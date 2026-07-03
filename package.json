@@ -1,7 +1,7 @@
 {
   "name": "@jfs/vendor-cli",
-  "version": "0.1.0",
-  "description": "Shared vendoring CLI for the @jfs kit family — generates/checks the committed copies buildless consumers ship (esm/global/bare/cjs formats), deriving the exposed surface from the kit's own exports.",
+  "version": "0.1.1",
+  "description": "Shared vendoring CLI for the @jfs kit family \u2014 generates/checks the committed copies buildless consumers ship (esm/global/bare/cjs formats), deriving the exposed surface from the kit's own exports.",
   "type": "module",
   "main": "index.mjs",
   "exports": {

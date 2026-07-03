@@ -46,8 +46,9 @@ top-level `export` declarations — never a hand-maintained list.
 `npm test` drives a fixture kit (`test/fixture-kit/`) through a bin shim the
 same way real kits are driven, covering every format, `--pick`, `--check`
 drift detection, argument validation, and executable-output probes. Each kit
-additionally keeps its own `test-vendor.mjs` as an integration test of its
-shim + pin against its real surface.
+additionally keeps its own vendor integration test (`test-vendor.mjs`, or
+`test/vendor.test.js` in news-kit) exercising its shim + pin against its
+real surface.
 
 ## Releasing a change
 
