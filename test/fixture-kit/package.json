@@ -1,0 +1,12 @@
+{
+  "name": "@jfs/fixture-kit",
+  "version": "9.9.9",
+  "description": "Test fixture for @jfs/vendor-cli — a minimal kit with every export form the surface derivation must handle.",
+  "type": "module",
+  "main": "index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jsvolos63/fixture-kit.git"
+  },
+  "license": "MIT"
+}
