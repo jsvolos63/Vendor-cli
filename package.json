@@ -1,17 +1,22 @@
 {
   "name": "@jfs/vendor-cli",
-  "version": "0.1.1",
-  "description": "Shared vendoring CLI for the @jfs kit family \u2014 generates/checks the committed copies buildless consumers ship (esm/global/bare/cjs formats), deriving the exposed surface from the kit's own exports.",
+  "version": "0.2.0",
+  "description": "Shared dev CLI for the @jfs kit family \u2014 vendoring generator (esm/global/bare/cjs, surface derived from the kit's own exports) plus the consolidated kit-pin bumper and version stamper the consumers used to each hand-roll.",
   "type": "module",
   "main": "index.mjs",
   "exports": {
     ".": "./index.mjs"
   },
+  "bin": {
+    "jfs-bump-kit-pins": "bin/bump-kit-pins.mjs",
+    "jfs-version-stamp": "bin/version-stamp.mjs"
+  },
   "files": [
-    "index.mjs"
+    "index.mjs",
+    "bin"
   ],
   "scripts": {
-    "test": "node --test test/test.mjs"
+    "test": "node --test test/test.mjs test/tooling.test.mjs"
   },
   "repository": {
     "type": "git",
