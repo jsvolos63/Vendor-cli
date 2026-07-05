@@ -1,7 +1,15 @@
 # @jfs/vendor-cli
 
-Shared vendoring CLI for the `@jfs/*` kit family (`dom-kit`, `pwa-kit`,
-`cache-kit`, `news-kit`, `netlify-kit`).
+Shared **dev CLI** for the `@jfs/*` kit family (`dom-kit`, `pwa-kit`,
+`cache-kit`, `news-kit`, `netlify-kit`). It owns three jobs that used to be
+byte-identical copies scattered across the kits and their consumers:
+
+1. **Vendoring** (`runVendorCli`, via each kit's `jfs-<kit>-vendor` bin) —
+   generate/`--check` the committed copies buildless consumers ship.
+2. **Kit-pin bumping** (`bumpKitPins`, `jfs-bump-kit-pins` bin) — the
+   consumer-side pin rewriter.
+3. **Version stamping** (`versionStamp`, `jfs-version-stamp` bin) — stamp the
+   version into a consumer's shell files.
 
 The family's consumers are buildless static sites: `node_modules` is not
 deployed, so each consumer commits a generated copy of every kit it uses and
@@ -10,6 +18,56 @@ CI fails if that copy drifts from the pinned package. Each kit ships a
 every one of those bins was a byte-identical 200-line copy of the same
 script, so a fix in one silently missed the other four. The logic now lives
 (and is tested) here, once.
+
+## Consumer bins
+
+Consumers that used to hand-roll `scripts/bump-kit-pins.mjs` and their own
+version stamper now add `@jfs/vendor-cli` as a direct devDependency (pinned by
+commit SHA, like every `@jfs` pin — npm only links a *direct* dependency's
+bins) and call:
+
+```jsonc
+// package.json
+"scripts": {
+  "version:stamp": "jfs-version-stamp",
+  "version:check": "jfs-version-stamp --check"
+}
+```
+
+```yaml
+# .github/workflows/kit-pin-bump.yml
+- run: jfs-bump-kit-pins          # was: node scripts/bump-kit-pins.mjs
+```
+
+**`jfs-bump-kit-pins`** rewrites the repo's `github:jsvolos63/<kit>#<sha>`
+pins to each kit repo's current default-branch HEAD (needs `GITHUB_TOKEN`),
+touching `package.json` only when a pin actually moved.
+
+**`jfs-version-stamp`** stamps one version string into the shell files that
+must agree on it, driven by a `versionStamp` block in the consumer's
+`package.json`:
+
+```jsonc
+"versionStamp": {
+  "source": { "packageVersion": true },   // or { fromFile } / { deployEnv }
+  "edits": [
+    { "file": "sw.js",
+      "find": "const SW_VERSION = '[^']*';",
+      "replace": "const SW_VERSION = '{version}';" },
+    { "file": "index.html", "flags": "g",
+      "find": "\\?v=[^&\"'\\s]*", "replace": "?v={version}" }
+  ]
+}
+```
+
+`source` is exactly one of `{ packageVersion: true }` (the `version` field),
+`{ fromFile: { path, pattern } }` (capture group 1 of a regex — for repos
+whose source of truth is a `const` in a JS file), or
+`{ deployEnv: { vars, fallback } }` (a per-deploy id from env vars, each
+optionally sliced as `"NAME:8"`, with a `"timestamp"` fallback). Each edit's
+`find` is a RegExp string (optional `flags`) and `{version}` is substituted
+into `replace`. `--check` writes nothing and exits 1 on drift; it's a no-op
+for the non-deterministic `deployEnv` source.
 
 ## How kits use it
 

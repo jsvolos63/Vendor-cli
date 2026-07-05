@@ -216,3 +216,183 @@ if (opts.check) {
   console.log(`${pkg.name} vendor: wrote ${opts.out} (format ${opts.format}, ${exposed.length} of ${surface.length} exports).`);
 }
 }
+
+// ===========================================================================
+// The family's other two byte-identical-per-consumer dev scripts, consolidated
+// here for the same reason the vendoring generator was: a fix in one copy
+// silently missed the rest. Consumers used to carry a local
+// scripts/bump-kit-pins.mjs + their own version stamper; they now depend on
+// this package directly and call the `jfs-bump-kit-pins` / `jfs-version-stamp`
+// bins instead.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// bumpKitPins — rewrite the `github:jsvolos63/<kit>#<sha>` pins in a consumer's
+// package.json to each kit repo's current default-branch HEAD. Run by each
+// consumer's kit-pin-bump workflow; touches package.json only when a pin
+// actually changed, so `git diff --quiet package.json` remains the signal.
+// `resolveHead` is injectable so tests can exercise the rewrite without hitting
+// the GitHub API.
+// ---------------------------------------------------------------------------
+const KIT_PIN_RE = /^github:(jsvolos63\/[A-Za-z0-9._-]+)#([0-9a-f]{40})$/;
+
+async function fetchHeadSha(repo) {
+  const token = process.env.GITHUB_TOKEN || '';
+  const res = await fetch(`https://api.github.com/repos/${repo}/commits/HEAD`, {
+    headers: {
+      accept: 'application/vnd.github.sha',
+      'user-agent': 'kit-pin-bump',
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+  });
+  if (!res.ok) throw new Error(`${repo}: GitHub API returned HTTP ${res.status}`);
+  const sha = (await res.text()).trim();
+  if (!/^[0-9a-f]{40}$/.test(sha)) {
+    throw new Error(`${repo}: unexpected HEAD response "${sha.slice(0, 60)}"`);
+  }
+  return sha;
+}
+
+export async function bumpKitPins(rootDir = process.cwd(), { resolveHead = fetchHeadSha } = {}) {
+  const file = resolve(rootDir, 'package.json');
+  const raw = readFileSync(file, 'utf8');
+  const pkg = JSON.parse(raw);
+
+  let out = raw;
+  let changed = false;
+  for (const section of ['dependencies', 'devDependencies']) {
+    for (const [name, spec] of Object.entries(pkg[section] || {})) {
+      const m = typeof spec === 'string' ? spec.match(KIT_PIN_RE) : null;
+      if (!m) continue;
+      const [, repo, pinned] = m;
+      const head = await resolveHead(repo);
+      if (head === pinned) {
+        console.log(`${name}: up to date at ${pinned.slice(0, 7)}`);
+        continue;
+      }
+      out = out.replace(`github:${repo}#${pinned}`, `github:${repo}#${head}`);
+      changed = true;
+      console.log(`${name}: ${pinned.slice(0, 7)} -> ${head.slice(0, 7)}`);
+    }
+  }
+
+  if (changed) {
+    JSON.parse(out); // refuse to write a package.json that no longer parses
+    writeFileSync(file, out);
+    console.log('package.json updated');
+  } else {
+    console.log('all kit pins up to date');
+  }
+  return changed;
+}
+
+// ---------------------------------------------------------------------------
+// versionStamp — stamp one version string into the shell files that must agree
+// on it (service-worker cache name, `?v=` cache-busters, header label), so a
+// bumped version can't leave returning visitors on a stale cached shell. Driven
+// by a `versionStamp` block in the consumer's package.json:
+//
+//   "versionStamp": {
+//     "source": { "packageVersion": true },
+//     "edits": [
+//       { "file": "sw.js",
+//         "find": "const SW_VERSION = '[^']*';",
+//         "replace": "const SW_VERSION = '{version}';" },
+//       { "file": "index.html", "flags": "g",
+//         "find": "\\?v=[^&\"'\\s]*",
+//         "replace": "?v={version}" }
+//     ]
+//   }
+//
+// `source` is exactly one of:
+//   { "packageVersion": true }                     — package.json "version"
+//   { "fromFile": { "path", "pattern" } }          — capture group 1 of a regex
+//   { "deployEnv": { "vars": [...], "fallback" } } — a per-deploy id; the
+//        vars are tried in order, each optionally sliced as "NAME:8"; a
+//        "timestamp" fallback yields Date.now().toString(36). Non-deterministic,
+//        so `--check` is a no-op for this source.
+//
+// Each edit's `find` is a RegExp string (optional `flags`); `{version}` in
+// `replace` is substituted literally. `--check` writes nothing and exits 1 on
+// drift — consumers run it in CI as version:check.
+// ---------------------------------------------------------------------------
+const VERSION_RE = /^[A-Za-z0-9._-]+$/;
+
+function failStamp(msg) {
+  console.error(`version-stamp: ${msg}`);
+  process.exit(1);
+}
+
+function resolveStampVersion(source, rootDir) {
+  if (!source || typeof source !== 'object') failStamp('versionStamp.source is required');
+  if (source.packageVersion) {
+    const pkg = JSON.parse(readFileSync(resolve(rootDir, 'package.json'), 'utf8'));
+    return { version: pkg.version, deterministic: true };
+  }
+  if (source.fromFile) {
+    const { path: p, pattern } = source.fromFile;
+    if (!p || !pattern) failStamp('versionStamp.source.fromFile needs { path, pattern }');
+    const src = readFileSync(resolve(rootDir, p), 'utf8');
+    const m = src.match(new RegExp(pattern));
+    if (!m || m[1] == null) failStamp(`pattern ${pattern} (capture group 1) not found in ${p}`);
+    return { version: m[1], deterministic: true };
+  }
+  if (source.deployEnv) {
+    for (const spec of source.deployEnv.vars || []) {
+      const [name, len] = String(spec).split(':');
+      const val = process.env[name];
+      if (typeof val === 'string' && val.trim()) {
+        const v = len ? val.trim().slice(0, Number(len)) : val.trim();
+        if (VERSION_RE.test(v)) return { version: v, deterministic: false };
+      }
+    }
+    if (source.deployEnv.fallback === 'timestamp') {
+      return { version: Date.now().toString(36), deterministic: false };
+    }
+    failStamp('no deployEnv var resolved and no timestamp fallback');
+  }
+  return failStamp('versionStamp.source must set packageVersion, fromFile, or deployEnv');
+}
+
+export function versionStamp(rootDir = process.cwd(), argv = process.argv.slice(2)) {
+  const check = argv.includes('--check');
+  const pkg = JSON.parse(readFileSync(resolve(rootDir, 'package.json'), 'utf8'));
+  const config = pkg.versionStamp;
+  if (!config || !Array.isArray(config.edits) || config.edits.length === 0) {
+    failStamp('no versionStamp.edits[] in package.json');
+  }
+
+  const { version, deterministic } = resolveStampVersion(config.source, rootDir);
+  if (typeof version !== 'string' || !VERSION_RE.test(version)) {
+    failStamp(`refusing to stamp suspicious version "${version}"`);
+  }
+  if (check && !deterministic) {
+    console.log('version-stamp: source is per-deploy (non-deterministic) — nothing to check.');
+    return;
+  }
+
+  let drift = false;
+  for (const edit of config.edits) {
+    const { file, find, replace, flags } = edit;
+    if (!file || !find || replace == null) {
+      failStamp(`each edit needs { file, find, replace }; got ${JSON.stringify(edit)}`);
+    }
+    const dest = resolve(rootDir, file);
+    const src = readFileSync(dest, 'utf8');
+    if (!new RegExp(find, flags || '').test(src)) failStamp(`pattern ${find} not found in ${file}`);
+    const out = replace.replaceAll('{version}', version);
+    // Function replacer so `$`-sequences in `out` are treated literally.
+    const next = src.replace(new RegExp(find, flags || ''), () => out);
+    if (next === src) continue; // already stamped
+    if (check) {
+      drift = true;
+      console.error(`version-stamp: ${file} is out of date (expected ${version})`);
+    } else {
+      writeFileSync(dest, next);
+      console.log(`version-stamp: stamped ${version} into ${file}`);
+    }
+  }
+
+  if (check && drift) failStamp('run `npm run version:stamp` and commit the result.');
+  if (check) console.log(`version-stamp: all files in sync at ${version}.`);
+}
