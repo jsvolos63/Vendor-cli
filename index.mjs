@@ -333,7 +333,13 @@ function resolveStampVersion(source, rootDir) {
     const { path: p, pattern } = source.fromFile;
     if (!p || !pattern) failStamp('versionStamp.source.fromFile needs { path, pattern }');
     const src = readFileSync(resolve(rootDir, p), 'utf8');
-    const m = src.match(new RegExp(pattern));
+    let re;
+    try {
+      re = new RegExp(pattern);
+    } catch (e) {
+      return failStamp(`invalid versionStamp.source.fromFile.pattern /${pattern}/ — ${e.message}`);
+    }
+    const m = src.match(re);
     if (!m || m[1] == null) failStamp(`pattern ${pattern} (capture group 1) not found in ${p}`);
     return { version: m[1], deterministic: true };
   }
@@ -379,10 +385,17 @@ export function versionStamp(rootDir = process.cwd(), argv = process.argv.slice(
     }
     const dest = resolve(rootDir, file);
     const src = readFileSync(dest, 'utf8');
-    if (!new RegExp(find, flags || '').test(src)) failStamp(`pattern ${find} not found in ${file}`);
+    let re;
+    try {
+      re = new RegExp(find, flags || '');
+    } catch (e) {
+      return failStamp(`invalid regex in edit for ${file}: /${find}/${flags || ''} — ${e.message}`);
+    }
+    if (!re.test(src)) failStamp(`pattern ${find} not found in ${file}`);
     const out = replace.replaceAll('{version}', version);
-    // Function replacer so `$`-sequences in `out` are treated literally.
-    const next = src.replace(new RegExp(find, flags || ''), () => out);
+    // Function replacer so `$`-sequences in `out` are treated literally. Reusing
+    // `re` is safe: String.replace with a global regex ignores/ resets lastIndex.
+    const next = src.replace(re, () => out);
     if (next === src) continue; // already stamped
     if (check) {
       drift = true;
