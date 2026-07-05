@@ -128,6 +128,26 @@ test('versionStamp exits 1 on a missing pattern', () => {
   assert.match(res.stderr, /not found/);
 });
 
+test('versionStamp exits 1 with a clear message on an invalid edit regex', () => {
+  const dir = freshRepo(
+    { version: '1.0.0', versionStamp: { source: { packageVersion: true }, edits: [{ file: 'sw.js', find: '[', replace: '{version}' }] } },
+    { 'sw.js': 'x\n' },
+  );
+  const res = stampSubprocess(dir);
+  assert.equal(res.status, 1, res.stderr);
+  assert.match(res.stderr, /invalid regex/);
+});
+
+test('versionStamp exits 1 with a clear message on an invalid fromFile pattern', () => {
+  const dir = freshRepo(
+    { version: '1.0.0', versionStamp: { source: { fromFile: { path: 'v.js', pattern: '(' } }, edits: [{ file: 'sw.js', find: 'x', replace: '{version}' }] } },
+    { 'v.js': "VERSION='1'\n", 'sw.js': 'x\n' },
+  );
+  const res = stampSubprocess(dir);
+  assert.equal(res.status, 1, res.stderr);
+  assert.match(res.stderr, /invalid versionStamp.source.fromFile.pattern/);
+});
+
 test('versionStamp refuses a suspicious version string', () => {
   const dir = freshRepo(
     { version: 'has space', versionStamp: { source: { packageVersion: true }, edits: [{ file: 'sw.js', find: 'x', replace: '{version}' }] } },
