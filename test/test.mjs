@@ -131,6 +131,24 @@ test('cjs format: parseable and exports the full derived surface', () => {
   assert.deepEqual([...mapped].sort(), [...NAMES].sort(), 'module.exports must expose exactly the derived exports');
 });
 
+test('cjs format: --pick narrows module.exports (body kept whole)', () => {
+  const dir = freshDir();
+  const pickTwo = NAMES.slice(0, 2);
+  const r = run(['--format', 'cjs', '--pick', pickTwo.join(','), '--out', 'picked.cjs'], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const file = join(dir, 'picked.cjs');
+  const out = readFileSync(file, 'utf8');
+  assert.equal(syntaxCheck(file).status, 0, 'picked cjs output must parse');
+  const mapped = surfaceMapNames(out, 'module.exports = {');
+  assert.deepEqual([...mapped].sort(), [...pickTwo].sort());
+  // Unpicked DECLARATIONS still exist in the body — only the exposed API
+  // narrows. (Aggregate-alias names like helperAlias are exports-map-only, so
+  // assert on the fixture's local declaration names.)
+  for (const name of ['greet', 'fetchThing', 'ANSWER', 'Widget', 'doubled', 'internalHelper']) {
+    assert.ok(out.includes(name), `body keeps ${name}`);
+  }
+});
+
 test('--check: passes in sync, fails on drift, fails when missing', () => {
   const dir = freshDir();
   const args = ['--format', 'global', '--name', 'G', '--out', 'v.js'];
@@ -145,11 +163,12 @@ test('--check: passes in sync, fails on drift, fails when missing', () => {
   assert.match(drift.stderr, /out of sync/);
 });
 
-test('argument validation: bad format, missing --out, --pick outside global', () => {
+test('argument validation: bad format, missing --out, --pick outside global/cjs', () => {
   const dir = freshDir();
   assert.notEqual(run(['--format', 'nope', '--out', 'x.js'], dir).status, 0);
   assert.notEqual(run(['--format', 'esm'], dir).status, 0);
   assert.notEqual(run(['--format', 'esm', '--out', 'x.js', '--pick', 'a'], dir).status, 0);
+  assert.notEqual(run(['--format', 'bare', '--out', 'x.js', '--pick', 'a'], dir).status, 0);
 });
 
 // ------------------------------------------------- fixture-exact assertions

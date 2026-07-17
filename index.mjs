@@ -40,8 +40,13 @@
 //                     dropped — aliases can't be expressed as declarations)
 //   --format cjs      CommonJS transform (module.exports of the public API)
 //                     for `require()` from CommonJS Netlify Functions
-//   --pick a,b,c      global format only: expose just this subset (each name
-//                     must exist in the derived surface — typos are an error)
+//   --pick a,b,c      global and cjs formats: expose just this subset (each
+//                     name must exist in the derived surface — typos are an
+//                     error). Narrows the EXPOSED API (the global object /
+//                     module.exports map), not the shipped bytes — the body
+//                     is kept whole because internal helpers are shared and
+//                     regex-level tree-shaking would be unsound. Use it to
+//                     keep a consumer's coupling surface explicit.
 //   --check           don't write; exit 1 if <dest> differs from what would
 //                     be generated (consumers run this in CI as vendor:check)
 //
@@ -93,7 +98,9 @@ if (!FORMATS.includes(opts.format)) fail(`--format must be one of: ${FORMATS.joi
 if (!opts.out) fail('--out <dest> is required');
 if (opts.format === 'global' && !opts.name) fail('--format global requires --name <GlobalName>');
 if (opts.name && !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(opts.name)) fail(`--name must be a valid identifier, got: ${opts.name}`);
-if (opts.pick && opts.format !== 'global') fail('--pick is only valid with --format global');
+if (opts.pick && opts.format !== 'global' && opts.format !== 'cjs') {
+  fail('--pick is only valid with --format global or cjs');
+}
 
 // ------------------------------------------------------- derive the surface
 
