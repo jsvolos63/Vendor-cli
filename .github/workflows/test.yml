@@ -33,7 +33,7 @@ jobs:
       - name: Fail if the shipped module changed without a version bump
         run: |
           BASE="origin/${GITHUB_BASE_REF}"
-          if git diff --quiet "$BASE...HEAD" -- index.mjs; then
+          if git diff --quiet "$BASE...HEAD" -- index.mjs bin; then
             echo "shipped module unchanged - no bump required"
             exit 0
           fi
