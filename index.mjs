@@ -294,6 +294,65 @@ export async function bumpKitPins(rootDir = process.cwd(), { resolveHead = fetch
 }
 
 // ---------------------------------------------------------------------------
+// verifyKitPins — pre-flight: assert every `github:jsvolos63/<kit>#<sha>` pin in
+// a consumer's package.json points at a commit that actually exists on the
+// remote, BEFORE `npm install` tries to fetch it. A hand-edited/typo'd SHA
+// otherwise surfaces as an opaque `npm install` git-128 / codeload 404 that
+// takes a while to diagnose; run in CI ahead of install, this turns it into a
+// one-line "pin X#<sha> does not exist" and fails fast. Existence is checked
+// against the same GitHub API `bumpKitPins` resolves HEAD from; `checkExists`
+// is injectable so tests never hit the network. Scans the same sections and
+// pin format as `bumpKitPins`, so the two stay symmetric. Throws on any missing
+// pin (or an unexpected API status); returns the number of pins verified.
+// ---------------------------------------------------------------------------
+async function commitExists(repo, sha) {
+  const token = process.env.GITHUB_TOKEN || '';
+  const res = await fetch(`https://api.github.com/repos/${repo}/commits/${sha}`, {
+    headers: {
+      accept: 'application/vnd.github.sha',
+      'user-agent': 'kit-pin-check',
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+  });
+  if (res.status === 200) return true;
+  // 404 (unknown repo/commit) and 422 (malformed sha) both mean "not a real
+  // pin"; anything else (403 rate-limit, 5xx) is inconclusive, not "missing".
+  if (res.status === 404 || res.status === 422) return false;
+  throw new Error(`${repo}@${sha.slice(0, 7)}: GitHub API returned HTTP ${res.status}`);
+}
+
+export async function verifyKitPins(rootDir = process.cwd(), { checkExists = commitExists } = {}) {
+  const pkg = JSON.parse(readFileSync(resolve(rootDir, 'package.json'), 'utf8'));
+
+  const pins = [];
+  for (const section of ['dependencies', 'devDependencies']) {
+    for (const [name, spec] of Object.entries(pkg[section] || {})) {
+      const m = typeof spec === 'string' ? spec.match(KIT_PIN_RE) : null;
+      if (m) pins.push({ name, repo: m[1], sha: m[2] });
+    }
+  }
+
+  const missing = [];
+  for (const p of pins) {
+    if (await checkExists(p.repo, p.sha)) {
+      console.log(`${p.name}: ${p.sha.slice(0, 7)} resolves on ${p.repo}`);
+    } else {
+      missing.push(p);
+      console.error(`${p.name}: pin github:${p.repo}#${p.sha} does NOT exist on the remote`);
+    }
+  }
+
+  if (missing.length) {
+    const list = missing.map((p) => `${p.name} (${p.repo}#${p.sha.slice(0, 7)})`).join(', ');
+    throw new Error(
+      `${missing.length} kit pin(s) point at a commit that does not exist: ${list}. ` +
+        'Fix the SHA in package.json (see `jfs-bump-kit-pins`) before installing.'
+    );
+  }
+  return pins.length;
+}
+
+// ---------------------------------------------------------------------------
 // versionStamp — stamp one version string into the shell files that must agree
 // on it (service-worker cache name, `?v=` cache-busters, header label), so a
 // bumped version can't leave returning visitors on a stale cached shell. Driven

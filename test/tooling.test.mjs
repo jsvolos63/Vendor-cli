@@ -12,7 +12,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const INDEX = join(dirname(fileURLToPath(import.meta.url)), '..', 'index.mjs');
-const { bumpKitPins, versionStamp } = await import(pathToFileURL(INDEX));
+const { bumpKitPins, verifyKitPins, versionStamp } = await import(pathToFileURL(INDEX));
 
 function freshRepo(pkg, files = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'tooling-test-'));
@@ -187,4 +187,67 @@ test('bumpKitPins leaves an up-to-date pin alone', async () => {
   const changed = await bumpKitPins(dir, { resolveHead: async () => SHA_A });
   assert.equal(changed, false);
   assert.equal(readFileSync(join(dir, 'package.json'), 'utf8'), before);
+});
+
+// --------------------------------------------------------------- verifyKitPins
+
+test('verifyKitPins passes when every pin resolves, ignoring non-pins', async () => {
+  const dir = freshRepo({
+    name: 'consumer',
+    dependencies: { '@jfs/netlify-kit': `github:jsvolos63/netlify-kit#${SHA_A}` },
+    devDependencies: {
+      '@jfs/dom-kit': `github:jsvolos63/dom-kit#${SHA_B}`,
+      jsdom: '^25.0.0', // non-pin — must not be checked
+    },
+  });
+  const seen = [];
+  const n = await verifyKitPins(dir, {
+    checkExists: async (repo, sha) => {
+      seen.push(`${repo}#${sha.slice(0, 7)}`);
+      return true;
+    },
+  });
+  assert.equal(n, 2);
+  assert.deepEqual(seen, [`jsvolos63/netlify-kit#${SHA_A.slice(0, 7)}`, `jsvolos63/dom-kit#${SHA_B.slice(0, 7)}`]);
+});
+
+test('verifyKitPins throws a clear error naming pins that do not exist', async () => {
+  const dir = freshRepo({
+    name: 'consumer',
+    devDependencies: {
+      '@jfs/dom-kit': `github:jsvolos63/dom-kit#${SHA_A}`,
+      '@jfs/news-kit': `github:jsvolos63/news-kit#${SHA_B}`,
+    },
+  });
+  // dom-kit resolves; news-kit does not (the bad-SHA scenario this exists for).
+  await assert.rejects(
+    verifyKitPins(dir, { checkExists: async (repo) => repo !== 'jsvolos63/news-kit' }),
+    (err) => {
+      assert.match(err.message, /do(es)? not exist/i);
+      assert.match(err.message, /news-kit/);
+      assert.doesNotMatch(err.message, /dom-kit/); // only the missing one is named
+      return true;
+    },
+  );
+});
+
+test('verifyKitPins propagates an inconclusive API status instead of passing', async () => {
+  const dir = freshRepo({
+    name: 'consumer',
+    devDependencies: { '@jfs/dom-kit': `github:jsvolos63/dom-kit#${SHA_A}` },
+  });
+  await assert.rejects(
+    verifyKitPins(dir, {
+      checkExists: async () => {
+        throw new Error('jsvolos63/dom-kit@aaaaaaa: GitHub API returned HTTP 403');
+      },
+    }),
+    /HTTP 403/,
+  );
+});
+
+test('verifyKitPins is a no-op (returns 0) when there are no kit pins', async () => {
+  const dir = freshRepo({ name: 'consumer', devDependencies: { jsdom: '^25.0.0' } });
+  const n = await verifyKitPins(dir, { checkExists: async () => { throw new Error('should not be called'); } });
+  assert.equal(n, 0);
 });

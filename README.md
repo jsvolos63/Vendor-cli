@@ -8,7 +8,9 @@ byte-identical copies scattered across the kits and their consumers:
    generate/`--check` the committed copies buildless consumers ship.
 2. **Kit-pin bumping** (`bumpKitPins`, `jfs-bump-kit-pins` bin) — the
    consumer-side pin rewriter.
-3. **Version stamping** (`versionStamp`, `jfs-version-stamp` bin) — stamp the
+3. **Kit-pin checking** (`verifyKitPins`, `jfs-check-kit-pins` bin) — a
+   pre-flight that every pinned SHA actually exists on the remote.
+4. **Version stamping** (`versionStamp`, `jfs-version-stamp` bin) — stamp the
    version into a consumer's shell files.
 
 The family's consumers are buildless static sites: `node_modules` is not
@@ -42,6 +44,20 @@ bins) and call:
 **`jfs-bump-kit-pins`** rewrites the repo's `github:jsvolos63/<kit>#<sha>`
 pins to each kit repo's current default-branch HEAD (needs `GITHUB_TOKEN`),
 touching `package.json` only when a pin actually moved.
+
+**`jfs-check-kit-pins`** is a pre-flight that every `github:jsvolos63/<kit>#<sha>`
+pin points at a commit that actually exists on the remote. A hand-edited or
+typo'd SHA otherwise surfaces as an opaque `npm install` git-128 / codeload 404;
+run this ahead of install in CI and it fails fast with a clear
+`pin <kit>#<sha> does not exist` instead. It scans the same sections and pin
+format as `jfs-bump-kit-pins`, needs `GITHUB_TOKEN` for private repos, and exits
+non-zero on any missing pin (or an inconclusive API status — a 403/5xx is not
+treated as "missing"):
+
+```yaml
+# in CI, before `npm ci`
+- run: jfs-check-kit-pins
+```
 
 **`jfs-version-stamp`** stamps one version string into the shell files that
 must agree on it, driven by a `versionStamp` block in the consumer's
