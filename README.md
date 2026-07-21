@@ -49,10 +49,10 @@ touching `package.json` only when a pin actually moved.
 pin points at a commit that actually exists on the remote. A hand-edited or
 typo'd SHA otherwise surfaces as an opaque `npm install` git-128 / codeload 404;
 run this ahead of install in CI and it fails fast with a clear
-`pin <kit>#<sha> does not exist` instead. It scans the same sections and pin
-format as `jfs-bump-kit-pins`, needs `GITHUB_TOKEN` for private repos, and exits
-non-zero on any missing pin (or an inconclusive API status — a 403/5xx is not
-treated as "missing"):
+`pin <kit>#<sha> does not exist` instead. It scans `dependencies`,
+`devDependencies`, and the `vendoredKits` object (the copy-in consumers), needs
+`GITHUB_TOKEN` for private repos, and exits non-zero on any missing pin (or an
+inconclusive API status — a 403/5xx is not treated as "missing"):
 
 ```yaml
 # in CI, before `npm ci`

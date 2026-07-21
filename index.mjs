@@ -325,11 +325,24 @@ export async function verifyKitPins(rootDir = process.cwd(), { checkExists = com
   const pkg = JSON.parse(readFileSync(resolve(rootDir, 'package.json'), 'utf8'));
 
   const pins = [];
+  const dedup = new Set();
+  const collect = (name, spec) => {
+    const m = typeof spec === 'string' ? spec.match(KIT_PIN_RE) : null;
+    if (!m) return;
+    const key = `${m[1]}#${m[2]}`;
+    if (dedup.has(key)) return; // a kit pinned in two sections is one check
+    dedup.add(key);
+    pins.push({ name, repo: m[1], sha: m[2] });
+  };
   for (const section of ['dependencies', 'devDependencies']) {
-    for (const [name, spec] of Object.entries(pkg[section] || {})) {
-      const m = typeof spec === 'string' ? spec.match(KIT_PIN_RE) : null;
-      if (m) pins.push({ name, repo: m[1], sha: m[2] });
-    }
+    for (const [name, spec] of Object.entries(pkg[section] || {})) collect(name, spec);
+  }
+  // Some consumers (e.g. John's-News) keep the kit pins under a `vendoredKits`
+  // object instead of *dependencies (they copy the kits in rather than install
+  // them). Same `github:<repo>#<sha>` value format, so check those too; non-pin
+  // values like the "note" field simply don't match KIT_PIN_RE.
+  if (pkg.vendoredKits && typeof pkg.vendoredKits === 'object') {
+    for (const [name, spec] of Object.entries(pkg.vendoredKits)) collect(name, spec);
   }
 
   const missing = [];
