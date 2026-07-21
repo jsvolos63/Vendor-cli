@@ -251,3 +251,33 @@ test('verifyKitPins is a no-op (returns 0) when there are no kit pins', async ()
   const n = await verifyKitPins(dir, { checkExists: async () => { throw new Error('should not be called'); } });
   assert.equal(n, 0);
 });
+
+test('verifyKitPins also scans the vendoredKits object, ignoring its note field', async () => {
+  const dir = freshRepo({
+    name: 'consumer',
+    devDependencies: { '@jfs/vendor-cli': `github:jsvolos63/vendor-cli#${SHA_A}` },
+    vendoredKits: {
+      note: 'never edit by hand',
+      '@jfs/news-kit': `github:jsvolos63/news-kit#${SHA_B}`,
+      '@jfs/dom-kit': `github:jsvolos63/dom-kit#${SHA_A}`,
+    },
+  });
+  const seen = [];
+  const n = await verifyKitPins(dir, {
+    checkExists: async (repo) => { seen.push(repo); return true; },
+  });
+  assert.equal(n, 3); // vendor-cli (devDep) + news-kit + dom-kit (vendoredKits); note ignored
+  assert.deepEqual(seen.sort(), ['jsvolos63/dom-kit', 'jsvolos63/news-kit', 'jsvolos63/vendor-cli']);
+});
+
+test('verifyKitPins de-dups a kit pinned in both a section and vendoredKits', async () => {
+  const dir = freshRepo({
+    name: 'consumer',
+    devDependencies: { '@jfs/dom-kit': `github:jsvolos63/dom-kit#${SHA_A}` },
+    vendoredKits: { '@jfs/dom-kit': `github:jsvolos63/dom-kit#${SHA_A}` },
+  });
+  let calls = 0;
+  const n = await verifyKitPins(dir, { checkExists: async () => { calls++; return true; } });
+  assert.equal(n, 1);
+  assert.equal(calls, 1);
+});
