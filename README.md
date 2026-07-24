@@ -43,7 +43,13 @@ bins) and call:
 
 **`jfs-bump-kit-pins`** rewrites the repo's `github:jsvolos63/<kit>#<sha>`
 pins to each kit repo's current default-branch HEAD (needs `GITHUB_TOKEN`),
-touching `package.json` only when a pin actually moved.
+touching `package.json` only when a pin actually moved. It scans
+`dependencies`, `devDependencies`, and the `vendoredKits` object (the copy-in
+consumers, e.g. John's-News) — the same shapes `jfs-check-kit-pins` covers.
+For `vendoredKits` pins the bumper only rewrites the SHAs: those kits are
+copied in rather than npm-installed, so the consumer is responsible for
+regenerating its vendored copies from the new pins itself (no `vendor:sync`
+is assumed; the bin prints a reminder when a vendoredKits pin moves).
 
 **`jfs-check-kit-pins`** is a pre-flight that every `github:jsvolos63/<kit>#<sha>`
 pin points at a commit that actually exists on the remote. A hand-edited or

@@ -189,6 +189,75 @@ test('bumpKitPins leaves an up-to-date pin alone', async () => {
   assert.equal(readFileSync(join(dir, 'package.json'), 'utf8'), before);
 });
 
+test('bumpKitPins also bumps pins under vendoredKits, ignoring its note field', async () => {
+  const dir = freshRepo({
+    name: 'consumer',
+    devDependencies: { jsdom: '^25.0.0' },
+    vendoredKits: {
+      note: 'never edit by hand',
+      '@jfs/news-kit': `github:jsvolos63/news-kit#${SHA_A}`,
+      '@jfs/dom-kit': `github:jsvolos63/dom-kit#${SHA_A}`,
+    },
+  });
+  const logs = [];
+  const origLog = console.log;
+  console.log = (msg) => logs.push(String(msg));
+  let changed;
+  try {
+    changed = await bumpKitPins(dir, { resolveHead: async () => SHA_B });
+  } finally {
+    console.log = origLog;
+  }
+  assert.equal(changed, true);
+  const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
+  assert.equal(pkg.vendoredKits['@jfs/news-kit'], `github:jsvolos63/news-kit#${SHA_B}`);
+  assert.equal(pkg.vendoredKits['@jfs/dom-kit'], `github:jsvolos63/dom-kit#${SHA_B}`);
+  assert.equal(pkg.vendoredKits.note, 'never edit by hand'); // non-pin untouched
+  assert.equal(pkg.devDependencies.jsdom, '^25.0.0');
+  // Copy-in consumers own the regeneration of their vendored copies — the
+  // bumper must say so instead of implying a vendor:sync happened.
+  assert.ok(
+    logs.some((l) => /vendoredKits/.test(l) && /regenerate/.test(l)),
+    `expected a regenerate-yourself note in output, got:\n${logs.join('\n')}`
+  );
+});
+
+test('bumpKitPins moves a kit pinned in both a section and vendoredKits together', async () => {
+  const dir = freshRepo({
+    name: 'consumer',
+    devDependencies: { '@jfs/dom-kit': `github:jsvolos63/dom-kit#${SHA_A}` },
+    vendoredKits: { '@jfs/dom-kit': `github:jsvolos63/dom-kit#${SHA_A}` },
+  });
+  let resolves = 0;
+  const changed = await bumpKitPins(dir, {
+    resolveHead: async () => {
+      resolves++;
+      return SHA_B;
+    },
+  });
+  assert.equal(changed, true);
+  assert.equal(resolves, 1); // one resolve moves every occurrence
+  const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
+  assert.equal(pkg.devDependencies['@jfs/dom-kit'], `github:jsvolos63/dom-kit#${SHA_B}`);
+  assert.equal(pkg.vendoredKits['@jfs/dom-kit'], `github:jsvolos63/dom-kit#${SHA_B}`);
+});
+
+test('bumpKitPins prints no vendoredKits note for a devDependencies-only consumer', async () => {
+  const dir = freshRepo({
+    name: 'consumer',
+    devDependencies: { '@jfs/dom-kit': `github:jsvolos63/dom-kit#${SHA_A}` },
+  });
+  const logs = [];
+  const origLog = console.log;
+  console.log = (msg) => logs.push(String(msg));
+  try {
+    await bumpKitPins(dir, { resolveHead: async () => SHA_B });
+  } finally {
+    console.log = origLog;
+  }
+  assert.ok(!logs.some((l) => /vendoredKits/.test(l)), `unexpected vendoredKits note:\n${logs.join('\n')}`);
+});
+
 // --------------------------------------------------------------- verifyKitPins
 
 test('verifyKitPins passes when every pin resolves, ignoring non-pins', async () => {

@@ -238,8 +238,13 @@ if (opts.check) {
 // package.json to each kit repo's current default-branch HEAD. Run by each
 // consumer's kit-pin-bump workflow; touches package.json only when a pin
 // actually changed, so `git diff --quiet package.json` remains the signal.
-// `resolveHead` is injectable so tests can exercise the rewrite without hitting
-// the GitHub API.
+// Scans `dependencies`, `devDependencies`, and the `vendoredKits` object (the
+// copy-in consumers, e.g. John's-News) — the same shapes `verifyKitPins`
+// covers, so the two stay symmetric. NOTE: for `vendoredKits` pins this bin
+// only rewrites the SHAs — those kits are copied in, not npm-installed, so the
+// consumer owns regenerating its vendored copies from the new pins (there is
+// no `vendor:sync` assumption here). `resolveHead` is injectable so tests can
+// exercise the rewrite without hitting the GitHub API.
 // ---------------------------------------------------------------------------
 const KIT_PIN_RE = /^github:(jsvolos63\/[A-Za-z0-9._-]+)#([0-9a-f]{40})$/;
 
@@ -265,28 +270,61 @@ export async function bumpKitPins(rootDir = process.cwd(), { resolveHead = fetch
   const raw = readFileSync(file, 'utf8');
   const pkg = JSON.parse(raw);
 
+  // Collect every pin once. A kit pinned in two places at the same SHA (e.g.
+  // a dependency section AND vendoredKits) is one resolve; the rewrite below
+  // is a replaceAll, so both occurrences move together.
+  const pins = [];
+  const dedup = new Map();
+  const collect = (name, spec, vendored) => {
+    const m = typeof spec === 'string' ? spec.match(KIT_PIN_RE) : null;
+    if (!m) return;
+    const key = `${m[1]}#${m[2]}`;
+    const dup = dedup.get(key);
+    if (dup) {
+      dup.vendored = dup.vendored || vendored; // still one resolve/rewrite
+      return;
+    }
+    const pin = { name, repo: m[1], pinned: m[2], vendored };
+    dedup.set(key, pin);
+    pins.push(pin);
+  };
+  for (const section of ['dependencies', 'devDependencies']) {
+    for (const [name, spec] of Object.entries(pkg[section] || {})) collect(name, spec, false);
+  }
+  // Copy-in consumers (e.g. John's-News) keep their kit pins under a
+  // `vendoredKits` object instead of *dependencies — same `github:<repo>#<sha>`
+  // value format. Bump those too; non-pin values like the "note" field simply
+  // don't match KIT_PIN_RE.
+  if (pkg.vendoredKits && typeof pkg.vendoredKits === 'object') {
+    for (const [name, spec] of Object.entries(pkg.vendoredKits)) collect(name, spec, true);
+  }
+
   let out = raw;
   let changed = false;
-  for (const section of ['dependencies', 'devDependencies']) {
-    for (const [name, spec] of Object.entries(pkg[section] || {})) {
-      const m = typeof spec === 'string' ? spec.match(KIT_PIN_RE) : null;
-      if (!m) continue;
-      const [, repo, pinned] = m;
-      const head = await resolveHead(repo);
-      if (head === pinned) {
-        console.log(`${name}: up to date at ${pinned.slice(0, 7)}`);
-        continue;
-      }
-      out = out.replace(`github:${repo}#${pinned}`, `github:${repo}#${head}`);
-      changed = true;
-      console.log(`${name}: ${pinned.slice(0, 7)} -> ${head.slice(0, 7)}`);
+  let vendoredChanged = false;
+  for (const { name, repo, pinned, vendored } of pins) {
+    const head = await resolveHead(repo);
+    if (head === pinned) {
+      console.log(`${name}: up to date at ${pinned.slice(0, 7)}`);
+      continue;
     }
+    out = out.replaceAll(`github:${repo}#${pinned}`, `github:${repo}#${head}`);
+    changed = true;
+    if (vendored) vendoredChanged = true;
+    console.log(`${name}: ${pinned.slice(0, 7)} -> ${head.slice(0, 7)}`);
   }
 
   if (changed) {
     JSON.parse(out); // refuse to write a package.json that no longer parses
     writeFileSync(file, out);
     console.log('package.json updated');
+    if (vendoredChanged) {
+      console.log(
+        'note: vendoredKits pins were bumped — this bin only rewrites the SHAs; ' +
+          'regenerate the vendored copies from the new pins yourself (copy-in ' +
+          'consumers own that step; no vendor:sync is assumed).'
+      );
+    }
   } else {
     console.log('all kit pins up to date');
   }
