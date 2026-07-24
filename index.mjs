@@ -28,12 +28,23 @@
 // Usage (from a consumer repo, with the kit installed as a devDependency):
 //
 //   <bin-name> --format <esm|global|bare|cjs> --out <dest> \
-//              [--name <GlobalName>] [--pick a,b,c] [--check]
+//              [--name <GlobalName>] [--pick a,b,c] \
+//              [--global <Name[:a,b,c]> ...] [--check]
 //
 //   --format esm      verbatim ESM copy (unit tests import this)
 //   --format global   classic-script IIFE exposing the public API on
 //                     `globalThis.<Name>` (--name required) — for service
 //                     workers via importScripts() and classic <script> pages
+//   --global Name[:a,b,c]
+//                     global format only; repeatable. Each occurrence adds a
+//                     named global to the SAME emitted file, exposing the
+//                     `:`-suffixed pick list (or the full surface without
+//                     one). The kit body is emitted once and every global's
+//                     surface map closes over it — the fix for consumers
+//                     that shipped the whole bundle twice just to get two
+//                     narrowed globals. Mutually exclusive with
+//                     --name/--pick (the legacy single-global spelling;
+//                     `--global X:a,b` ≡ `--name X --pick a,b`).
 //   --format bare     `export`-stripped copy whose declarations become
 //                     bundle-scoped when concatenated into a classic-script
 //                     bundle (aggregate `export { a as b }` alias lines are
@@ -78,7 +89,7 @@ function fail(msg) {
 // ---------------------------------------------------------------- arguments
 
 const args = argv;
-const opts = { check: false, pick: null, name: null, format: null, out: null };
+const opts = { check: false, pick: null, name: null, format: null, out: null, globals: [] };
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
   const next = () => {
@@ -90,16 +101,42 @@ for (let i = 0; i < args.length; i++) {
   else if (a === '--out') opts.out = next();
   else if (a === '--name') opts.name = next();
   else if (a === '--pick') opts.pick = next().split(',').map((s) => s.trim()).filter(Boolean);
+  else if (a === '--global') opts.globals.push(next());
   else fail(`unknown argument: ${a}`);
 }
 
 const FORMATS = ['esm', 'global', 'bare', 'cjs'];
+const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 if (!FORMATS.includes(opts.format)) fail(`--format must be one of: ${FORMATS.join(', ')}`);
 if (!opts.out) fail('--out <dest> is required');
-if (opts.format === 'global' && !opts.name) fail('--format global requires --name <GlobalName>');
-if (opts.name && !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(opts.name)) fail(`--name must be a valid identifier, got: ${opts.name}`);
+if (opts.globals.length && opts.format !== 'global') fail('--global is only valid with --format global');
+if (opts.globals.length && (opts.name || opts.pick)) {
+  fail('--global cannot be combined with --name/--pick — use one --global <Name[:a,b,c]> per exposed global');
+}
+if (opts.format === 'global' && !opts.name && !opts.globals.length) {
+  fail('--format global requires --name <GlobalName> (or one --global <Name[:a,b,c]> per global)');
+}
+if (opts.name && !IDENT_RE.test(opts.name)) fail(`--name must be a valid identifier, got: ${opts.name}`);
 if (opts.pick && opts.format !== 'global' && opts.format !== 'cjs') {
   fail('--pick is only valid with --format global or cjs');
+}
+
+// Parse `--global Name[:a,b,c]` specs: name before the first `:`, an optional
+// pick list after it (no `:` = full surface, same as --name without --pick).
+const globalSpecs = opts.globals.map((spec) => {
+  const idx = spec.indexOf(':');
+  const name = idx === -1 ? spec : spec.slice(0, idx);
+  if (!IDENT_RE.test(name)) fail(`--global name must be a valid identifier, got: ${name || spec}`);
+  const pick = idx === -1 ? null : spec.slice(idx + 1).split(',').map((s) => s.trim()).filter(Boolean);
+  if (pick && pick.length === 0) fail(`--global ${name}: empty pick list after ':'`);
+  return { name, pick };
+});
+{
+  const seen = new Set();
+  for (const { name } of globalSpecs) {
+    if (seen.has(name)) fail(`--global ${name} given more than once`);
+    seen.add(name);
+  }
 }
 
 // ------------------------------------------------------- derive the surface
@@ -133,15 +170,35 @@ if (surface.length === 0) {
   fail(`found no top-level exports in ${KIT_DIR}/index.js — refusing to generate an empty surface.`);
 }
 
-let exposed = surface;
-if (opts.pick) {
+function resolveExposed(pick, flag) {
+  if (!pick) return surface;
   const known = new Set(surface.map((s) => s.exported));
-  const unknown = opts.pick.filter((n) => !known.has(n));
+  const unknown = pick.filter((n) => !known.has(n));
   if (unknown.length) {
-    fail(`--pick names not exported by ${pkg.name}: ${unknown.join(', ')} (available: ${[...known].join(', ')})`);
+    fail(`${flag} names not exported by ${pkg.name}: ${unknown.join(', ')} (available: ${[...known].join(', ')})`);
   }
-  exposed = surface.filter((s) => opts.pick.includes(s.exported));
+  return surface.filter((s) => pick.includes(s.exported));
 }
+
+const exposed = resolveExposed(opts.pick, '--pick');
+
+// For the global format: the ordered list of { name, exposed } globals the
+// emitted file assigns. The legacy `--name X [--pick a,b]` spelling is exactly
+// one entry, so `--global X:a,b` and `--name X --pick a,b` emit identical
+// bytes; each additional --global adds another surface map over the SAME
+// (single) kit body.
+const globals =
+  opts.format === 'global'
+    ? opts.name
+      ? [{ name: opts.name, exposed }]
+      : globalSpecs.map((g) => ({ name: g.name, exposed: resolveExposed(g.pick, `--global ${g.name}`) }))
+    : null;
+
+// What the file as a whole exposes — for the log lines. With several globals
+// that's the union of their pick lists.
+const exposedCount = globals
+  ? new Set(globals.flatMap((g) => g.exposed.map((s) => s.exported))).size
+  : exposed.length;
 
 // -------------------------------------------------------------- generation
 
@@ -167,7 +224,8 @@ function strippedBody(esm) {
 }
 
 function build() {
-  const surfaceMap = exposed.map((s) => `  ${s.exported}: ${s.local},`).join('\n');
+  const mapOf = (list) => list.map((s) => `  ${s.exported}: ${s.local},`).join('\n');
+  const surfaceMap = mapOf(exposed);
   switch (opts.format) {
     case 'esm':
       return header('// The unit tests import this verbatim ESM copy.') + source;
@@ -179,18 +237,26 @@ function build() {
           '// classic-script bundle. Aggregate alias exports are dropped.'
         ) + strippedBody(source).replace(/^\n+/, '')
       );
-    case 'global':
+    case 'global': {
+      // One shared body, then one surface-map assignment per global. With the
+      // single legacy --name spelling this emits exactly the pre---global
+      // bytes, so committed vendored copies stay in sync.
+      const globalList = globals.map((g) => `globalThis.${g.name}`).join(', ');
+      const maps = globals
+        .map((g) => `globalThis.${g.name} = {\n${mapOf(g.exposed)}\n};`)
+        .join('\n');
       return (
         header(
           '// Classic-script IIFE build for importScripts()/<script> consumers;\n' +
-          `// exposes the public API on globalThis.${opts.name}.`
+          `// exposes the public API on ${globalList}.`
         ) +
         '(function () {\n' +
         '"use strict";\n' +
         strippedBody(source) +
-        `\nglobalThis.${opts.name} = {\n${surfaceMap}\n};\n` +
+        `\n${maps}\n` +
         '}());\n'
       );
+    }
     case 'cjs':
       return (
         header(
@@ -216,11 +282,12 @@ if (opts.check) {
   if (current !== expected) {
     fail(`${opts.out} is out of sync with the pinned ${pkg.name}.\nRun \`npm install && npm run vendor:sync\` and commit the result.`);
   }
-  console.log(`${pkg.name} vendor: ${opts.out} is in sync (${exposed.length} of ${surface.length} exports exposed).`);
+  console.log(`${pkg.name} vendor: ${opts.out} is in sync (${exposedCount} of ${surface.length} exports exposed).`);
 } else {
   mkdirSync(dirname(dest), { recursive: true });
   writeFileSync(dest, expected);
-  console.log(`${pkg.name} vendor: wrote ${opts.out} (format ${opts.format}, ${exposed.length} of ${surface.length} exports).`);
+  const shape = globals && globals.length > 1 ? `${globals.length} globals, ` : '';
+  console.log(`${pkg.name} vendor: wrote ${opts.out} (format ${opts.format}, ${shape}${exposedCount} of ${surface.length} exports).`);
 }
 }
 
