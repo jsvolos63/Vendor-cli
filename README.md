@@ -43,7 +43,13 @@ bins) and call:
 
 **`jfs-bump-kit-pins`** rewrites the repo's `github:jsvolos63/<kit>#<sha>`
 pins to each kit repo's current default-branch HEAD (needs `GITHUB_TOKEN`),
-touching `package.json` only when a pin actually moved.
+touching `package.json` only when a pin actually moved. It scans
+`dependencies`, `devDependencies`, and the `vendoredKits` object (the copy-in
+consumers, e.g. John's-News) — the same shapes `jfs-check-kit-pins` covers.
+For `vendoredKits` pins the bumper only rewrites the SHAs: those kits are
+copied in rather than npm-installed, so the consumer is responsible for
+regenerating its vendored copies from the new pins itself (no `vendor:sync`
+is assumed; the bin prints a reminder when a vendoredKits pin moves).
 
 **`jfs-check-kit-pins`** is a pre-flight that every `github:jsvolos63/<kit>#<sha>`
 pin points at a commit that actually exists on the remote. A hand-edited or
@@ -101,15 +107,36 @@ runVendorCli(dirname(dirname(fileURLToPath(import.meta.url))));
 
 `runVendorCli(kitDir, argv?)` reads the **kit's** `package.json` and
 `index.js` from `kitDir` and generates (or `--check`s) the consumer-side
-vendored copy. Flags are unchanged from the per-kit era:
+vendored copy:
 
 ```
 --format esm      verbatim ESM copy (unit tests import this)
---format global   classic-script IIFE on globalThis.<Name> (--name required)
+--format global   classic-script IIFE on globalThis.<Name> (--name required,
+                  unless --global is used instead)
 --format bare     export-stripped copy for classic-script bundle concatenation
 --format cjs      CommonJS transform for require() from CJS Netlify Functions
---pick a,b,c      global only: expose just this subset (typos are an error)
+--pick a,b,c      global/cjs: expose just this subset (typos are an error)
+--global Name[:a,b,c]
+                  global format only; repeatable. Each occurrence adds a named
+                  global to the SAME emitted file, exposing its `:`-suffixed
+                  pick list (or the full surface without one). The kit body is
+                  emitted once and every global's surface map closes over it —
+                  use this when one page needs two narrowed globals from the
+                  same kit, instead of vendoring the whole bundle twice.
+                  Mutually exclusive with --name/--pick, the legacy
+                  single-global spelling (`--global X:a,b` emits bytes
+                  identical to `--name X --pick a,b`).
 --check           exit 1 if the destination differs from what would be generated
+```
+
+E.g. a consumer that loads both the reader sanitizer and the news river from
+`@jfs/news-kit` as classic scripts vendors ONE file:
+
+```
+jfs-news-kit-vendor --format global \
+  --global NewsKitSanitize:sanitizeHtmlToFragment,isSafeContentUrl \
+  --global NewsKitRiver:renderNewsRiver,ensureNewsRiverStyles \
+  --out docs/js/vendor/news-kit.global.js
 ```
 
 The exposed surface for global/cjs is derived from the kit source's own
