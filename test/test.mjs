@@ -6,10 +6,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const KIT_DIR = join(dirname(fileURLToPath(import.meta.url)), 'fixture-kit');
 const BIN = join(KIT_DIR, 'bin', 'vendor.mjs');
@@ -231,6 +231,46 @@ test('argument validation: bad format, missing --out, --pick outside global/cjs'
   assert.notEqual(run(['--format', 'esm'], dir).status, 0);
   assert.notEqual(run(['--format', 'esm', '--out', 'x.js', '--pick', 'a'], dir).status, 0);
   assert.notEqual(run(['--format', 'bare', '--out', 'x.js', '--pick', 'a'], dir).status, 0);
+});
+
+test('unsupported export forms (default / re-export-from / export *) fail loudly', () => {
+  // Each of these previously slipped past both the surface derivation and the
+  // export stripping, emitting broken output (`default x` is a syntax error)
+  // or a silently incomplete surface. Generation must refuse instead.
+  const dir = freshDir();
+  const CLI = join(KIT_DIR, '..', '..', 'index.mjs');
+  let n = 0;
+  const makeKitBin = (body) => {
+    const kit = join(dir, `bad-kit-${n++}`);
+    mkdirSync(join(kit, 'bin'), { recursive: true });
+    writeFileSync(
+      join(kit, 'package.json'),
+      JSON.stringify({ name: '@jfs/bad-kit', version: '1.0.0', type: 'module' }) + '\n'
+    );
+    writeFileSync(join(kit, 'index.js'), body);
+    writeFileSync(
+      join(kit, 'bin', 'vendor.mjs'),
+      `import { runVendorCli } from ${JSON.stringify(pathToFileURL(CLI).href)};\n` +
+        `runVendorCli(${JSON.stringify(kit)});\n`
+    );
+    return join(kit, 'bin', 'vendor.mjs');
+  };
+  const cases = [
+    'export default function greet() {}\nexport const A = 1;\n',
+    "export const A = 1;\nexport { A as B } from './other.js';\n",
+    "export const A = 1;\nexport * from './other.js';\n",
+  ];
+  for (const body of cases) {
+    const bin = makeKitBin(body);
+    const r = spawnSync(process.execPath, [bin, '--format', 'cjs', '--out', 'out.cjs'], {
+      cwd: dir,
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 1, `expected failure for: ${body.split('\n')[1] || body}\n${r.stderr}`);
+    assert.match(r.stderr, /unsupported export form/);
+  }
+  // A kit using only the supported forms still generates fine (the fixture
+  // kit itself — exercised throughout this file — is the positive case).
 });
 
 // ------------------------------------------------- fixture-exact assertions

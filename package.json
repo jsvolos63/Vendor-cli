@@ -1,6 +1,6 @@
 {
   "name": "@jfs/vendor-cli",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Shared dev CLI for the @jfs kit family — vendoring generator (esm/global/bare/cjs, surface derived from the kit's own exports) plus the consolidated kit-pin bumper, kit-pin existence pre-flight, and version stamper the consumers used to each hand-roll.",
   "type": "module",
   "main": "index.mjs",

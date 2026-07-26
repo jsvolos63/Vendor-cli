@@ -148,6 +148,32 @@ test('versionStamp exits 1 with a clear message on an invalid fromFile pattern',
   assert.match(res.stderr, /invalid versionStamp.source.fromFile.pattern/);
 });
 
+test('versionStamp exits 1 with a clear message when an edit file is missing', () => {
+  // sw.js deliberately absent — must name the file, not dump an ENOENT stack.
+  const dir = freshRepo(PKG_SOURCE_STAMP, {
+    'index.html': '<span class="v">v0.0.0</span>\n<script src="app.js?v=0.0.0"></script>\n',
+  });
+  const res = stampSubprocess(dir);
+  assert.equal(res.status, 1, res.stderr);
+  assert.match(res.stderr, /cannot read sw\.js/);
+});
+
+test('versionStamp exits 1 with a clear message when the fromFile source is missing', () => {
+  const dir = freshRepo(
+    {
+      version: '1.0.0',
+      versionStamp: {
+        source: { fromFile: { path: 'v.js', pattern: "VERSION = '([^']+)'" } },
+        edits: [{ file: 'sw.js', find: 'x', replace: '{version}' }],
+      },
+    },
+    { 'sw.js': 'x\n' },
+  );
+  const res = stampSubprocess(dir);
+  assert.equal(res.status, 1, res.stderr);
+  assert.match(res.stderr, /cannot read versionStamp\.source\.fromFile v\.js/);
+});
+
 test('versionStamp refuses a suspicious version string', () => {
   const dir = freshRepo(
     { version: 'has space', versionStamp: { source: { packageVersion: true }, edits: [{ file: 'sw.js', find: 'x', replace: '{version}' }] } },
