@@ -75,8 +75,10 @@
 // (non-zero exit, nothing written) rather than producing a plausible artifact
 // with a silently missing export.
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { dirname, resolve, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 
 export function runVendorCli(kitDir, argv = process.argv.slice(2)) {
 const KIT_DIR = kitDir;
@@ -445,16 +447,84 @@ if (opts.check) {
 // consumer owns regenerating its vendored copies from the new pins (there is
 // no `vendor:sync` assumption here). `resolveHead` is injectable so tests can
 // exercise the rewrite without hitting the GitHub API.
+//
+// Resolution is GIT-FIRST (`git ls-remote <url> HEAD`) with the GitHub REST
+// API kept as the fallback. The API path used to be the only path, and it is
+// dead in every git-proxy-based environment (Claude Code remote sessions and
+// similar): the ambient credential there is scoped to the git transport, not
+// to api.github.com, so `commits/HEAD` answers 401 authenticated and 403
+// unauthenticated for these private repos and the bin died before bumping
+// anything. `git` reaches the same repos through whatever transport the
+// environment already has configured. The API path stays because it DOES work
+// in GitHub Actions (where `GITHUB_TOKEN` is API-scoped) and covers a git
+// binary that is missing or blocked.
 // ---------------------------------------------------------------------------
 const KIT_PIN_RE = /^github:(jsvolos63\/[A-Za-z0-9._-]+)#([0-9a-f]{40})$/;
+const REPO_RE = /^jsvolos63\/[A-Za-z0-9._-]+$/;
+const SHA_RE = /^[0-9a-f]{40}$/;
 
 // Bound each GitHub API call: these bins run unattended in CI workflows, and
 // a fetch with no signal can hang until the job's own timeout kills it with
 // nothing in the log. 30s is generous for a metadata GET.
 const GITHUB_API_TIMEOUT_MS = 30_000;
+// The git subprocesses get the same bound, for the same reason: a git sitting
+// on a credential prompt or a dead proxy must not wedge an unattended job.
+const GIT_TIMEOUT_MS = GITHUB_API_TIMEOUT_MS;
 
-async function fetchHeadSha(repo) {
-  const token = process.env.GITHUB_TOKEN || '';
+// A repo name here already matched KIT_PIN_RE, but it ends up in a subprocess
+// argv and a URL — re-assert the shape at the boundary rather than trusting
+// the caller.
+function gitRepoUrl(repo) {
+  if (!REPO_RE.test(repo)) {
+    throw new Error(`refusing to run git for unexpected repo name "${String(repo).slice(0, 60)}"`);
+  }
+  return `https://github.com/${repo}`;
+}
+
+// Always an argument ARRAY, never a shell string, so nothing in a repo name or
+// SHA can reach a shell. GIT_TERMINAL_PROMPT=0 (plus a no-op askpass) keeps a
+// credential-less environment from blocking on an interactive prompt.
+function runGit(args, opts = {}) {
+  return spawnSync('git', args, {
+    encoding: 'utf8',
+    timeout: GIT_TIMEOUT_MS,
+    windowsHide: true,
+    shell: false,
+    ...opts,
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_ASKPASS: 'true',
+      GCM_INTERACTIVE: 'never',
+      ...(opts.env || {}),
+    },
+  });
+}
+
+function gitFailureReason(res) {
+  if (res.error) return res.error.message;
+  if (res.signal) return `git killed by ${res.signal} (timeout ${GIT_TIMEOUT_MS}ms)`;
+  const last = String(res.stderr || '').trim().split('\n').filter(Boolean).pop();
+  return last || `git exited ${res.status}`;
+}
+
+// -> { sha } on success, { error } when git could not answer.
+function gitHeadSha(repo, run = runGit) {
+  let res;
+  try {
+    res = run(['ls-remote', gitRepoUrl(repo), 'HEAD']);
+  } catch (err) {
+    return { error: err?.message || String(err) };
+  }
+  if (!res || res.error || res.status !== 0) return { error: res ? gitFailureReason(res) : 'git produced no result' };
+  const first = String(res.stdout || '').trim().split('\n')[0] || '';
+  const sha = first.split(/\s+/)[0];
+  if (!SHA_RE.test(sha)) return { error: `unexpected ls-remote output "${first.slice(0, 60)}"` };
+  return { sha };
+}
+
+async function apiHeadSha(repo) {
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '';
   const res = await fetch(`https://api.github.com/repos/${repo}/commits/HEAD`, {
     headers: {
       accept: 'application/vnd.github.sha',
@@ -465,13 +535,86 @@ async function fetchHeadSha(repo) {
   });
   if (!res.ok) throw new Error(`${repo}: GitHub API returned HTTP ${res.status}`);
   const sha = (await res.text()).trim();
-  if (!/^[0-9a-f]{40}$/.test(sha)) {
+  if (!SHA_RE.test(sha)) {
     throw new Error(`${repo}: unexpected HEAD response "${sha.slice(0, 60)}"`);
   }
   return sha;
 }
 
-export async function bumpKitPins(rootDir = process.cwd(), { resolveHead = fetchHeadSha } = {}) {
+// Exported for tests only: `run` stands in for runGit so the git path can be
+// exercised (both branches) without a network.
+export async function _fetchHeadSha(repo, { run = runGit } = {}) {
+  // Assert the shape once, up front: `repo` reaches both a subprocess argv and
+  // a URL, and neither transport should ever see an unvalidated name.
+  if (!REPO_RE.test(repo)) {
+    throw new Error(`refusing to resolve unexpected repo name "${String(repo).slice(0, 60)}"`);
+  }
+  const viaGit = gitHeadSha(repo, run);
+  if (viaGit.sha) return viaGit.sha;
+  try {
+    return await apiHeadSha(repo);
+  } catch (apiErr) {
+    // Both transports failed. Name each failure in one line so the log doesn't
+    // just read "HTTP 401" and send the reader off to the API docs.
+    throw new Error(
+      `${repo}: could not resolve HEAD — git ls-remote failed (${viaGit.error}); ` +
+        `GitHub API fallback failed (${apiErr?.message || apiErr})`
+    );
+  }
+}
+
+const fetchHeadSha = (repo) => _fetchHeadSha(repo);
+
+// Explicit `--pin <kit>=<sha>` overrides: validate the SHA shape AND that the
+// named kit is really pinned in this package.json, so a typo fails with a
+// clear message instead of writing a package.json npm can't install.
+function resolveExplicitPins(explicit, pins) {
+  const overrides = new Map(); // pin object -> sha
+  for (const [rawName, rawSha] of Object.entries(explicit || {})) {
+    const sha = String(rawSha ?? '').trim().toLowerCase();
+    if (!SHA_RE.test(sha)) {
+      throw new Error(
+        `--pin ${rawName}: "${String(rawSha ?? '').slice(0, 60)}" is not a 40-character hex commit SHA`
+      );
+    }
+    const match = pins.find(
+      (p) => p.names.has(rawName) || p.repo === rawName || p.repo.split('/')[1] === rawName
+    );
+    if (!match) {
+      const known = pins.map((p) => [...p.names][0]).join(', ') || 'none';
+      throw new Error(`--pin ${rawName}: no kit pinned as "${rawName}" in package.json (pinned kits: ${known})`);
+    }
+    overrides.set(match, sha);
+  }
+  return overrides;
+}
+
+// Parse the `jfs-bump-kit-pins` argv. Exported so the bin stays a thin shim and
+// the flag handling is testable without spawning anything.
+export function parseBumpKitPinsArgs(argv = []) {
+  const pins = {};
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    let spec;
+    if (arg === '--pin') {
+      spec = argv[++i];
+      if (spec === undefined) throw new Error('--pin requires a <kit>=<sha> argument');
+    } else if (arg.startsWith('--pin=')) {
+      spec = arg.slice('--pin='.length);
+    } else {
+      throw new Error(`unknown argument "${arg}" (usage: jfs-bump-kit-pins [--pin <kit>=<sha>]...)`);
+    }
+    const eq = spec.indexOf('=');
+    if (eq <= 0) throw new Error(`--pin ${spec}: expected <kit>=<sha>`);
+    pins[spec.slice(0, eq)] = spec.slice(eq + 1);
+  }
+  return { pins };
+}
+
+export async function bumpKitPins(
+  rootDir = process.cwd(),
+  { resolveHead = fetchHeadSha, pins: explicitPins = null } = {}
+) {
   const file = resolve(rootDir, 'package.json');
   const raw = readFileSync(file, 'utf8');
   const pkg = JSON.parse(raw);
@@ -488,9 +631,10 @@ export async function bumpKitPins(rootDir = process.cwd(), { resolveHead = fetch
     const dup = dedup.get(key);
     if (dup) {
       dup.vendored = dup.vendored || vendored; // still one resolve/rewrite
+      dup.names.add(name); // …but every alias can still name it in a --pin
       return;
     }
-    const pin = { name, repo: m[1], pinned: m[2], vendored };
+    const pin = { name, repo: m[1], pinned: m[2], vendored, names: new Set([name]) };
     dedup.set(key, pin);
     pins.push(pin);
   };
@@ -505,19 +649,30 @@ export async function bumpKitPins(rootDir = process.cwd(), { resolveHead = fetch
     for (const [name, spec] of Object.entries(pkg.vendoredKits)) collect(name, spec, true);
   }
 
+  // Explicit pins are validated up front — before ANY resolution — so a typo'd
+  // SHA or an unknown kit name fails immediately instead of after a round of
+  // network calls (and never half-writes package.json).
+  const overrides = resolveExplicitPins(explicitPins, pins);
+
   let out = raw;
   let changed = false;
   let vendoredChanged = false;
-  for (const { name, repo, pinned, vendored } of pins) {
-    const head = await resolveHead(repo);
+  for (const pin of pins) {
+    const { name, repo, pinned, vendored } = pin;
+    const explicit = overrides.get(pin);
+    // An explicit pin skips resolution for that kit entirely — that is the
+    // point of the flag (pin to a known-good older commit, or bump without any
+    // remote access at all).
+    const head = explicit ?? (await resolveHead(repo));
+    const how = explicit ? ' (explicit --pin)' : '';
     if (head === pinned) {
-      console.log(`${name}: up to date at ${pinned.slice(0, 7)}`);
+      console.log(`${name}: up to date at ${pinned.slice(0, 7)}${how}`);
       continue;
     }
     out = out.replaceAll(`github:${repo}#${pinned}`, `github:${repo}#${head}`);
     changed = true;
     if (vendored) vendoredChanged = true;
-    console.log(`${name}: ${pinned.slice(0, 7)} -> ${head.slice(0, 7)}`);
+    console.log(`${name}: ${pinned.slice(0, 7)} -> ${head.slice(0, 7)}${how}`);
   }
 
   if (changed) {
@@ -543,14 +698,71 @@ export async function bumpKitPins(rootDir = process.cwd(), { resolveHead = fetch
 // remote, BEFORE `npm install` tries to fetch it. A hand-edited/typo'd SHA
 // otherwise surfaces as an opaque `npm install` git-128 / codeload 404 that
 // takes a while to diagnose; run in CI ahead of install, this turns it into a
-// one-line "pin X#<sha> does not exist" and fails fast. Existence is checked
-// against the same GitHub API `bumpKitPins` resolves HEAD from; `checkExists`
-// is injectable so tests never hit the network. Scans the same sections and
-// pin format as `bumpKitPins`, so the two stay symmetric. Throws on any missing
-// pin (or an unexpected API status); returns the number of pins verified.
+// one-line "pin X#<sha> does not exist" and fails fast. `checkExists` is
+// injectable so tests never hit the network. Scans the same sections and pin
+// format as `bumpKitPins`, so the two stay symmetric. Throws on any missing
+// pin (or an inconclusive check); returns the number of pins verified.
+//
+// Existence is GIT-FIRST for the same reason HEAD resolution is (see above):
+// `git fetch --depth=1 <url> <sha>` into a throwaway bare repo, with the API
+// as the fallback. `git ls-remote` alone would NOT do — pins routinely point
+// at commits that are no longer at any ref tip, and ls-remote only lists tips.
+// A depth-1 fetch of the exact SHA succeeds for a real historical commit and
+// fails with "upload-pack: not our ref" for one that does not exist, which is
+// exactly the distinction this pre-flight needs.
+//
+// FAIL-CLOSED CONTRACT (do not relax): only a positive "the remote says this
+// ref is not ours" answer counts as missing, and only a clean fetch counts as
+// present. Everything else — no git binary, transport error, timeout, an API
+// 403/5xx — is INCONCLUSIVE and must throw, never quietly pass. A network
+// outage turning this check green is the one failure mode that would make the
+// whole pre-flight worthless.
 // ---------------------------------------------------------------------------
-async function commitExists(repo, sha) {
-  const token = process.env.GITHUB_TOKEN || '';
+
+// Remote answers that positively mean "that commit is not on this repo".
+const GIT_MISSING_REF_RE =
+  /(upload-pack: not our ref|not our ref|couldn't find remote ref|no such remote ref|unadvertised object|did not send all necessary objects)/i;
+
+// -> { result: true|false } when git answered definitively, { error } when it
+// could not answer at all.
+function gitCommitExists(repo, sha, run = runGit) {
+  if (!SHA_RE.test(sha)) return { result: false }; // malformed pin can't exist
+  let url;
+  try {
+    url = gitRepoUrl(repo);
+  } catch (err) {
+    return { error: err?.message || String(err) };
+  }
+  let dir = null;
+  try {
+    dir = mkdtempSync(join(tmpdir(), 'jfs-kit-pin-'));
+    const init = run(['init', '--quiet', '--bare', dir]);
+    if (!init || init.error || init.status !== 0) {
+      return { error: init ? gitFailureReason(init) : 'git produced no result' };
+    }
+    const res = run(['fetch', '--quiet', '--depth=1', url, sha], { cwd: dir });
+    if (!res) return { error: 'git produced no result' };
+    if (!res.error && res.status === 0) return { result: true };
+    const text = `${res.stderr || ''}\n${res.error?.message || ''}`;
+    if (!res.error && GIT_MISSING_REF_RE.test(text)) return { result: false };
+    return { error: gitFailureReason(res) };
+  } catch (err) {
+    return { error: err?.message || String(err) };
+  } finally {
+    // Clean up on every path, including a throw — these are bare repos in the
+    // system temp dir and an unattended CI job may run this many times.
+    if (dir) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // Best-effort: a temp-dir removal failure must not mask the result.
+      }
+    }
+  }
+}
+
+async function apiCommitExists(repo, sha) {
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '';
   const res = await fetch(`https://api.github.com/repos/${repo}/commits/${sha}`, {
     headers: {
       accept: 'application/vnd.github.sha',
@@ -565,6 +777,28 @@ async function commitExists(repo, sha) {
   if (res.status === 404 || res.status === 422) return false;
   throw new Error(`${repo}@${sha.slice(0, 7)}: GitHub API returned HTTP ${res.status}`);
 }
+
+// Exported for tests only: `run` stands in for runGit so both branches can be
+// exercised without a network.
+export async function _commitExists(repo, sha, { run = runGit } = {}) {
+  if (!REPO_RE.test(repo)) {
+    throw new Error(`refusing to check unexpected repo name "${String(repo).slice(0, 60)}"`);
+  }
+  const viaGit = gitCommitExists(repo, sha, run);
+  if (viaGit.result !== undefined) return viaGit.result;
+  try {
+    return await apiCommitExists(repo, sha);
+  } catch (apiErr) {
+    // Inconclusive on BOTH transports -> throw. verifyKitPins turns this into
+    // a non-zero exit; it must never be read as "the pin is fine".
+    throw new Error(
+      `${repo}@${sha.slice(0, 7)}: could not verify pin — git fetch failed (${viaGit.error}); ` +
+        `GitHub API fallback failed (${apiErr?.message || apiErr})`
+    );
+  }
+}
+
+const commitExists = (repo, sha) => _commitExists(repo, sha);
 
 export async function verifyKitPins(rootDir = process.cwd(), { checkExists = commitExists } = {}) {
   const pkg = JSON.parse(readFileSync(resolve(rootDir, 'package.json'), 'utf8'));

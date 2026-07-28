@@ -42,7 +42,7 @@ bins) and call:
 ```
 
 **`jfs-bump-kit-pins`** rewrites the repo's `github:jsvolos63/<kit>#<sha>`
-pins to each kit repo's current default-branch HEAD (needs `GITHUB_TOKEN`),
+pins to each kit repo's current default-branch HEAD,
 touching `package.json` only when a pin actually moved. It scans
 `dependencies`, `devDependencies`, and the `vendoredKits` object (the copy-in
 consumers, e.g. John's-News) — the same shapes `jfs-check-kit-pins` covers.
@@ -51,19 +51,61 @@ copied in rather than npm-installed, so the consumer is responsible for
 regenerating its vendored copies from the new pins itself (no `vendor:sync`
 is assumed; the bin prints a reminder when a vendoredKits pin moves).
 
+Pin to an **explicit** commit instead of HEAD with a repeatable `--pin`
+(`<kit>` is the package name as it appears in `package.json`, or the repo
+name; the SHA must be 40 hex characters and the kit must actually be pinned
+in this repo). An explicit pin skips remote resolution for that kit entirely,
+so it also works with no remote access at all:
+
+```bash
+jfs-bump-kit-pins                                   # every kit -> its HEAD
+jfs-bump-kit-pins --pin @jfs/pwa-kit=<40-hex-sha>   # pin one kit back/forward
+```
+
 **`jfs-check-kit-pins`** is a pre-flight that every `github:jsvolos63/<kit>#<sha>`
 pin points at a commit that actually exists on the remote. A hand-edited or
 typo'd SHA otherwise surfaces as an opaque `npm install` git-128 / codeload 404;
 run this ahead of install in CI and it fails fast with a clear
 `pin <kit>#<sha> does not exist` instead. It scans `dependencies`,
-`devDependencies`, and the `vendoredKits` object (the copy-in consumers), needs
-`GITHUB_TOKEN` for private repos, and exits non-zero on any missing pin (or an
-inconclusive API status — a 403/5xx is not treated as "missing"):
+`devDependencies`, and the `vendoredKits` object (the copy-in consumers), and
+exits non-zero on any missing pin — or on an **inconclusive** check, which is
+deliberately not treated as "fine":
 
 ```yaml
 # in CI, before `npm ci`
 - run: jfs-check-kit-pins
 ```
+
+### How the remote is reached (git first, API fallback)
+
+Both pin bins resolve against the remote **git-first**, falling back to the
+GitHub REST API:
+
+| job | git | API fallback |
+| --- | --- | --- |
+| resolve HEAD | `git ls-remote <url> HEAD` | `GET /repos/<repo>/commits/HEAD` |
+| pin exists?  | `git fetch --depth=1 <url> <sha>` into a throwaway bare repo | `GET /repos/<repo>/commits/<sha>` |
+
+The API used to be the only path, and it is unusable wherever the ambient
+credential is scoped to the **git transport** rather than to `api.github.com`
+(Claude Code remote sessions and other git-proxy setups): the API answers 401
+authenticated / 403 unauthenticated for these private repos, so
+`jfs-bump-kit-pins` died with `GitHub API returned HTTP 401` before bumping
+anything. `git` reaches the same repos through whatever transport the
+environment already has. The API path is kept because it *does* work in GitHub
+Actions, where `GITHUB_TOKEN` is API-scoped (`GH_TOKEN` is accepted too), and
+it covers a git binary that's missing or blocked.
+
+Existence needs the depth-1 **fetch**, not `ls-remote`: pins routinely point at
+commits that are no longer at any ref tip, and `ls-remote` only lists tips. A
+depth-1 fetch of the exact SHA succeeds for a real historical commit and fails
+with `upload-pack: not our ref` for one that doesn't exist.
+
+`jfs-check-kit-pins` is **fail-closed**: only a clean fetch (or a 200) counts
+as present and only a positive "not our ref" (or a 404/422) counts as missing.
+Anything else — no git binary, transport error, timeout, API 403/5xx — is
+inconclusive and exits non-zero. A network outage must never turn this
+pre-flight green.
 
 **`jfs-version-stamp`** stamps one version string into the shell files that
 must agree on it, driven by a `versionStamp` block in the consumer's
