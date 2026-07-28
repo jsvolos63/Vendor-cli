@@ -67,6 +67,13 @@
 // runtime) or reference a removed one (a ReferenceError that fails service
 // worker install), and a drift check can't catch either because the committed
 // copy and the regenerated one would share the same stale list.
+//
+// That derivation is regex-level, so it is deliberately FAIL-CLOSED: every
+// `export` in the source must be one the derivation consumed, and static
+// `import` / `import.meta` must be absent from the formats that can't express
+// them. An export form the generator doesn't understand aborts generation
+// (non-zero exit, nothing written) rather than producing a plausible artifact
+// with a silently missing export.
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -145,15 +152,25 @@ const globalSpecs = opts.globals.map((spec) => {
 // declarations plus aggregate `export { a as b, c }` alias lines. The kits
 // deliberately use only these forms (no default export, no re-export-from),
 // which keeps this derivation exact.
+//
+// It also returns `accounted`: the source offset of every `export` keyword the
+// derivation actually consumed. The gate below asserts that set covers EVERY
+// top-level `export` in the file, so the CLI fails closed BY CONSTRUCTION — an
+// export form this function doesn't understand (today's `export var` /
+// `export function*` / `export const { a, b } = …`, or tomorrow's new syntax)
+// stops the build instead of silently vanishing from the generated surface.
 function deriveSurface(esm) {
   const surface = [];
+  const accounted = new Set();
   const declRe = /^export\s+(?:async\s+)?(?:function|const|let|class)\s+([A-Za-z0-9_$]+)/gm;
   let m;
   while ((m = declRe.exec(esm)) !== null) {
     surface.push({ exported: m[1], local: m[1] });
+    accounted.add(m.index);
   }
   const aggRe = /^export\s*\{([^}]*)\}\s*;?\s*$/gm;
   while ((m = aggRe.exec(esm)) !== null) {
+    accounted.add(m.index);
     for (const part of m[1].split(',')) {
       const spec = part.trim();
       if (!spec) continue;
@@ -162,8 +179,23 @@ function deriveSurface(esm) {
       surface.push({ exported: alias[2] || alias[1], local: alias[1] });
     }
   }
-  return surface;
+  return { surface, accounted };
 }
+
+// 1-based line number + trimmed line text for a source offset, so every
+// refusal below can point at the offending line.
+function lineInfo(index) {
+  const line = source.slice(0, index).split('\n').length;
+  const start = source.lastIndexOf('\n', index - 1) + 1;
+  const end = source.indexOf('\n', index);
+  return { line, text: source.slice(start, end === -1 ? source.length : end).trim() };
+}
+
+const SUPPORTED_FORMS =
+  'the supported forms are `export [async] function|const|let|class NAME …` and ' +
+  'aggregate `export { a as b, c }` lines. Anything else can be exported by ' +
+  'declaring it normally and adding it to an aggregate line ' +
+  '(e.g. `function* gen() {}` … `export { gen };`).';
 
 // The derivation (and the export-stripping in strippedBody) is only sound for
 // the forms the kits deliberately restrict themselves to. A default export or
@@ -171,7 +203,8 @@ function deriveSurface(esm) {
 // output — `export default x` strips to the syntax error `default x` (failing
 // service-worker install at the consumer), and `export { a } from './m'` /
 // `export * from './m'` silently vanish from the derived surface. Fail loudly
-// at generation time instead.
+// at generation time instead. (The catch-all gate below would also stop these;
+// this one is kept because it names the form.)
 {
   const unsupported = source.match(
     /^export\s+default\b|^export\s*\{[^}]*\}\s*from\b|^export\s*\*/m
@@ -186,7 +219,82 @@ function deriveSurface(esm) {
   }
 }
 
-const surface = deriveSurface(source);
+const { surface, accounted } = deriveSurface(source);
+
+// ------------------------------------------------------------- fail closed
+// Enumerating bad forms can only ever cover the ones we thought of, and the
+// failure mode of a missed one is the worst kind: a plausible artifact, exit
+// code 0, and a reassuring log line — with `vendor:check` blind to it, because
+// the committed copy and the regenerated copy share the omission. So instead
+// of listing what's rejected, assert that the derivation ACCOUNTED FOR every
+// `export` in the source, and refuse otherwise.
+{
+  const orphans = [];
+  const exportRe = /^export\b/gm;
+  let m;
+  while ((m = exportRe.exec(source)) !== null) {
+    if (!accounted.has(m.index)) orphans.push(lineInfo(m.index));
+  }
+  if (orphans.length) {
+    fail(
+      `${orphans.length} export(s) in ${KIT_DIR}/index.js that this generator cannot derive:\n` +
+        orphans.map((o) => `  line ${o.line}: ${o.text}`).join('\n') +
+        `\n${SUPPORTED_FORMS}\n` +
+        'Generating anyway would drop these from the global/cjs surface (or emit ' +
+        'broken classic-script syntax) with a passing exit code, so nothing was written.'
+    );
+  }
+}
+
+// Static `import` / `import.meta` are ES-module-only syntax. The bare, global
+// and cjs builds are a classic script / a CommonJS module, so either one is a
+// hard syntax error there (a service worker importScripts()-ing such a file
+// fails install) — and a RELATIVE import means a multi-file kit, which no
+// single-file vendored copy can represent in ANY format. Both used to be
+// copied through verbatim with exit code 0.
+{
+  const statics = [];
+  // Matches `import …` / `import{…}` / `import '…'`, but not the dynamic
+  // `import(…)` (legal in classic scripts and CJS) nor `import.meta`.
+  const importRe = /^[ \t]*import\b(?![ \t]*[(.])/gm;
+  let m;
+  while ((m = importRe.exec(source)) !== null) {
+    const stmt = source.slice(m.index, m.index + 400).split(';')[0];
+    const spec = stmt.match(/from\s*['"]([^'"]+)['"]/) || stmt.match(/^[ \t]*import\s*['"]([^'"]+)['"]/);
+    statics.push({ ...lineInfo(m.index), spec: spec ? spec[1] : null });
+  }
+
+  const relative = statics.find((s) => s.spec && /^[.\/]/.test(s.spec));
+  if (relative) {
+    fail(
+      `relative import "${relative.spec}" at ${KIT_DIR}/index.js:${relative.line} — a kit is ` +
+        'vendored as ONE file, so the imported module would be missing wherever the ' +
+        'generated copy lands. Inline the dependency into index.js.'
+    );
+  }
+
+  if (opts.format !== 'esm') {
+    if (statics.length) {
+      const s = statics[0];
+      fail(
+        `static import at ${KIT_DIR}/index.js:${s.line} (\`${s.text}\`) cannot be emitted in ` +
+          `--format ${opts.format}: that build is a classic script / CommonJS module, where a ` +
+          'static import is a syntax error (it would fail service-worker install or require() ' +
+          'at the consumer). Inline the dependency, or vendor this kit as --format esm only.'
+      );
+    }
+    const meta = source.search(/\bimport\s*\.\s*meta\b/);
+    if (meta !== -1) {
+      const s = lineInfo(meta);
+      fail(
+        `\`import.meta\` at ${KIT_DIR}/index.js:${s.line} (\`${s.text}\`) cannot be emitted in ` +
+          `--format ${opts.format}: it is only valid inside an ES module, so the generated ` +
+          'classic-script/CommonJS file would be a syntax error.'
+      );
+    }
+  }
+}
+
 if (surface.length === 0) {
   fail(`found no top-level exports in ${KIT_DIR}/index.js — refusing to generate an empty surface.`);
 }
