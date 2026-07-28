@@ -188,6 +188,142 @@ test('versionStamp refuses a suspicious version string', () => {
   assert.match(res.stderr, /suspicious version/);
 });
 
+// ------------------------------------------------- versionStamp / lockfile
+//
+// package-lock.json carries the package version twice (root + packages[""]);
+// npm only resyncs them on `npm install`, so a bump committed without one
+// leaves the committed lockfile stale. These cover the stamper keeping both in
+// lockstep — including that it never reformats the file and never touches a
+// dependency's own "version".
+
+// Shaped like real npm output, including a dependency whose version equals the
+// stale root version (it must survive untouched) and a nested "version" key.
+function lockfileFixture(version, { root = true, pkgs = true } = {}) {
+  return `{
+  "name": "demo",
+${root ? `  "version": "${version}",\n` : ''}  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "demo",
+${pkgs ? `      "version": "${version}",\n` : ''}      "license": "MIT",
+      "dependencies": {
+        "left-pad": "^1.3.0"
+      }
+    },
+    "node_modules/left-pad": {
+      "version": "${version}",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-notreal",
+      "engines": {
+        "node": ">=8"
+      }
+    }
+  }
+}
+`;
+}
+
+test('versionStamp keeps package-lock.json in lockstep with package.json', () => {
+  const dir = freshRepo(PKG_SOURCE_STAMP, {
+    'sw.js': "const SW_VERSION = '0.0.0';\n",
+    'index.html': '<span class="v">v0.0.0</span>\n<script src="app.js?v=0.0.0"></script>\n',
+    'package-lock.json': lockfileFixture('0.0.0'),
+  });
+  versionStamp(dir);
+  const lock = JSON.parse(readFileSync(join(dir, 'package-lock.json'), 'utf8'));
+  assert.equal(lock.version, '1.2.3');
+  assert.equal(lock.packages[''].version, '1.2.3');
+  // A dependency's own version is not the package version — leave it alone.
+  assert.equal(lock.packages['node_modules/left-pad'].version, '0.0.0');
+});
+
+test('versionStamp rewrites only the two version lines of a lockfile (no reformat)', () => {
+  const before = lockfileFixture('0.0.0');
+  const dir = freshRepo(PKG_SOURCE_STAMP, {
+    'sw.js': "const SW_VERSION = '0.0.0';\n",
+    'index.html': '<span class="v">v0.0.0</span>\n<script src="app.js?v=0.0.0"></script>\n',
+    'package-lock.json': before,
+  });
+  versionStamp(dir);
+  const after = readFileSync(join(dir, 'package-lock.json'), 'utf8');
+  const b = before.split('\n');
+  const a = after.split('\n');
+  assert.equal(a.length, b.length, 'line count must not change');
+  const changed = b.map((line, i) => [i, line, a[i]]).filter(([, line, now]) => line !== now);
+  assert.deepEqual(
+    changed.map(([, , now]) => now),
+    ['  "version": "1.2.3",', '      "version": "1.2.3",'],
+  );
+});
+
+test('versionStamp --check reports a drifted lockfile and exits 1', () => {
+  // Every other target is already stamped: the lockfile is the only drift.
+  const dir = freshRepo(PKG_SOURCE_STAMP, {
+    'sw.js': "const SW_VERSION = '1.2.3';\n",
+    'index.html': '<span class="v">v1.2.3</span>\n<script src="app.js?v=1.2.3"></script>\n',
+    'package-lock.json': lockfileFixture('1.2.2'),
+  });
+  const res = stampSubprocess(dir, ['--check']);
+  assert.equal(res.status, 1, res.stdout + res.stderr);
+  assert.match(res.stderr, /package-lock\.json is out of date \(expected 1\.2\.3/);
+  // --check must never write.
+  assert.equal(readFileSync(join(dir, 'package-lock.json'), 'utf8'), lockfileFixture('1.2.2'));
+});
+
+test('versionStamp --check passes on a synced lockfile', () => {
+  const dir = freshRepo(PKG_SOURCE_STAMP, {
+    'sw.js': "const SW_VERSION = '1.2.3';\n",
+    'index.html': '<span class="v">v1.2.3</span>\n<script src="app.js?v=1.2.3"></script>\n',
+    'package-lock.json': lockfileFixture('1.2.3'),
+  });
+  assert.doesNotThrow(() => versionStamp(dir, ['--check']));
+});
+
+test('versionStamp skips cleanly when the repo has no lockfile', () => {
+  // Weather deliberately gitignores its lockfile — never create or demand one.
+  const dir = freshRepo(PKG_SOURCE_STAMP, {
+    'sw.js': "const SW_VERSION = '0.0.0';\n",
+    'index.html': '<span class="v">v0.0.0</span>\n<script src="app.js?v=0.0.0"></script>\n',
+  });
+  versionStamp(dir);
+  assert.equal(existsSync(join(dir, 'package-lock.json')), false);
+  const res = stampSubprocess(dir, ['--check']);
+  assert.equal(res.status, 0, res.stderr);
+});
+
+test('versionStamp skips cleanly when the lockfile carries no version field', () => {
+  // npm omits both version fields when package.json has none (BearsMockDraft).
+  const before = lockfileFixture('0.0.0', { root: false, pkgs: false });
+  const dir = freshRepo(PKG_SOURCE_STAMP, {
+    'sw.js': "const SW_VERSION = '0.0.0';\n",
+    'index.html': '<span class="v">v0.0.0</span>\n<script src="app.js?v=0.0.0"></script>\n',
+    'package-lock.json': before,
+  });
+  versionStamp(dir);
+  assert.equal(readFileSync(join(dir, 'package-lock.json'), 'utf8'), before);
+  const res = stampSubprocess(dir, ['--check']);
+  assert.equal(res.status, 0, res.stderr);
+});
+
+test('versionStamp leaves the lockfile alone when the version comes from elsewhere', () => {
+  // BearsMockDraft sources from a JS constant; its lockfile is not a target.
+  const before = lockfileFixture('0.0.0');
+  const dir = freshRepo(
+    {
+      version: '9.9.9',
+      versionStamp: {
+        source: { fromFile: { path: 'version.js', pattern: "VERSION = '([^']+)'" } },
+        edits: [{ file: 'sw.js', find: "const SW_VERSION = '[^']*';", replace: "const SW_VERSION = '{version}';" }],
+      },
+    },
+    { 'version.js': "const VERSION = '2.18.6';\n", 'sw.js': "const SW_VERSION = 'x';\n", 'package-lock.json': before },
+  );
+  versionStamp(dir);
+  assert.equal(readFileSync(join(dir, 'package-lock.json'), 'utf8'), before);
+  assert.doesNotThrow(() => versionStamp(dir, ['--check']));
+});
+
 // ---------------------------------------------------------------- bumpKitPins
 
 const SHA_A = 'a'.repeat(40);

@@ -133,6 +133,18 @@ optionally sliced as `"NAME:8"`, with a `"timestamp"` fallback). Each edit's
 into `replace`. `--check` writes nothing and exits 1 on drift; it's a no-op
 for the non-deterministic `deployEnv` source.
 
+With the `{ packageVersion: true }` source, `package-lock.json` is an implicit
+target too: npm records the package's own version in the lockfile twice (the
+root `version` and `packages[""].version`) but only resyncs them on an
+`npm install` — `npm ci` accepts a stale pair silently and rewrites nothing, so
+a bump committed without a local install leaves the committed lockfile behind
+until some unrelated install mops it up. The stamper rewrites those two values
+and `--check` reports them as drift like any other target. It is a **textual**
+splice of exactly those two strings, never a JSON re-serialization, so npm's
+formatting is preserved byte for byte and a dependency's own `version` is never
+touched. Missing lockfile, a lockfile with no version fields, or a repo whose
+version comes from `fromFile`/`deployEnv`: clean no-op.
+
 ## How kits use it
 
 Each kit declares a dependency on this package (pinned by commit SHA, like
