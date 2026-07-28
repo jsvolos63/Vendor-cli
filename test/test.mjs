@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -233,44 +233,203 @@ test('argument validation: bad format, missing --out, --pick outside global/cjs'
   assert.notEqual(run(['--format', 'bare', '--out', 'x.js', '--pick', 'a'], dir).status, 0);
 });
 
-test('unsupported export forms (default / re-export-from / export *) fail loudly', () => {
-  // Each of these previously slipped past both the surface derivation and the
-  // export stripping, emitting broken output (`default x` is a syntax error)
-  // or a silently incomplete surface. Generation must refuse instead.
+// --------------------------------------------------------- fail-closed gate
+// A kit whose source uses a form the surface derivation can't handle must stop
+// generation. The failure mode this guards is the nasty one: a plausible
+// artifact, exit code 0, a reassuring log line — and `vendor:check` blind to
+// it, because the committed copy and the regenerated copy share the omission.
+//
+// Every case below asserts BOTH a non-zero exit AND that no output file was
+// produced (and that a pre-existing file at the destination is left untouched,
+// so a refusal can never leave a partial or stale artifact behind).
+
+let badKitSeq = 0;
+const CLI_PATH = join(KIT_DIR, '..', '..', 'index.mjs');
+
+// Build a throwaway kit (package.json + index.js + the same bin shim shape the
+// real kits ship) around `body`, and return its bin path.
+function makeKitBin(dir, body) {
+  const kit = join(dir, `kit-${badKitSeq++}`);
+  mkdirSync(join(kit, 'bin'), { recursive: true });
+  writeFileSync(
+    join(kit, 'package.json'),
+    JSON.stringify({ name: '@jfs/bad-kit', version: '1.0.0', type: 'module' }) + '\n'
+  );
+  writeFileSync(join(kit, 'index.js'), body);
+  writeFileSync(
+    join(kit, 'bin', 'vendor.mjs'),
+    `import { runVendorCli } from ${JSON.stringify(pathToFileURL(CLI_PATH).href)};\n` +
+      `runVendorCli(${JSON.stringify(kit)});\n`
+  );
+  return join(kit, 'bin', 'vendor.mjs');
+}
+
+function runKit(bin, args, cwd) {
+  return spawnSync(process.execPath, [bin, ...args], { cwd, encoding: 'utf8' });
+}
+
+// Assert `body` is refused for `format`: non-zero exit, nothing written, and a
+// pre-existing destination left byte-identical.
+function assertRefused(label, body, format = 'cjs', extraArgs = []) {
   const dir = freshDir();
-  const CLI = join(KIT_DIR, '..', '..', 'index.mjs');
-  let n = 0;
-  const makeKitBin = (body) => {
-    const kit = join(dir, `bad-kit-${n++}`);
-    mkdirSync(join(kit, 'bin'), { recursive: true });
-    writeFileSync(
-      join(kit, 'package.json'),
-      JSON.stringify({ name: '@jfs/bad-kit', version: '1.0.0', type: 'module' }) + '\n'
-    );
-    writeFileSync(join(kit, 'index.js'), body);
-    writeFileSync(
-      join(kit, 'bin', 'vendor.mjs'),
-      `import { runVendorCli } from ${JSON.stringify(pathToFileURL(CLI).href)};\n` +
-        `runVendorCli(${JSON.stringify(kit)});\n`
-    );
-    return join(kit, 'bin', 'vendor.mjs');
-  };
+  const bin = makeKitBin(dir, body);
+  const out = 'out.generated.js';
+  const dest = join(dir, out);
+
+  const r = runKit(bin, ['--format', format, '--out', out, ...extraArgs], dir);
+  assert.notEqual(r.status, 0, `${label}: expected a non-zero exit\nstdout: ${r.stdout}`);
+  assert.equal(existsSync(dest), false, `${label}: refusal must not write ${out}`);
+  assert.doesNotMatch(r.stdout, /wrote /, `${label}: must not log a successful write`);
+
+  // …and with a stale artifact already sitting at the destination, the refusal
+  // must leave it exactly as it was (no truncate, no partial rewrite).
+  const stale = '// previously generated\nmodule.exports = {};\n';
+  writeFileSync(dest, stale);
+  const again = runKit(bin, ['--format', format, '--out', out, ...extraArgs], dir);
+  assert.notEqual(again.status, 0, `${label}: expected a non-zero exit (stale-dest run)`);
+  assert.equal(readFileSync(dest, 'utf8'), stale, `${label}: refusal must not touch a stale ${out}`);
+  return r;
+}
+
+test('fail-closed: export forms the derivation cannot handle are refused', () => {
+  // Previously each of these produced a BAD ARTIFACT with exit code 0: the
+  // export was missing from the derived surface (silently unavailable to the
+  // consumer) or the stripped body was a syntax error.
   const cases = [
-    'export default function greet() {}\nexport const A = 1;\n',
-    "export const A = 1;\nexport { A as B } from './other.js';\n",
-    "export const A = 1;\nexport * from './other.js';\n",
+    ['export var', 'export const A = 1;\nexport var B = 2;\n'],
+    ['export function*', 'export const A = 1;\nexport function* gen() { yield 1; }\n'],
+    [
+      'export async function*',
+      'export const A = 1;\nexport async function* agen() { yield 1; }\n',
+    ],
+    [
+      'export const {…} destructuring',
+      'const src = { C: 3, D: 4 };\nexport const A = 1;\nexport const { C, D } = src;\n',
+    ],
+    [
+      'export const […] destructuring',
+      'const pair = [1, 2];\nexport const A = 1;\nexport const [E, F] = pair;\n',
+    ],
+    ['export let destructuring', 'const s = { G: 1 };\nexport const A = 1;\nexport let { G } = s;\n'],
+    ['export enum-ish unknown form', 'export const A = 1;\nexport type Foo = 1;\n'],
   ];
-  for (const body of cases) {
-    const bin = makeKitBin(body);
-    const r = spawnSync(process.execPath, [bin, '--format', 'cjs', '--out', 'out.cjs'], {
-      cwd: dir,
-      encoding: 'utf8',
-    });
-    assert.equal(r.status, 1, `expected failure for: ${body.split('\n')[1] || body}\n${r.stderr}`);
-    assert.match(r.stderr, /unsupported export form/);
+  for (const [label, body] of cases) {
+    const r = assertRefused(label, body);
+    assert.match(r.stderr, /cannot derive/, `${label}: stderr should name the undeliverable exports`);
   }
-  // A kit using only the supported forms still generates fine (the fixture
-  // kit itself — exercised throughout this file — is the positive case).
+});
+
+test('fail-closed: the refused export is named with its line', () => {
+  const dir = freshDir();
+  const bin = makeKitBin(dir, 'export const A = 1;\nexport var B = 2;\n');
+  const r = runKit(bin, ['--format', 'cjs', '--out', 'out.cjs'], dir);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /line 2: export var B = 2;/);
+});
+
+test('fail-closed: unsupported export forms (default / re-export-from / export *) still name the form', () => {
+  const cases = [
+    ['export default', 'export default function greet() {}\nexport const A = 1;\n'],
+    ['re-export-from', "export const A = 1;\nexport { A as B } from './other.js';\n"],
+    ['export *', "export const A = 1;\nexport * from './other.js';\n"],
+  ];
+  for (const [label, body] of cases) {
+    const r = assertRefused(label, body);
+    assert.match(r.stderr, /unsupported export form/, `${label}: keeps the specific diagnostic`);
+  }
+});
+
+test('fail-closed: a static import is refused for classic-script/CommonJS formats', () => {
+  // This emitted the `import` line verbatim into the cjs/global/bare builds:
+  // `node --check` on the result is a SyntaxError, and a classic service
+  // worker importScripts()-ing it fails install.
+  const body = "import { createHash } from 'node:crypto';\nexport const A = createHash;\n";
+  for (const format of ['cjs', 'bare', 'global']) {
+    const extra = format === 'global' ? ['--name', 'G'] : [];
+    const r = assertRefused(`static import (${format})`, body, format, extra);
+    assert.match(r.stderr, /static import/);
+  }
+  // The esm format IS a module, so a bare-specifier import is fine there.
+  const dir = freshDir();
+  const bin = makeKitBin(dir, body);
+  const ok = runKit(bin, ['--format', 'esm', '--out', 'ok.esm.js'], dir);
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.ok(readFileSync(join(dir, 'ok.esm.js'), 'utf8').includes("from 'node:crypto'"));
+});
+
+test('fail-closed: a relative import is refused in every format (a kit is one file)', () => {
+  const body = "import { helper } from './helper.js';\nexport const A = helper;\n";
+  for (const format of ['esm', 'cjs', 'bare']) {
+    const r = assertRefused(`relative import (${format})`, body, format);
+    assert.match(r.stderr, /relative import/);
+  }
+});
+
+test('fail-closed: import.meta is refused for classic-script/CommonJS formats', () => {
+  const body = 'export const A = 1;\nexport const HERE = import.meta.url;\n';
+  for (const format of ['cjs', 'bare', 'global']) {
+    const extra = format === 'global' ? ['--name', 'G'] : [];
+    const r = assertRefused(`import.meta (${format})`, body, format, extra);
+    assert.match(r.stderr, /import\.meta/);
+  }
+  // Verbatim esm keeps working — it really is a module.
+  const dir = freshDir();
+  const bin = makeKitBin(dir, body);
+  assert.equal(runKit(bin, ['--format', 'esm', '--out', 'meta.esm.js'], dir).status, 0);
+});
+
+test('fail-closed: dynamic import() is NOT refused (legal in every emitted format)', () => {
+  const dir = freshDir();
+  const bin = makeKitBin(dir, "export const load = () => import('node:crypto');\n");
+  for (const [format, extra] of [['cjs', []], ['bare', []], ['global', ['--name', 'G']]]) {
+    const out = `dyn.${format}.js`;
+    const r = runKit(bin, ['--format', format, '--out', out, ...extra], dir);
+    assert.equal(r.status, 0, `${format}: ${r.stderr}`);
+    assert.equal(syntaxCheck(join(dir, out)).status, 0, `${format} output must parse`);
+  }
+});
+
+test('control: a well-formed kit still generates its FULL surface in every format', async () => {
+  // The regression the gate exists to prevent, from the other side: nothing
+  // above may cost a well-formed kit any of its exports.
+  const dir = freshDir();
+  const bin = makeKitBin(
+    dir,
+    'export function greet(n) { return `hi ${n}`; }\n' +
+      'export async function pull() { return 1; }\n' +
+      'export const ANSWER = 42;\n' +
+      'export let counter = 0;\n' +
+      'export class Widget { constructor(id) { this.id = id; } }\n' +
+      'function helper(x) { return x * 2; }\n' +
+      'export { helper as helperAlias, ANSWER as THE_ANSWER };\n'
+  );
+  const all = ['greet', 'pull', 'ANSWER', 'counter', 'Widget', 'helperAlias', 'THE_ANSWER'];
+
+  assert.equal(runKit(bin, ['--format', 'esm', '--out', 'c.esm.js'], dir).status, 0);
+  const esm = readFileSync(join(dir, 'c.esm.js'), 'utf8');
+  for (const n of all) assert.ok(esm.includes(n), `esm keeps ${n}`);
+
+  assert.equal(runKit(bin, ['--format', 'bare', '--out', 'c.bare.js'], dir).status, 0);
+  assert.equal(syntaxCheck(join(dir, 'c.bare.js')).status, 0);
+  assert.ok(!/^export\s/m.test(readFileSync(join(dir, 'c.bare.js'), 'utf8')));
+
+  const g = runKit(bin, ['--format', 'global', '--name', 'Ctl', '--out', 'c.global.js'], dir);
+  assert.equal(g.status, 0, g.stderr);
+  assert.match(g.stdout, new RegExp(`${all.length} of ${all.length} exports`));
+  assert.equal(syntaxCheck(join(dir, 'c.global.js')).status, 0);
+  assert.deepEqual(
+    [...globalMapNames(readFileSync(join(dir, 'c.global.js'), 'utf8'), 'Ctl')].sort(),
+    [...all].sort()
+  );
+
+  const c = runKit(bin, ['--format', 'cjs', '--out', 'c.cjs'], dir);
+  assert.equal(c.status, 0, c.stderr);
+  const { createRequire } = await import('node:module');
+  const mod = createRequire(import.meta.url)(join(dir, 'c.cjs'));
+  assert.deepEqual(Object.keys(mod).sort(), [...all].sort(), 'require() must expose every export');
+  assert.equal(mod.greet('kit'), 'hi kit');
+  assert.equal(mod.THE_ANSWER, 42);
+  assert.equal(mod.helperAlias(21), 42);
 });
 
 // ------------------------------------------------- fixture-exact assertions
