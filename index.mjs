@@ -873,6 +873,9 @@ export async function verifyKitPins(rootDir = process.cwd(), { checkExists = com
 // Each edit's `find` is a RegExp string (optional `flags`); `{version}` in
 // `replace` is substituted literally. `--check` writes nothing and exits 1 on
 // drift — consumers run it in CI as version:check.
+//
+// With `{ "packageVersion": true }` the lockfile is stamped too — see
+// stampLockfile below.
 // ---------------------------------------------------------------------------
 const VERSION_RE = /^[A-Za-z0-9._-]+$/;
 
@@ -921,6 +924,71 @@ function resolveStampVersion(source, rootDir) {
     failStamp('no deployEnv var resolved and no timestamp fallback');
   }
   return failStamp('versionStamp.source must set packageVersion, fromFile, or deployEnv');
+}
+
+// ---------------------------------------------------------------------------
+// package-lock.json carries the package's own version in two structural places
+// — the root object's `version` and `packages[""].version` — and npm only
+// resyncs them on an `npm install`. `npm ci` accepts a stale pair silently and
+// does NOT rewrite the file, so a version bump committed without a local
+// install leaves the committed lockfile behind, invisibly, until some unrelated
+// install mops it up (which is how a "kit pin bump" PR ends up being nothing
+// but two lockfile version lines). When package.json's `version` is the source
+// of truth, treat those two values as stamp targets so `--check` catches the
+// drift in CI like any other target.
+//
+// Deliberately textual, not JSON.parse → JSON.stringify: lockfiles run to
+// thousands of lines and npm's exact serialization must survive, so we splice
+// only the two version strings and leave every other byte alone. Both patterns
+// are anchored so they cannot reach a dependency's `version`: the root one must
+// sit at top-level indentation (npm indents package entries by 4+ spaces), and
+// the packages one must be inside the `""` entry that opens the `packages`
+// object, with `[^{}]` forbidding the match from crossing into a nested entry.
+// ---------------------------------------------------------------------------
+const LOCKFILE = 'package-lock.json';
+const LOCK_TARGETS = [
+  { what: 'version', re: /(^\{[\s\S]*?\n[ \t]{1,2}"version"[ \t]*:[ \t]*")([^"\n]*)(")/ },
+  {
+    what: 'packages[""].version',
+    re: /("packages"[ \t]*:[ \t]*\{\s*""[ \t]*:[ \t]*\{[^{}]*?"version"[ \t]*:[ \t]*")([^"\n]*)(")/,
+  },
+];
+
+// Returns true when `check` found drift. Any shape it does not recognise —
+// missing file, a lockfile with no version fields (npm omits them when
+// package.json has none) — is a clean no-op, never an error: Weather
+// gitignores its lockfile and BearsMockDraft's package.json has no version.
+function stampLockfile(rootDir, version, check) {
+  const dest = resolve(rootDir, LOCKFILE);
+  let src;
+  try {
+    src = readFileSync(dest, 'utf8');
+  } catch {
+    return false; // no lockfile in this repo — nothing to keep in lockstep
+  }
+
+  let next = src;
+  const stale = [];
+  for (const { what, re } of LOCK_TARGETS) {
+    const m = next.match(re);
+    if (!m) continue; // this lockfile shape doesn't carry that version
+    if (m[2] === version) continue;
+    stale.push(`${what}: ${m[2]}`);
+    // Function replacer so `$`-sequences in the version can't be interpolated;
+    // the non-global regex rewrites exactly the one anchored occurrence.
+    next = next.replace(re, (_all, pre, _old, post) => pre + version + post);
+  }
+
+  if (!stale.length) return false;
+  if (check) {
+    console.error(
+      `version-stamp: ${LOCKFILE} is out of date (expected ${version}; found ${stale.join(', ')})`
+    );
+    return true;
+  }
+  writeFileSync(dest, next);
+  console.log(`version-stamp: stamped ${version} into ${LOCKFILE} (${stale.length} field(s))`);
+  return false;
 }
 
 export function versionStamp(rootDir = process.cwd(), argv = process.argv.slice(2)) {
@@ -974,6 +1042,13 @@ export function versionStamp(rootDir = process.cwd(), argv = process.argv.slice(
       writeFileSync(dest, next);
       console.log(`version-stamp: stamped ${version} into ${file}`);
     }
+  }
+
+  // Only when package.json's own `version` is the source of truth: a repo that
+  // sources its version from elsewhere (a JS constant, a deploy id) has no
+  // reason for its lockfile to carry that value.
+  if (config.source?.packageVersion && typeof pkg.version === 'string') {
+    if (stampLockfile(rootDir, version, check)) drift = true;
   }
 
   if (check && drift) failStamp('run `npm run version:stamp` and commit the result.');
