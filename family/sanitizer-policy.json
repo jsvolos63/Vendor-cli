@@ -1,0 +1,50 @@
+{
+  "comment": [
+    "Canonical @jfs sanitizer policy — the single source of truth for the",
+    "security-critical constants that dom-kit's sanitizeHtml and news-kit's",
+    "sanitizeHtmlToFragment / URL guards used to hand-mirror (the mirror",
+    "comment drifted once already: MATH was blocked in one kit and not the",
+    "other). Each kit carries these values between",
+    "`// @jfs-sanitizer-policy:<region>:start` / `:end` markers and",
+    "regenerates them with `jfs-sanitizer-policy-sync`; the kits' CI runs",
+    "the `--check` mode and fails on drift.",
+    "",
+    "blockedTags — tags whose ENTIRE SUBTREE is removed, never unwrapped:",
+    "unwrapping <script>/<style> would keep their raw text as visible",
+    "content, form controls invite UI redressing, and svg/math open mXSS",
+    "namespace confusion. Stored lowercase; per-region templates render the",
+    "case/quoting each kit needs.",
+    "",
+    "urlControlChars — strips ALL C0 controls + DEL anywhere in a URL",
+    "before scheme checks: browsers drop tab/newline/NUL from a URL before",
+    "resolving its scheme, so `java\\tscript:` would otherwise slip past a",
+    "scheme test, and control characters embedded in an accepted URL must",
+    "not survive into the returned value either."
+  ],
+  "blockedTags": [
+    "script",
+    "style",
+    "iframe",
+    "noscript",
+    "form",
+    "input",
+    "button",
+    "select",
+    "textarea",
+    "svg",
+    "math",
+    "video",
+    "audio",
+    "object",
+    "embed",
+    "link",
+    "meta",
+    "base",
+    "title",
+    "template"
+  ],
+  "urlControlChars": {
+    "source": "[\\u0000-\\u001F\\u007F]",
+    "flags": "g"
+  }
+}
