@@ -1182,3 +1182,174 @@ export function claudeMdSync(rootDir = process.cwd(), argv = []) {
   writeFileSync(target, next);
   console.log('claude-md-sync: updated the CLAUDE.md family-conventions block.');
 }
+
+// ---------------------------------------------------------------------------
+// jfs-sanitizer-policy-sync — the sanitizer-policy constants synchronizer.
+//
+// dom-kit's `_BLOCKED_TAGS` and news-kit's `DEFAULT_BLOCKED` are the same
+// security-critical tag list, and the URL control-character strip regex
+// existed three times across the two kits. A comment asserted the mirror and
+// it still drifted (MATH was blocked in one kit and not the other) — exactly
+// the failure jfs-claude-md-sync exists to prevent, applied to sanitizer
+// policy. The canonical data now lives once, in family/sanitizer-policy.json
+// here; each kit carries the constants between per-region marker comments
+// that this tool rewrites wholesale:
+//
+//   // @jfs-sanitizer-policy:blocked-tags:start case=lower quote=double
+//   "script", "style", ...
+//   // @jfs-sanitizer-policy:blocked-tags:end
+//
+// Start-marker params drive a small per-region template, so each kit keeps
+// its own formatting (dom-kit lowercase double-quoted, news-kit UPPERCASE
+// single-quoted) while the VALUES can't drift. `--check` fails with a
+// diff-style message instead of writing — each kit's CI runs that.
+
+const POLICY_START_RE = /^([ \t]*)\/\/ @jfs-sanitizer-policy:([a-z-]+):start\b(.*)$/;
+const POLICY_MARKER_RE = /@jfs-sanitizer-policy:[a-z-]+:(start|end)\b/;
+
+export function sanitizerPolicy() {
+  return JSON.parse(
+    readFileSync(new URL('./family/sanitizer-policy.json', import.meta.url), 'utf8')
+  );
+}
+
+// Render one blocked-tags item line-set: quoted, comma-separated, greedily
+// wrapped at 80 columns at the marker's own indentation, so the output is
+// deterministic (byte-stable) for a given policy + params.
+function renderBlockedTags(policy, params, indent, bad) {
+  const casing = params.case ?? 'lower';
+  const quote = params.quote ?? 'single';
+  for (const key of Object.keys(params)) {
+    if (key !== 'case' && key !== 'quote') bad(`unknown param '${key}' for blocked-tags (allowed: case, quote)`);
+  }
+  if (casing !== 'lower' && casing !== 'upper') bad(`param case=${casing} must be 'lower' or 'upper'`);
+  if (quote !== 'single' && quote !== 'double') bad(`param quote=${quote} must be 'single' or 'double'`);
+  const q = quote === 'double' ? '"' : "'";
+  const items = policy.blockedTags.map(
+    (t) => `${q}${casing === 'upper' ? t.toUpperCase() : t}${q},`
+  );
+  const lines = [];
+  let line = '';
+  for (const item of items) {
+    const candidate = line ? `${line} ${item}` : indent + item;
+    if (line && candidate.length > 80) {
+      lines.push(line);
+      line = indent + item;
+    } else {
+      line = candidate;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+// Render the URL control-character strip regex as a complete const
+// declaration (the const NAME is the per-kit knob).
+function renderUrlControlChars(policy, params, indent, bad) {
+  for (const key of Object.keys(params)) {
+    if (key !== 'const') bad(`unknown param '${key}' for url-control-chars (allowed: const)`);
+  }
+  const name = params.const;
+  if (!name || !/^[A-Za-z_$][\w$]*$/.test(name)) {
+    bad(`url-control-chars needs const=<identifier> (got '${name ?? ''}')`);
+  }
+  const { source, flags } = policy.urlControlChars;
+  return [`${indent}const ${name} = /${source}/${flags};`];
+}
+
+const POLICY_REGIONS = {
+  'blocked-tags': renderBlockedTags,
+  'url-control-chars': renderUrlControlChars,
+};
+
+export function sanitizerPolicySync(rootDir = process.cwd(), argv = []) {
+  const check = argv.includes('--check');
+  const fail = (msg) => {
+    console.error(`sanitizer-policy-sync: ${msg}`);
+    process.exit(1);
+  };
+  const unknownFlag = argv.find((a) => a.startsWith('--') && a !== '--check');
+  if (unknownFlag) return fail(`unknown flag ${unknownFlag}`);
+  const targets = argv.filter((a) => !a.startsWith('--'));
+  if (targets.length === 0) {
+    return fail('usage: jfs-sanitizer-policy-sync [--check] <file> …');
+  }
+  const policy = sanitizerPolicy();
+  let drift = false;
+  for (const file of targets) {
+    const path = resolve(rootDir, file);
+    let src;
+    try {
+      src = readFileSync(path, 'utf8');
+    } catch (e) {
+      return fail(`cannot read ${file}: ${e.message}`);
+    }
+    const lines = src.split('\n');
+    const out = [];
+    let regions = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const m = POLICY_START_RE.exec(lines[i]);
+      if (!m) {
+        // A stray end marker outside a region means a hand edit mangled its
+        // start; rewriting around it would eat or duplicate code, so stop.
+        if (POLICY_MARKER_RE.test(lines[i])) {
+          return fail(`${file}:${i + 1}: sanitizer-policy markers are mangled (end without start, or a malformed start marker) — restore the marker pair, then re-run.`);
+        }
+        out.push(lines[i]);
+        continue;
+      }
+      const [, indent, region, rawParams] = m;
+      const render = POLICY_REGIONS[region];
+      if (!render) {
+        return fail(`${file}:${i + 1}: unknown region '${region}' (known: ${Object.keys(POLICY_REGIONS).join(', ')})`);
+      }
+      const endMarker = `@jfs-sanitizer-policy:${region}:end`;
+      let j = i + 1;
+      while (j < lines.length && !lines[j].includes(endMarker)) {
+        if (POLICY_MARKER_RE.test(lines[j])) {
+          return fail(`${file}:${j + 1}: sanitizer-policy markers are mangled (nested or mismatched marker inside region '${region}') — restore the marker pair, then re-run.`);
+        }
+        j++;
+      }
+      if (j === lines.length) {
+        return fail(`${file}:${i + 1}: region '${region}' has no end marker — restore it, then re-run.`);
+      }
+      const params = {};
+      for (const tok of rawParams.trim().split(/\s+/).filter(Boolean)) {
+        const pm = /^([a-z]+)=(\S+)$/.exec(tok);
+        if (!pm) return fail(`${file}:${i + 1}: malformed param '${tok}' in region '${region}' (expected key=value)`);
+        params[pm[1]] = pm[2];
+      }
+      const bad = (msg) => fail(`${file}:${i + 1}: ${msg}`);
+      const body = render(policy, params, indent, bad);
+      const current = lines.slice(i + 1, j);
+      if (current.join('\n') !== body.join('\n')) {
+        drift = true;
+        if (check) {
+          console.error(`sanitizer-policy-sync: ${file} region '${region}' is out of date:`);
+          for (const l of current) console.error(`- ${l}`);
+          for (const l of body) console.error(`+ ${l}`);
+        }
+      }
+      out.push(lines[i], ...body, lines[j]);
+      i = j;
+      regions++;
+    }
+    if (regions === 0) {
+      // A target with no regions is a misconfiguration, not "clean": passing
+      // silently would let a deleted marker disable the gate.
+      return fail(`${file}: no @jfs-sanitizer-policy regions found — add the start/end markers first.`);
+    }
+    const next = out.join('\n');
+    if (next === src) {
+      console.log(`sanitizer-policy-sync: ${file} in sync (${regions} region${regions === 1 ? '' : 's'}).`);
+    } else if (!check) {
+      writeFileSync(path, next);
+      console.log(`sanitizer-policy-sync: updated ${file}.`);
+    }
+  }
+  if (check && drift) {
+    return fail('sanitizer-policy regions are out of date — run `jfs-sanitizer-policy-sync <file>` and commit the result.');
+  }
+  if (check) console.log('sanitizer-policy-sync: all regions in sync.');
+}

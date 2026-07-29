@@ -40,6 +40,18 @@ bump the version, and consumers pick it up via `jfs-claude-md-sync` — family
 CI fails any repo whose block has drifted. The block is deliberately short:
 only conventions that are truly family-wide belong in it.
 
+## The canonical sanitizer policy
+
+`family/sanitizer-policy.json` is the single source for the family's
+security-critical sanitizer constants: the blocked-tag list that dom-kit's
+`_BLOCKED_TAGS` and news-kit's `DEFAULT_BLOCKED` used to hand-mirror (and
+drifted on once — MATH), and the URL control-character strip regex that
+existed three times across the two kits. Each kit carries the constants
+between `// @jfs-sanitizer-policy:<region>:start` / `:end` markers and
+regenerates them with `jfs-sanitizer-policy-sync` (start-marker params pick
+the kit's casing/quoting); the kits' CI runs the `--check` mode and fails on
+drift. Edit the JSON here, bump the version, and re-pin + re-sync the kits.
+
 <!-- jfs-family-conventions:start — managed by jfs-claude-md-sync; edit family/family-conventions.md in @jfs/vendor-cli -->
 
 ## Family conventions
