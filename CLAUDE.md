@@ -40,8 +40,6 @@ bump the version, and consumers pick it up via `jfs-claude-md-sync` — family
 CI fails any repo whose block has drifted. The block is deliberately short:
 only conventions that are truly family-wide belong in it.
 
-<!-- jfs-family-conventions:start — managed by jfs-claude-md-sync; edit family/family-conventions.md in @jfs/vendor-cli -->
-
 ## The canonical sanitizer policy
 
 `family/sanitizer-policy.json` is the single source for the family's
@@ -53,6 +51,8 @@ between `// @jfs-sanitizer-policy:<region>:start` / `:end` markers and
 regenerates them with `jfs-sanitizer-policy-sync` (start-marker params pick
 the kit's casing/quoting); the kits' CI runs the `--check` mode and fails on
 drift. Edit the JSON here, bump the version, and re-pin + re-sync the kits.
+
+<!-- jfs-family-conventions:start — managed by jfs-claude-md-sync; edit family/family-conventions.md in @jfs/vendor-cli -->
 
 ## Family conventions
 
