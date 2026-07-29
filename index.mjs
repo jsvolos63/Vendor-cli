@@ -80,72 +80,78 @@ import { dirname, resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 
-export function runVendorCli(kitDir, argv = process.argv.slice(2)) {
-const KIT_DIR = kitDir;
-const pkg = JSON.parse(readFileSync(`${KIT_DIR}/package.json`, 'utf8'));
-const source = readFileSync(`${KIT_DIR}/index.js`, 'utf8');
+// The generation is staged as named, parameter-passing functions —
+// parseVendorArgs → deriveKitSurface → resolveKitExposure →
+// emitVendoredOutput → writeOrCheckOutput — with runVendorCli (at the end of
+// this section) as a thin orchestrator. Every stage THROWS VendorCliError
+// instead of exiting; runVendorCli catches it and routes the message through
+// its fail(), so the CLI's stderr text and exit codes are unchanged.
 
-const repoMatch = String(pkg.repository?.url || '').match(
-  /github\.com[/:]([^/]+\/[^/.]+)/
-);
-const REPO = repoMatch ? repoMatch[1] : pkg.name;
+class VendorCliError extends Error {}
 
-function fail(msg) {
-  console.error(`${pkg.name} vendor: ${msg}`);
-  process.exit(1);
+function vendorFail(msg) {
+  throw new VendorCliError(msg);
 }
 
 // ---------------------------------------------------------------- arguments
 
-const args = argv;
-const opts = { check: false, pick: null, name: null, format: null, out: null, globals: [] };
-for (let i = 0; i < args.length; i++) {
-  const a = args[i];
-  const next = () => {
-    if (i + 1 >= args.length) fail(`${a} requires a value`);
-    return args[++i];
-  };
-  if (a === '--check') opts.check = true;
-  else if (a === '--format') opts.format = next();
-  else if (a === '--out') opts.out = next();
-  else if (a === '--name') opts.name = next();
-  else if (a === '--pick') opts.pick = next().split(',').map((s) => s.trim()).filter(Boolean);
-  else if (a === '--global') opts.globals.push(next());
-  else fail(`unknown argument: ${a}`);
-}
-
 const FORMATS = ['esm', 'global', 'bare', 'cjs'];
 const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
-if (!FORMATS.includes(opts.format)) fail(`--format must be one of: ${FORMATS.join(', ')}`);
-if (!opts.out) fail('--out <dest> is required');
-if (opts.globals.length && opts.format !== 'global') fail('--global is only valid with --format global');
-if (opts.globals.length && (opts.name || opts.pick)) {
-  fail('--global cannot be combined with --name/--pick — use one --global <Name[:a,b,c]> per exposed global');
-}
-if (opts.format === 'global' && !opts.name && !opts.globals.length) {
-  fail('--format global requires --name <GlobalName> (or one --global <Name[:a,b,c]> per global)');
-}
-if (opts.name && !IDENT_RE.test(opts.name)) fail(`--name must be a valid identifier, got: ${opts.name}`);
-if (opts.pick && opts.format !== 'global' && opts.format !== 'cjs') {
-  fail('--pick is only valid with --format global or cjs');
-}
 
-// Parse `--global Name[:a,b,c]` specs: name before the first `:`, an optional
-// pick list after it (no `:` = full surface, same as --name without --pick).
-const globalSpecs = opts.globals.map((spec) => {
-  const idx = spec.indexOf(':');
-  const name = idx === -1 ? spec : spec.slice(0, idx);
-  if (!IDENT_RE.test(name)) fail(`--global name must be a valid identifier, got: ${name || spec}`);
-  const pick = idx === -1 ? null : spec.slice(idx + 1).split(',').map((s) => s.trim()).filter(Boolean);
-  if (pick && pick.length === 0) fail(`--global ${name}: empty pick list after ':'`);
-  return { name, pick };
-});
-{
-  const seen = new Set();
-  for (const { name } of globalSpecs) {
-    if (seen.has(name)) fail(`--global ${name} given more than once`);
-    seen.add(name);
+// Parse + validate the CLI argv into { opts, globalSpecs }. Validation
+// failures throw VendorCliError (they never exit), so the flag handling is
+// testable in isolation.
+export function parseVendorArgs(argv) {
+  const args = argv;
+  const opts = { check: false, pick: null, name: null, format: null, out: null, globals: [] };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    const next = () => {
+      if (i + 1 >= args.length) vendorFail(`${a} requires a value`);
+      return args[++i];
+    };
+    if (a === '--check') opts.check = true;
+    else if (a === '--format') opts.format = next();
+    else if (a === '--out') opts.out = next();
+    else if (a === '--name') opts.name = next();
+    else if (a === '--pick') opts.pick = next().split(',').map((s) => s.trim()).filter(Boolean);
+    else if (a === '--global') opts.globals.push(next());
+    else vendorFail(`unknown argument: ${a}`);
   }
+
+  if (!FORMATS.includes(opts.format)) vendorFail(`--format must be one of: ${FORMATS.join(', ')}`);
+  if (!opts.out) vendorFail('--out <dest> is required');
+  if (opts.globals.length && opts.format !== 'global') vendorFail('--global is only valid with --format global');
+  if (opts.globals.length && (opts.name || opts.pick)) {
+    vendorFail('--global cannot be combined with --name/--pick — use one --global <Name[:a,b,c]> per exposed global');
+  }
+  if (opts.format === 'global' && !opts.name && !opts.globals.length) {
+    vendorFail('--format global requires --name <GlobalName> (or one --global <Name[:a,b,c]> per global)');
+  }
+  if (opts.name && !IDENT_RE.test(opts.name)) vendorFail(`--name must be a valid identifier, got: ${opts.name}`);
+  if (opts.pick && opts.format !== 'global' && opts.format !== 'cjs') {
+    vendorFail('--pick is only valid with --format global or cjs');
+  }
+
+  // Parse `--global Name[:a,b,c]` specs: name before the first `:`, an optional
+  // pick list after it (no `:` = full surface, same as --name without --pick).
+  const globalSpecs = opts.globals.map((spec) => {
+    const idx = spec.indexOf(':');
+    const name = idx === -1 ? spec : spec.slice(0, idx);
+    if (!IDENT_RE.test(name)) vendorFail(`--global name must be a valid identifier, got: ${name || spec}`);
+    const pick = idx === -1 ? null : spec.slice(idx + 1).split(',').map((s) => s.trim()).filter(Boolean);
+    if (pick && pick.length === 0) vendorFail(`--global ${name}: empty pick list after ':'`);
+    return { name, pick };
+  });
+  {
+    const seen = new Set();
+    for (const { name } of globalSpecs) {
+      if (seen.has(name)) vendorFail(`--global ${name} given more than once`);
+      seen.add(name);
+    }
+  }
+
+  return { opts, globalSpecs };
 }
 
 // ------------------------------------------------------- derive the surface
@@ -177,7 +183,7 @@ function deriveSurface(esm) {
       const spec = part.trim();
       if (!spec) continue;
       const alias = spec.match(/^([A-Za-z0-9_$]+)(?:\s+as\s+([A-Za-z0-9_$]+))?$/);
-      if (!alias) fail(`unparseable export specifier in aggregate export: "${spec}"`);
+      if (!alias) vendorFail(`unparseable export specifier in aggregate export: "${spec}"`);
       surface.push({ exported: alias[2] || alias[1], local: alias[1] });
     }
   }
@@ -186,7 +192,7 @@ function deriveSurface(esm) {
 
 // 1-based line number + trimmed line text for a source offset, so every
 // refusal below can point at the offending line.
-function lineInfo(index) {
+function lineInfo(source, index) {
   const line = source.slice(0, index).split('\n').length;
   const start = source.lastIndexOf('\n', index - 1) + 1;
   const end = source.indexOf('\n', index);
@@ -199,147 +205,164 @@ const SUPPORTED_FORMS =
   'declaring it normally and adding it to an aggregate line ' +
   '(e.g. `function* gen() {}` … `export { gen };`).';
 
-// The derivation (and the export-stripping in strippedBody) is only sound for
-// the forms the kits deliberately restrict themselves to. A default export or
-// a re-export-from would previously slip through both regexes and emit BROKEN
-// output — `export default x` strips to the syntax error `default x` (failing
-// service-worker install at the consumer), and `export { a } from './m'` /
-// `export * from './m'` silently vanish from the derived surface. Fail loudly
-// at generation time instead. (The catch-all gate below would also stop these;
-// this one is kept because it names the form.)
-{
-  const unsupported = source.match(
-    /^export\s+default\b|^export\s*\{[^}]*\}\s*from\b|^export\s*\*/m
-  );
-  if (unsupported) {
-    fail(
-      `unsupported export form "${unsupported[0].trim()}…" in ${KIT_DIR}/index.js — ` +
-        'the kits use only top-level export declarations and aggregate `export { a as b }` ' +
-        'lines (no default export, no re-export-from, no export *); the generated ' +
-        'global/bare/cjs output would be broken or silently incomplete.'
+// Derive the kit's exported surface and enforce every fail-closed gate:
+// unsupported export forms, exports the derivation didn't consume, static
+// imports / import.meta in formats that can't express them, and an empty
+// surface. Returns the ordered surface array; every refusal throws.
+function deriveKitSurface(source, opts, kitDir) {
+  // The derivation (and the export-stripping in strippedBody) is only sound for
+  // the forms the kits deliberately restrict themselves to. A default export or
+  // a re-export-from would previously slip through both regexes and emit BROKEN
+  // output — `export default x` strips to the syntax error `default x` (failing
+  // service-worker install at the consumer), and `export { a } from './m'` /
+  // `export * from './m'` silently vanish from the derived surface. Fail loudly
+  // at generation time instead. (The catch-all gate below would also stop these;
+  // this one is kept because it names the form.)
+  {
+    const unsupported = source.match(
+      /^export\s+default\b|^export\s*\{[^}]*\}\s*from\b|^export\s*\*/m
     );
-  }
-}
-
-const { surface, accounted } = deriveSurface(source);
-
-// ------------------------------------------------------------- fail closed
-// Enumerating bad forms can only ever cover the ones we thought of, and the
-// failure mode of a missed one is the worst kind: a plausible artifact, exit
-// code 0, and a reassuring log line — with `vendor:check` blind to it, because
-// the committed copy and the regenerated copy share the omission. So instead
-// of listing what's rejected, assert that the derivation ACCOUNTED FOR every
-// `export` in the source, and refuse otherwise.
-{
-  const orphans = [];
-  const exportRe = /^export\b/gm;
-  let m;
-  while ((m = exportRe.exec(source)) !== null) {
-    if (!accounted.has(m.index)) orphans.push(lineInfo(m.index));
-  }
-  if (orphans.length) {
-    fail(
-      `${orphans.length} export(s) in ${KIT_DIR}/index.js that this generator cannot derive:\n` +
-        orphans.map((o) => `  line ${o.line}: ${o.text}`).join('\n') +
-        `\n${SUPPORTED_FORMS}\n` +
-        'Generating anyway would drop these from the global/cjs surface (or emit ' +
-        'broken classic-script syntax) with a passing exit code, so nothing was written.'
-    );
-  }
-}
-
-// Static `import` / `import.meta` are ES-module-only syntax. The bare, global
-// and cjs builds are a classic script / a CommonJS module, so either one is a
-// hard syntax error there (a service worker importScripts()-ing such a file
-// fails install) — and a RELATIVE import means a multi-file kit, which no
-// single-file vendored copy can represent in ANY format. Both used to be
-// copied through verbatim with exit code 0.
-{
-  const statics = [];
-  // Matches `import …` / `import{…}` / `import '…'`, but not the dynamic
-  // `import(…)` (legal in classic scripts and CJS) nor `import.meta`.
-  const importRe = /^[ \t]*import\b(?![ \t]*[(.])/gm;
-  let m;
-  while ((m = importRe.exec(source)) !== null) {
-    const stmt = source.slice(m.index, m.index + 400).split(';')[0];
-    const spec = stmt.match(/from\s*['"]([^'"]+)['"]/) || stmt.match(/^[ \t]*import\s*['"]([^'"]+)['"]/);
-    statics.push({ ...lineInfo(m.index), spec: spec ? spec[1] : null });
-  }
-
-  const relative = statics.find((s) => s.spec && /^[.\/]/.test(s.spec));
-  if (relative) {
-    fail(
-      `relative import "${relative.spec}" at ${KIT_DIR}/index.js:${relative.line} — a kit is ` +
-        'vendored as ONE file, so the imported module would be missing wherever the ' +
-        'generated copy lands. Inline the dependency into index.js.'
-    );
-  }
-
-  if (opts.format !== 'esm') {
-    if (statics.length) {
-      const s = statics[0];
-      fail(
-        `static import at ${KIT_DIR}/index.js:${s.line} (\`${s.text}\`) cannot be emitted in ` +
-          `--format ${opts.format}: that build is a classic script / CommonJS module, where a ` +
-          'static import is a syntax error (it would fail service-worker install or require() ' +
-          'at the consumer). Inline the dependency, or vendor this kit as --format esm only.'
-      );
-    }
-    const meta = source.search(/\bimport\s*\.\s*meta\b/);
-    if (meta !== -1) {
-      const s = lineInfo(meta);
-      fail(
-        `\`import.meta\` at ${KIT_DIR}/index.js:${s.line} (\`${s.text}\`) cannot be emitted in ` +
-          `--format ${opts.format}: it is only valid inside an ES module, so the generated ` +
-          'classic-script/CommonJS file would be a syntax error.'
+    if (unsupported) {
+      vendorFail(
+        `unsupported export form "${unsupported[0].trim()}…" in ${kitDir}/index.js — ` +
+          'the kits use only top-level export declarations and aggregate `export { a as b }` ' +
+          'lines (no default export, no re-export-from, no export *); the generated ' +
+          'global/bare/cjs output would be broken or silently incomplete.'
       );
     }
   }
+
+  const { surface, accounted } = deriveSurface(source);
+
+  // ------------------------------------------------------------- fail closed
+  // Enumerating bad forms can only ever cover the ones we thought of, and the
+  // failure mode of a missed one is the worst kind: a plausible artifact, exit
+  // code 0, and a reassuring log line — with `vendor:check` blind to it, because
+  // the committed copy and the regenerated copy share the omission. So instead
+  // of listing what's rejected, assert that the derivation ACCOUNTED FOR every
+  // `export` in the source, and refuse otherwise.
+  {
+    const orphans = [];
+    const exportRe = /^export\b/gm;
+    let m;
+    while ((m = exportRe.exec(source)) !== null) {
+      if (!accounted.has(m.index)) orphans.push(lineInfo(source, m.index));
+    }
+    if (orphans.length) {
+      vendorFail(
+        `${orphans.length} export(s) in ${kitDir}/index.js that this generator cannot derive:\n` +
+          orphans.map((o) => `  line ${o.line}: ${o.text}`).join('\n') +
+          `\n${SUPPORTED_FORMS}\n` +
+          'Generating anyway would drop these from the global/cjs surface (or emit ' +
+          'broken classic-script syntax) with a passing exit code, so nothing was written.'
+      );
+    }
+  }
+
+  // Static `import` / `import.meta` are ES-module-only syntax. The bare, global
+  // and cjs builds are a classic script / a CommonJS module, so either one is a
+  // hard syntax error there (a service worker importScripts()-ing such a file
+  // fails install) — and a RELATIVE import means a multi-file kit, which no
+  // single-file vendored copy can represent in ANY format. Both used to be
+  // copied through verbatim with exit code 0.
+  {
+    const statics = [];
+    // Matches `import …` / `import{…}` / `import '…'`, but not the dynamic
+    // `import(…)` (legal in classic scripts and CJS) nor `import.meta`.
+    const importRe = /^[ \t]*import\b(?![ \t]*[(.])/gm;
+    let m;
+    while ((m = importRe.exec(source)) !== null) {
+      const stmt = source.slice(m.index, m.index + 400).split(';')[0];
+      const spec = stmt.match(/from\s*['"]([^'"]+)['"]/) || stmt.match(/^[ \t]*import\s*['"]([^'"]+)['"]/);
+      statics.push({ ...lineInfo(source, m.index), spec: spec ? spec[1] : null });
+    }
+
+    const relative = statics.find((s) => s.spec && /^[.\/]/.test(s.spec));
+    if (relative) {
+      vendorFail(
+        `relative import "${relative.spec}" at ${kitDir}/index.js:${relative.line} — a kit is ` +
+          'vendored as ONE file, so the imported module would be missing wherever the ' +
+          'generated copy lands. Inline the dependency into index.js.'
+      );
+    }
+
+    if (opts.format !== 'esm') {
+      if (statics.length) {
+        const s = statics[0];
+        vendorFail(
+          `static import at ${kitDir}/index.js:${s.line} (\`${s.text}\`) cannot be emitted in ` +
+            `--format ${opts.format}: that build is a classic script / CommonJS module, where a ` +
+            'static import is a syntax error (it would fail service-worker install or require() ' +
+            'at the consumer). Inline the dependency, or vendor this kit as --format esm only.'
+        );
+      }
+      const meta = source.search(/\bimport\s*\.\s*meta\b/);
+      if (meta !== -1) {
+        const s = lineInfo(source, meta);
+        vendorFail(
+          `\`import.meta\` at ${kitDir}/index.js:${s.line} (\`${s.text}\`) cannot be emitted in ` +
+            `--format ${opts.format}: it is only valid inside an ES module, so the generated ` +
+            'classic-script/CommonJS file would be a syntax error.'
+        );
+      }
+    }
+  }
+
+  if (surface.length === 0) {
+    vendorFail(`found no top-level exports in ${kitDir}/index.js — refusing to generate an empty surface.`);
+  }
+
+  return surface;
 }
 
-if (surface.length === 0) {
-  fail(`found no top-level exports in ${KIT_DIR}/index.js — refusing to generate an empty surface.`);
-}
-
-function resolveExposed(pick, flag) {
+// --pick / --global pick lists must name real exports — a typo is an error,
+// never a silently narrower surface.
+function resolveExposed(surface, pick, flag, pkgName) {
   if (!pick) return surface;
   const known = new Set(surface.map((s) => s.exported));
   const unknown = pick.filter((n) => !known.has(n));
   if (unknown.length) {
-    fail(`${flag} names not exported by ${pkg.name}: ${unknown.join(', ')} (available: ${[...known].join(', ')})`);
+    vendorFail(`${flag} names not exported by ${pkgName}: ${unknown.join(', ')} (available: ${[...known].join(', ')})`);
   }
   return surface.filter((s) => pick.includes(s.exported));
 }
 
-const exposed = resolveExposed(opts.pick, '--pick');
+// Resolve what the emitted file exposes: the (possibly --pick-narrowed)
+// surface, the per-global surfaces for the global format, and the exposed
+// count the log lines report. Returns { exposed, globals, exposedCount }.
+function resolveKitExposure(surface, opts, globalSpecs, pkgName) {
+  const exposed = resolveExposed(surface, opts.pick, '--pick', pkgName);
 
-// For the global format: the ordered list of { name, exposed } globals the
-// emitted file assigns. The legacy `--name X [--pick a,b]` spelling is exactly
-// one entry, so `--global X:a,b` and `--name X --pick a,b` emit identical
-// bytes; each additional --global adds another surface map over the SAME
-// (single) kit body.
-const globals =
-  opts.format === 'global'
-    ? opts.name
-      ? [{ name: opts.name, exposed }]
-      : globalSpecs.map((g) => ({ name: g.name, exposed: resolveExposed(g.pick, `--global ${g.name}`) }))
-    : null;
+  // For the global format: the ordered list of { name, exposed } globals the
+  // emitted file assigns. The legacy `--name X [--pick a,b]` spelling is exactly
+  // one entry, so `--global X:a,b` and `--name X --pick a,b` emit identical
+  // bytes; each additional --global adds another surface map over the SAME
+  // (single) kit body.
+  const globals =
+    opts.format === 'global'
+      ? opts.name
+        ? [{ name: opts.name, exposed }]
+        : globalSpecs.map((g) => ({ name: g.name, exposed: resolveExposed(surface, g.pick, `--global ${g.name}`, pkgName) }))
+      : null;
 
-// What the file as a whole exposes — for the log lines. With several globals
-// that's the union of their pick lists.
-const exposedCount = globals
-  ? new Set(globals.flatMap((g) => g.exposed.map((s) => s.exported))).size
-  : exposed.length;
+  // What the file as a whole exposes — for the log lines. With several globals
+  // that's the union of their pick lists.
+  const exposedCount = globals
+    ? new Set(globals.flatMap((g) => g.exposed.map((s) => s.exported))).size
+    : exposed.length;
+
+  return { exposed, globals, exposedCount };
+}
 
 // -------------------------------------------------------------- generation
 
-function header(extra) {
+function vendorHeader(pkg, repo, extra) {
   // The provenance values land inside a // comment in a file consumers commit
   // and ship; a stray newline in a malformed package.json field would break
   // out of the comment into code. Collapse any line break defensively.
   const oneLine = (v) => String(v).replace(/[\r\n]+/g, ' ');
   return (
-    `// VENDORED from ${oneLine(pkg.name)} v${oneLine(pkg.version)} (github:${oneLine(REPO)}), pinned in package.json.\n` +
+    `// VENDORED from ${oneLine(pkg.name)} v${oneLine(pkg.version)} (github:${oneLine(repo)}), pinned in package.json.\n` +
     `// DO NOT EDIT — generated by the kit's own vendor bin; run\n` +
     '// `npm run vendor:sync` to regenerate. CI runs `npm run vendor:check`\n' +
     '// to fail on drift.\n' +
@@ -358,10 +381,14 @@ function strippedBody(esm) {
     .replace(/\n{3,}/g, '\n\n');
 }
 
-function build() {
+// Emit the generated file for one format. Pure string-in/string-out: the
+// four formats stay a switch, but behind a seam that takes everything it
+// needs as parameters.
+function emitVendoredOutput(format, source, { exposed, globals }, pkg, repo) {
+  const header = (extra) => vendorHeader(pkg, repo, extra);
   const mapOf = (list) => list.map((s) => `  ${s.exported}: ${s.local},`).join('\n');
   const surfaceMap = mapOf(exposed);
-  switch (opts.format) {
+  switch (format) {
     case 'esm':
       return header('// The unit tests import this verbatim ESM copy.') + source;
     case 'bare':
@@ -404,26 +431,66 @@ function build() {
   }
 }
 
-const expected = build();
-const dest = resolve(process.cwd(), opts.out);
+// -------------------------------------------------------------- write/check
+// --check compares the destination against the freshly generated bytes and
+// throws on a missing or drifted copy (vendor:check in consumer CI); otherwise
+// write the file. `surfaceCount` is the full derived surface size for the
+// "<n> of <m> exports" log lines.
+function writeOrCheckOutput(expected, opts, { pkgName, exposedCount, surfaceCount, globals }) {
+  const dest = resolve(process.cwd(), opts.out);
 
-if (opts.check) {
-  let current = '';
-  try {
-    current = readFileSync(dest, 'utf8');
-  } catch {
-    fail(`${opts.out} missing — run \`npm run vendor:sync\`.`);
+  if (opts.check) {
+    let current = '';
+    try {
+      current = readFileSync(dest, 'utf8');
+    } catch {
+      vendorFail(`${opts.out} missing — run \`npm run vendor:sync\`.`);
+    }
+    if (current !== expected) {
+      vendorFail(`${opts.out} is out of sync with the pinned ${pkgName}.\nRun \`npm install && npm run vendor:sync\` and commit the result.`);
+    }
+    console.log(`${pkgName} vendor: ${opts.out} is in sync (${exposedCount} of ${surfaceCount} exports exposed).`);
+  } else {
+    mkdirSync(dirname(dest), { recursive: true });
+    writeFileSync(dest, expected);
+    const shape = globals && globals.length > 1 ? `${globals.length} globals, ` : '';
+    console.log(`${pkgName} vendor: wrote ${opts.out} (format ${opts.format}, ${shape}${exposedCount} of ${surfaceCount} exports).`);
   }
-  if (current !== expected) {
-    fail(`${opts.out} is out of sync with the pinned ${pkg.name}.\nRun \`npm install && npm run vendor:sync\` and commit the result.`);
-  }
-  console.log(`${pkg.name} vendor: ${opts.out} is in sync (${exposedCount} of ${surface.length} exports exposed).`);
-} else {
-  mkdirSync(dirname(dest), { recursive: true });
-  writeFileSync(dest, expected);
-  const shape = globals && globals.length > 1 ? `${globals.length} globals, ` : '';
-  console.log(`${pkg.name} vendor: wrote ${opts.out} (format ${opts.format}, ${shape}${exposedCount} of ${surface.length} exports).`);
 }
+
+// ------------------------------------------------------------- orchestrator
+
+export function runVendorCli(kitDir, argv = process.argv.slice(2)) {
+  const pkg = JSON.parse(readFileSync(`${kitDir}/package.json`, 'utf8'));
+  const source = readFileSync(`${kitDir}/index.js`, 'utf8');
+
+  const repoMatch = String(pkg.repository?.url || '').match(
+    /github\.com[/:]([^/]+\/[^/.]+)/
+  );
+  const repo = repoMatch ? repoMatch[1] : pkg.name;
+
+  function fail(msg) {
+    console.error(`${pkg.name} vendor: ${msg}`);
+    process.exit(1);
+  }
+
+  try {
+    const { opts, globalSpecs } = parseVendorArgs(argv);
+    const surface = deriveKitSurface(source, opts, kitDir);
+    const exposure = resolveKitExposure(surface, opts, globalSpecs, pkg.name);
+    const expected = emitVendoredOutput(opts.format, source, exposure, pkg, repo);
+    writeOrCheckOutput(expected, opts, {
+      pkgName: pkg.name,
+      exposedCount: exposure.exposedCount,
+      surfaceCount: surface.length,
+      globals: exposure.globals,
+    });
+  } catch (err) {
+    // Only the CLI's own refusals become the classic stderr line + exit 1;
+    // anything else (unreadable kit dir, JSON parse) propagates unchanged.
+    if (err instanceof VendorCliError) fail(err.message);
+    else throw err;
+  }
 }
 
 // ===========================================================================
