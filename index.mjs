@@ -1054,3 +1054,64 @@ export function versionStamp(rootDir = process.cwd(), argv = process.argv.slice(
   if (check && drift) failStamp('run `npm run version:stamp` and commit the result.');
   if (check) console.log(`version-stamp: all files in sync at ${version}.`);
 }
+
+// ---------------------------------------------------------------------------
+// jfs-claude-md-sync — the CLAUDE.md family-conventions synchronizer.
+//
+// Every consumer's CLAUDE.md used to end with a hand-copied "Pull requests"
+// section; seventeen copies of instructions that steer automated sessions is
+// exactly the drift the vendoring flow exists to prevent, applied to the one
+// artifact that wasn't covered. The canonical text now lives once, in
+// family/family-conventions.md here, and each consumer carries it between two
+// marker comments that this tool rewrites wholesale. Family CI runs the
+// --check mode from a bare checkout of this repo, so no consumer needs
+// @jfs/vendor-cli installed for the gate to hold.
+
+const FAMILY_START =
+  '<!-- jfs-family-conventions:start — managed by jfs-claude-md-sync; edit family/family-conventions.md in @jfs/vendor-cli -->';
+const FAMILY_END = '<!-- jfs-family-conventions:end -->';
+
+export function familyConventionsBlock() {
+  const body = readFileSync(
+    new URL('./family/family-conventions.md', import.meta.url),
+    'utf8'
+  ).trim();
+  return `${FAMILY_START}\n\n${body}\n\n${FAMILY_END}`;
+}
+
+export function claudeMdSync(rootDir = process.cwd(), argv = []) {
+  const check = argv.includes('--check');
+  const fail = (msg) => {
+    console.error(`claude-md-sync: ${msg}`);
+    process.exit(1);
+  };
+  const target = resolve(rootDir, 'CLAUDE.md');
+  let src;
+  try {
+    src = readFileSync(target, 'utf8');
+  } catch (e) {
+    return fail(`cannot read CLAUDE.md: ${e.message}`);
+  }
+  const block = familyConventionsBlock();
+  const start = src.indexOf(FAMILY_START);
+  const end = src.indexOf(FAMILY_END);
+  let next;
+  if (start === -1 && end === -1) {
+    // No block yet: append it (sync) — a repo adopting the family flow.
+    if (check) return fail('CLAUDE.md has no family-conventions block — run `jfs-claude-md-sync` and commit the result.');
+    next = src.replace(/\s*$/, '') + '\n\n' + block + '\n';
+  } else if (start === -1 || end === -1 || end < start) {
+    // Half a block (or end-before-start) means a hand edit mangled a marker;
+    // rewriting around it would duplicate or eat prose, so stop either way.
+    return fail('family-conventions markers are mangled (missing or out-of-order) — restore both markers, then re-run `jfs-claude-md-sync`.');
+  } else {
+    next = src.slice(0, start) + block + src.slice(end + FAMILY_END.length);
+  }
+  if (next === src) {
+    console.log('claude-md-sync: CLAUDE.md family conventions in sync.');
+    return;
+  }
+  if (check) return fail('CLAUDE.md family-conventions block is out of date — run `jfs-claude-md-sync` and commit the result.');
+  writeFileSync(target, next);
+  console.log('claude-md-sync: updated the CLAUDE.md family-conventions block.');
+}

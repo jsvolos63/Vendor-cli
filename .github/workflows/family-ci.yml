@@ -1,0 +1,154 @@
+# Family CI — the @jfs family's reusable check workflow (workflow_call).
+#
+# Every repo in the family used to hand-copy the same CI skeleton (checkout →
+# setup-node → kit-pin pre-flight → install → checks), and the copies drifted:
+# different action versions, different node versions, and a raw-URL kit-pin
+# check pinned to whatever vendor-cli SHA was current when each repo was set
+# up. Consumers now call this workflow instead:
+#
+#   jobs:
+#     family-ci:
+#       uses: jsvolos63/vendor-cli/.github/workflows/family-ci.yml@main
+#       with:
+#         verify-kit-pins: true
+#         install-command: npm ci
+#         run: |
+#           npm run vendor:check
+#           npm test
+#
+# One place to bump an action, tighten a gate, or add a family-wide check.
+# Treat edits here like kit API changes: they land in every repo's next CI
+# run at once. This repo's own test.yml references the workflow locally
+# (uses: ./...), so a PR that edits it is validated by its own edited copy.
+#
+# The workflow checks out THIS repo alongside the caller so the kit-pin
+# pre-flight and the CLAUDE.md family-conventions check run from a bare
+# checkout — consumers don't need @jfs/vendor-cli installed for either gate
+# (the kits deliberately don't depend on it). When the caller IS vendor-cli,
+# the local checkout is used instead so a PR here validates against its own
+# canonical text, not main's.
+name: Family CI
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version to set up
+        type: string
+        default: '20'
+      python-version:
+        description: Python version to set up ('' skips Python)
+        type: string
+        default: ''
+      install-command:
+        description: Dependency install command ('' skips the step)
+        type: string
+        default: npm install
+      verify-kit-pins:
+        description: Pre-flight that every pinned @jfs kit SHA resolves, before install
+        type: boolean
+        default: false
+      claude-md-check:
+        description: Check CLAUDE.md carries the current family-conventions block
+        type: boolean
+        default: true
+      run:
+        description: Newline-separated check commands, run in order (fail-fast)
+        type: string
+        required: true
+      version-guard-paths:
+        description: >-
+          Space-separated paths; on pull requests, require a package.json
+          version bump when any of them changed ('' skips the job). The kit
+          convention: consumers pin by commit SHA and releases tag by version,
+          so a shipped-module change without a bump ships two different SHAs
+          under one version label.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # vendor-cli's own CI validates against the PR's canonical text, not
+      # main's — everyone else runs the family tooling from a main checkout.
+      JFS_VENDOR_CLI_DIR: ${{ github.repository == 'jsvolos63/vendor-cli' && '.' || '.jfs-family/vendor-cli' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@v5
+        if: (inputs.verify-kit-pins || inputs.claude-md-check) && github.repository != 'jsvolos63/vendor-cli'
+        with:
+          repository: jsvolos63/vendor-cli
+          path: .jfs-family/vendor-cli
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - uses: actions/setup-python@v6
+        if: inputs.python-version != ''
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      # Before install so a typo'd/hand-edited SHA fails with a clear message
+      # instead of an opaque install-time git-128 / 404.
+      - name: Verify @jfs kit pins exist
+        if: inputs.verify-kit-pins
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module -e "const { verifyKitPins } = await import(process.cwd() + '/' + process.env.JFS_VENDOR_CLI_DIR + '/index.mjs'); const n = await verifyKitPins(); console.log('kit-pin-check: all ' + n + ' kit pin(s) resolve.');"
+
+      - name: Install dependencies
+        if: inputs.install-command != ''
+        run: ${{ inputs.install-command }}
+
+      - name: Check CLAUDE.md family conventions are in sync
+        if: inputs.claude-md-check
+        run: node "$JFS_VENDOR_CLI_DIR/bin/claude-md-sync.mjs" --check
+
+      # The extra checkout must not leak into the caller's own checks (globbed
+      # lints and syntax sweeps would pick it up).
+      - name: Remove family tooling checkout
+        if: github.repository != 'jsvolos63/vendor-cli'
+        run: rm -rf .jfs-family
+
+      - name: Run checks
+        run: ${{ inputs.run }}
+
+  # The kit-style version-bump guard, formerly copy-pasted into eight repos.
+  version-bump:
+    if: github.event_name == 'pull_request' && inputs.version-guard-paths != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fail if guarded paths changed without a package.json version bump
+        env:
+          GUARD_PATHS: ${{ inputs.version-guard-paths }}
+        run: |
+          BASE="origin/${GITHUB_BASE_REF}"
+          if git diff --quiet "$BASE...HEAD" -- $GUARD_PATHS; then
+            echo "guarded paths unchanged - no bump required"
+            exit 0
+          fi
+          git show "$BASE:package.json" > /tmp/base-package.json
+          BASE_VERSION=$(node -p "require('/tmp/base-package.json').version")
+          HEAD_VERSION=$(node -p "require('./package.json').version")
+          if [ "$BASE_VERSION" = "$HEAD_VERSION" ]; then
+            echo "::error::guarded paths changed but package.json version is still ${HEAD_VERSION} - bump it"
+            exit 1
+          fi
+          echo "version bumped: ${BASE_VERSION} -> ${HEAD_VERSION}"
