@@ -1,0 +1,198 @@
+# Kit pin bump — the @jfs family's reusable pin-bump workflow (workflow_call).
+#
+# The consumer half of the kit-update fan-out: check whether the pinned
+# @jfs/* kits have moved past the caller's pins, and if so open a PR with the
+# bumped pins + regenerated vendored copies. The workflow patch-bumps the app
+# version for the re-vendored assets, runs the repo's CI checks itself (PRs
+# opened with the default GITHUB_TOKEN never trigger pull_request workflows,
+# so normal CI can't gate them), and merges the PR when they pass — a kit fix
+# propagates with zero manual touches. It never pushes directly to the
+# default branch.
+#
+# Eight consumer repos used to hand-copy this ~104-line skeleton and the
+# copies drifted (8 distinct files differing only in install/check/version
+# commands). Worse, the copies demoted a failed auto-merge to an invisible
+# `::warning::` — which is how kit pins silently drifted across the family.
+# This reusable workflow FAILS the run when the merge of a validated bump is
+# blocked, so a stuck bump shows up as a red workflow run (set `soft-fail:
+# true` to get the old warning-only behavior back).
+#
+# Callers keep only the schedule and the repo-specific commands:
+#
+#   name: Kit pin bump
+#   on:
+#     schedule:
+#       - cron: '41 6 * * 1'
+#     workflow_dispatch:
+#   permissions:
+#     contents: write
+#     pull-requests: write
+#   jobs:
+#     bump:
+#       uses: jsvolos63/vendor-cli/.github/workflows/kit-pin-bump.yml@main
+#       with:
+#         check-command: |
+#           npm run check
+#           npm test
+#
+# The caller MUST grant `contents: write` + `pull-requests: write` — a
+# called workflow can never elevate beyond what the caller passes. The
+# default github.token is used throughout (same as family-ci.yml), so no
+# secrets need to be forwarded; `secrets: inherit` is unnecessary.
+#
+# One place to fix the flow for every consumer. Treat edits here like kit
+# API changes: they land in every repo's next scheduled bump at once.
+name: Kit pin bump
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version to set up
+        type: string
+        default: '22'
+      install-command:
+        description: Dependency install command (jfs-bump-kit-pins ships in
+          @jfs/vendor-cli, so deps must be installed before it can run)
+        type: string
+        default: npm ci
+      vendor-sync-command:
+        description: >-
+          Commands that regenerate the vendored copies from the bumped pins
+          ('' skips — for copy-in consumers with no vendor:sync). The default
+          re-installs first so the newly pinned kit commits are what gets
+          vendored.
+        type: string
+        default: |
+          npm install
+          npm run vendor:sync
+      version-bump-command:
+        description: >-
+          Commands that bump the app version for the re-vendored shipped
+          assets ('' skips). Repos whose version source of truth is not
+          package.json override this with their own rewrite.
+        type: string
+        default: |
+          npm version patch --no-git-tag-version
+          npm run version:stamp
+      check-command:
+        description: >-
+          The repo's CI checks, run against the bumped tree before the PR is
+          merged ('' skips — only sensible for pins-only repos that leave the
+          PR for a human via auto-merge: false). Required so every caller
+          states its validation explicitly.
+        type: string
+        required: true
+      auto-merge:
+        description: Squash-merge the validated PR automatically ('false'
+          leaves it open for a human)
+        type: boolean
+        default: true
+      soft-fail:
+        description: >-
+          If auto-merge is blocked (branch protection, conflict), emit the
+          legacy '::warning::' instead of failing the job. Default false —
+          a stuck bump should be loud, not a warning nobody reads.
+        type: boolean
+        default: false
+      pr-body-extra:
+        description: Extra Markdown appended to the PR body (e.g. manual
+          re-vendor instructions for copy-in consumers)
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
+
+      - name: Bump @jfs kit pins to their current HEADs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: npm run kit-pins:bump
+
+      # kit-pins:bump touches package.json only when a pin actually moved,
+      # so this single check gates every later stage.
+      - name: Detect whether any pin moved
+        id: diff
+        run: |
+          if git diff --quiet package.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Pins unchanged — nothing to vendor, bump, or check."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Re-vendor from the bumped pins
+        if: steps.diff.outputs.changed == 'true' && inputs.vendor-sync-command != ''
+        run: ${{ inputs.vendor-sync-command }}
+
+      # The re-vendored copies are shipped assets, so the family's version
+      # rule applies: patch-bump so the merged PR rolls the service-worker
+      # cache instead of leaving returning visitors on the stale shell.
+      - name: Bump the app version
+        if: steps.diff.outputs.changed == 'true' && inputs.version-bump-command != ''
+        run: ${{ inputs.version-bump-command }}
+
+      # PRs opened with the default GITHUB_TOKEN never trigger pull_request
+      # workflows, so the repo's CI can't validate this PR before merge. Run
+      # the same checks here instead — the merge step below is only reached
+      # if they pass (and the merge to main triggers the full CI run as a
+      # backstop).
+      - name: Run the repo's CI checks against the bumped tree
+        if: steps.diff.outputs.changed == 'true' && inputs.check-command != ''
+        run: ${{ inputs.check-command }}
+
+      - name: Open a pull request if anything changed
+        id: cpr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: auto/kit-pin-bump
+          commit-message: "Bump @jfs kit pins to current HEADs; re-vendor"
+          title: "Bump @jfs kit pins to current HEADs"
+          body: |
+            Automated pin bump: the pinned `@jfs/*` kits have new commits on
+            their default branches. Pins updated by `npm run kit-pins:bump`
+            (the @jfs/vendor-cli jfs-bump-kit-pins bin); vendored copies
+            regenerated and the app version bumped per this repo's caller
+            inputs; the repo's CI checks ran green inside the bump workflow
+            before this PR was opened. (PRs opened with the default
+            GITHUB_TOKEN never trigger pull_request CI, so validation runs
+            pre-merge instead, and the merge to main triggers the full CI
+            run as a backstop.)
+
+            ${{ inputs.pr-body-extra }}
+
+      # Squash-merge the validated PR; the branch is deleted so the next
+      # scheduled run starts clean. If branch protection or a conflict
+      # blocks the merge, FAIL the run — a validated bump left unmerged is
+      # exactly how pins silently drift, so it must be a red run, not a
+      # warning (soft-fail: true restores the old behavior).
+      - name: Merge the validated pin-bump PR
+        if: inputs.auto-merge && (steps.cpr.outputs.pull-request-operation == 'created' || steps.cpr.outputs.pull-request-operation == 'updated')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ steps.cpr.outputs.pull-request-url }}
+          SOFT_FAIL: ${{ inputs.soft-fail }}
+        run: |
+          if gh pr merge --squash --delete-branch "$PR_URL"; then
+            echo "Pin-bump PR merged: $PR_URL"
+          elif [ "$SOFT_FAIL" = "true" ]; then
+            echo "::warning::Auto-merge failed (branch protection or conflict) — review and merge manually: $PR_URL"
+          else
+            echo "::error::Auto-merge of the validated pin-bump PR failed (branch protection, a conflict, or a permissions gap). The bump is stuck at $PR_URL — merge it manually or fix the blocker. Left unmerged, this repo's kit pins silently drift from the family."
+            exit 1
+          fi

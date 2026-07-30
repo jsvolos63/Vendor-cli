@@ -20,6 +20,43 @@ repo's next CI run at once — treat them like kit API changes. This repo's
 own `test.yml` references it locally (`uses: ./…`) so a PR editing the
 workflow validates against its own copy.
 
+## Kit pin bump (`.github/workflows/kit-pin-bump.yml`)
+
+The second reusable workflow: the weekly pin-bump/re-vendor/auto-merge flow
+that eight consumers used to hand-copy (~104 lines each, all eight drifted).
+Callers keep only the schedule and their repo-specific commands; everything
+else — checkout, node, install, `jfs-bump-kit-pins`, PR open, squash-merge —
+lives here. Inputs: `check-command` (required — the repo's CI checks, run
+in-workflow because default-token PRs never trigger pull_request CI),
+`install-command` (default `npm ci`), `vendor-sync-command` and
+`version-bump-command` ('' skips either), `node-version` (default 22),
+`auto-merge` (default true), `soft-fail` (default false), `pr-body-extra`.
+The important behavior change vs. the old copies: a blocked auto-merge of a
+validated bump **fails the run** instead of emitting an invisible
+`::warning::` (the old failure mode is how pins silently drifted across the
+family); `soft-fail: true` restores warning-only. A minimal caller:
+
+```yaml
+name: Kit pin bump
+on:
+  schedule:
+    - cron: '41 6 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: write        # the caller must grant both — a called
+  pull-requests: write   # workflow can't elevate its token
+jobs:
+  bump:
+    uses: jsvolos63/vendor-cli/.github/workflows/kit-pin-bump.yml@main
+    with:
+      check-command: |
+        npm run check
+        npm test
+```
+
+Same rules as family-ci: edits land in every consumer's next scheduled bump
+at once — treat them like kit API changes.
+
 ## Kit extraction policy (the bar for kit #9)
 
 The family's per-repo overhead — CI, pins, vendoring, release tagging, a
