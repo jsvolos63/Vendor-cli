@@ -77,3 +77,8 @@ between two repos is cheaper than a new repo's permanent CI, pin, and
 vendoring overhead. Prefer growing an existing kit over minting a new one.
 
 <!-- jfs-family-conventions:end -->
+
+## Session preferences (jsvolos63)
+
+- Always present times relating to usage limits or resets in US Central
+  time (CT), converting from UTC (note CST/CDT as applicable).
