@@ -65,7 +65,20 @@ and drops every top-level declaration they can't reach. It is a
 purpose-built pass over the kit source (a lexer that classifies every
 character as code/comment/literal, statement segmentation, reachability),
 NOT a bundler — a bundler would reprint every kit and erase every comment,
-and these files are committed and reviewed. Four invariants, all tested:
+and these files are committed and reviewed.
+
+It runs for ALL FOUR formats. `esm` was excluded at first on the theory that
+an ESM copy is bundler input, which is wrong here: the consumers are
+buildless and import the vendored ESM file directly in the browser, so an
+unshaken copy is shipped bytes (news-kit v0.12.0's absorption of dom-kit +
+modal-kit put three consumers on a 113 KB ESM copy; their real pick lists
+emit 16 KB / 70 KB / 90 KB). A narrowed esm build emits the surviving
+declarations with `export` stripped plus one aggregate `export { … }` line —
+the esm analogue of cjs's `module.exports` map, and the only form that can
+carry an alias. `bare` has no exposed surface at all, so `--pick` there
+narrows the body only.
+
+Four invariants, all tested:
 surviving declarations are exact source slices (readability), any
 declaration carrying a `@jfs-sanitizer-policy:` marker is a root and the
 generator refuses to emit fewer markers than the source (the consumers run

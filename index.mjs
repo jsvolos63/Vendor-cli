@@ -31,7 +31,11 @@
 //              [--name <GlobalName>] [--pick a,b,c] \
 //              [--global <Name[:a,b,c]> ...] [--check]
 //
-//   --format esm      verbatim ESM copy (unit tests import this)
+//   --format esm      ESM copy (unit tests import this; the buildless
+//                     consumers import it straight from the browser).
+//                     Verbatim source without --pick; with one, the
+//                     tree-shaken body plus an aggregate `export { … }` line
+//                     carrying exactly the picked surface
 //   --format global   classic-script IIFE exposing the public API on
 //                     `globalThis.<Name>` (--name required) — for service
 //                     workers via importScripts() and classic <script> pages
@@ -51,14 +55,17 @@
 //                     dropped — aliases can't be expressed as declarations)
 //   --format cjs      CommonJS transform (module.exports of the public API)
 //                     for `require()` from CommonJS Netlify Functions
-//   --pick a,b,c      global and cjs formats: expose just this subset (each
-//                     name must exist in the derived surface — typos are an
-//                     error). Narrows the exposed API (the global object /
-//                     module.exports map) AND the shipped bytes: the body is
-//                     tree-shaken down to the declarations the picks actually
-//                     reach (see "tree-shaking" below). Use it to keep a
-//                     consumer's coupling surface — and its payload —
-//                     explicit.
+//   --pick a,b,c      expose just this subset (each name must exist in the
+//                     derived surface — typos are an error). Narrows the
+//                     exposed API (the global object / module.exports map /
+//                     the esm `export { … }` line) AND the shipped bytes: the
+//                     body is tree-shaken down to the declarations the picks
+//                     actually reach (see "tree-shaking" below). Use it to
+//                     keep a consumer's coupling surface — and its payload —
+//                     explicit. Valid in every format; in `bare` there is no
+//                     exposed surface to narrow, so it narrows the body only
+//                     (the app references the surviving declarations by their
+//                     bundle-scoped names, as it already does there).
 //   --check           don't write; exit 1 if <dest> differs from what would
 //                     be generated (consumers run this in CI as vendor:check)
 //
@@ -77,14 +84,22 @@
 // with a silently missing export.
 //
 // TREE-SHAKING (see the treeShakeKitSource section further down): a NARROWED
-// surface also narrows the emitted body. Without it, merging two kits would
-// tax every consumer that wants one helper from one of them with the whole
-// other kit's bytes. The shaker is source-preserving — it drops whole
-// top-level declarations and emits the surviving ones VERBATIM, so comments
-// (including the `@jfs-sanitizer-policy` marker regions the family's policy
-// gate checks in the vendored copies), formatting and readability survive, and
-// the output is byte-deterministic. A full surface still emits the source
-// unshaken, byte-for-byte as before.
+// surface also narrows the emitted body, in EVERY format. Without it, merging
+// two kits would tax every consumer that wants one helper from one of them
+// with the whole other kit's bytes. The shaker is source-preserving — it drops
+// whole top-level declarations and emits the surviving ones VERBATIM, so
+// comments (including the `@jfs-sanitizer-policy` marker regions the family's
+// policy gate checks in the vendored copies), formatting and readability
+// survive, and the output is byte-deterministic. A full surface still emits
+// the source unshaken, byte-for-byte as before.
+//
+// `esm` was excluded from this at first, on the assumption that an ESM copy is
+// consumed by a bundler that would shake it downstream. It isn't: the family's
+// consumers are buildless, and their vendored ESM copies are loaded directly
+// by the browser (some as cache-first service-worker shell assets). So esm
+// shakes too — the only format-specific part is how the narrowed surface is
+// re-expressed (an aggregate `export { … }` line instead of a surface-map
+// object).
 
 import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { dirname, resolve, join } from 'node:path';
@@ -140,9 +155,7 @@ export function parseVendorArgs(argv) {
     vendorFail('--format global requires --name <GlobalName> (or one --global <Name[:a,b,c]> per global)');
   }
   if (opts.name && !IDENT_RE.test(opts.name)) vendorFail(`--name must be a valid identifier, got: ${opts.name}`);
-  if (opts.pick && opts.format !== 'global' && opts.format !== 'cjs') {
-    vendorFail('--pick is only valid with --format global or cjs');
-  }
+  if (opts.pick && opts.pick.length === 0) vendorFail('--pick needs at least one export name');
 
   // Parse `--global Name[:a,b,c]` specs: name before the first `:`, an optional
   // pick list after it (no `:` = full surface, same as --name without --pick).
@@ -362,7 +375,14 @@ function resolveKitExposure(surface, opts, globalSpecs, pkgName) {
     ? new Set(globals.flatMap((g) => g.exposed.map((s) => s.exported))).size
     : exposed.length;
 
-  return { exposed, globals, exposedCount };
+  // Whether the emitted surface is smaller than the kit's own. Separate from
+  // "was the body shaken": a pick list can narrow the exported API while
+  // leaving nothing droppable (every local is still reachable), and a kit
+  // without `"sideEffects": false` narrows its surface without shaking at all.
+  // The esm emitter needs the surface answer, not the body one.
+  const narrowed = exposedCount < surface.length;
+
+  return { exposed, globals, exposedCount, narrowed };
 }
 
 // ------------------------------------------------------------ tree-shaking
@@ -877,15 +897,15 @@ export function treeShakeKitSource(source, rootLocals, { fail = vendorFail, expo
 }
 
 // Decide whether this generation shakes, and do it. Returns the body the
-// formats below emit. Unshaken (verbatim source) whenever:
-//   * the format keeps the source as-is (esm) or has no narrowed surface,
+// formats below emit. The pass is format-agnostic — it slices top-level
+// declarations out of the kit source, which every format then wraps its own
+// way — so all four get it. Unshaken (verbatim source) whenever:
+//   * there is no narrowed surface (no --pick / no per-global picks),
 //   * the picks cover the whole surface — today's bytes, unchanged, so
 //     existing full-surface vendored copies don't move, or
 //   * the kit has not declared `"sideEffects": false`, i.e. its author has not
 //     asserted that dropping an unreferenced top-level declaration is safe.
-function narrowKitBody(source, format, { exposed, globals }, surface, pkg) {
-  if (format !== 'global' && format !== 'cjs') return { body: source, shaken: false };
-
+function narrowKitBody(source, { exposed, globals }, surface, pkg) {
   const rootLocals = new Set(
     (globals ? globals.flatMap((g) => g.exposed) : exposed).map((s) => s.local)
   );
@@ -936,13 +956,36 @@ function strippedBody(esm) {
 // Emit the generated file for one format. Pure string-in/string-out: the
 // four formats stay a switch, but behind a seam that takes everything it
 // needs as parameters.
-function emitVendoredOutput(format, source, { exposed, globals }, pkg, repo) {
+function emitVendoredOutput(format, source, { exposed, globals, narrowed, shaken }, pkg, repo) {
   const header = (extra) => vendorHeader(pkg, repo, extra);
   const mapOf = (list) => list.map((s) => `  ${s.exported}: ${s.local},`).join('\n');
   const surfaceMap = mapOf(exposed);
   switch (format) {
     case 'esm':
-      return header('// The unit tests import this verbatim ESM copy.') + source;
+      // Unnarrowed: the verbatim source, byte-for-byte — the shape every
+      // full-surface esm copy in the family is committed at.
+      if (!narrowed) return header('// The unit tests import this verbatim ESM copy.') + source;
+      // Narrowed: the family's esm consumers are buildless, so they import
+      // this file DIRECTLY in the browser — nothing downstream will shake it
+      // for them. Emit the reachable declarations with their `export` keywords
+      // stripped and re-express the picked surface as one aggregate line, the
+      // same way cjs re-expresses it as module.exports (and for the same
+      // reason: an aggregate is the only form that can carry an alias).
+      return (
+        header(
+          shaken
+            ? '// ESM copy narrowed by --pick: the body is tree-shaken to the\n' +
+              '// declarations the picked exports reach, and the surface is\n' +
+              '// re-expressed as the aggregate `export { … }` line at the end.'
+            : '// ESM copy narrowed by --pick to the aggregate `export { … }` line at\n' +
+              '// the end. The body is the kit\'s WHOLE source — it was not\n' +
+              '// tree-shaken, because the kit does not declare "sideEffects": false.'
+        ) +
+        strippedBody(source).replace(/^\n+/, '') +
+        `\nexport {\n${exposed
+          .map((s) => (s.exported === s.local ? `  ${s.local},` : `  ${s.local} as ${s.exported},`))
+          .join('\n')}\n};\n`
+      );
     case 'bare':
       return (
         header(
@@ -1031,9 +1074,15 @@ export function runVendorCli(kitDir, argv = process.argv.slice(2)) {
     const { opts, globalSpecs } = parseVendorArgs(argv);
     const surface = deriveKitSurface(source, opts, kitDir);
     const exposure = resolveKitExposure(surface, opts, globalSpecs, pkg.name);
-    const narrowed = narrowKitBody(source, opts.format, exposure, surface, pkg);
+    const narrowed = narrowKitBody(source, exposure, surface, pkg);
     if (narrowed.note) console.warn(`${pkg.name} vendor: ${narrowed.note}`);
-    const expected = emitVendoredOutput(opts.format, narrowed.body, exposure, pkg, repo);
+    const expected = emitVendoredOutput(
+      opts.format,
+      narrowed.body,
+      { ...exposure, shaken: narrowed.shaken },
+      pkg,
+      repo
+    );
     writeOrCheckOutput(expected, opts, {
       pkgName: pkg.name,
       exposedCount: exposure.exposedCount,

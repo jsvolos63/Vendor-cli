@@ -226,12 +226,21 @@ test('--check: passes in sync, fails on drift, fails when missing', () => {
   assert.match(drift.stderr, /out of sync/);
 });
 
-test('argument validation: bad format, missing --out, --pick outside global/cjs', () => {
+test('argument validation: bad format, missing --out, --pick in every format', () => {
   const dir = freshDir();
   assert.notEqual(run(['--format', 'nope', '--out', 'x.js'], dir).status, 0);
   assert.notEqual(run(['--format', 'esm'], dir).status, 0);
-  assert.notEqual(run(['--format', 'esm', '--out', 'x.js', '--pick', 'a'], dir).status, 0);
-  assert.notEqual(run(['--format', 'bare', '--out', 'x.js', '--pick', 'a'], dir).status, 0);
+  // --pick is accepted in EVERY format now (esm/bare shake the body too); an
+  // unknown name is still an error, and an empty list is refused outright.
+  for (const format of ['esm', 'bare', 'cjs']) {
+    const bad = run(['--format', format, '--out', 'x.js', '--pick', 'definitelyNotAnExport'], dir);
+    assert.notEqual(bad.status, 0, `${format}: a typo'd pick must fail`);
+    assert.match(bad.stderr, /definitelyNotAnExport/);
+    assert.equal(existsSync(join(dir, 'x.js')), false);
+    const ok = run(['--format', format, '--out', `ok.${format}.js`, '--pick', NAMES[0]], dir);
+    assert.equal(ok.status, 0, `${format}: a real pick must be accepted — ${ok.stderr}`);
+    assert.notEqual(run(['--format', format, '--out', 'y.js', '--pick', ' , '], dir).status, 0, `${format}: empty pick list`);
+  }
 });
 
 // --------------------------------------------------------- fail-closed gate
@@ -684,6 +693,178 @@ test('tree-shaking: template literals and regex literals do not confuse the scan
   assert.ok(out.includes('const CSS = `'), 'the template a pick reaches survives whole');
   assert.ok(out.includes('const NAME_RE'), 'so does the regex it uses');
   assert.ok(!out.includes('const dropped'), 'and the unreachable declaration still goes');
+});
+
+// ------------------------------------------------ esm-format tree-shaking
+// The esm copies are NOT bundler input in this family: the buildless
+// consumers import the vendored file DIRECTLY in the browser (Art-Gallery
+// caches it as a cache-first service-worker shell asset), so nothing
+// downstream would ever shake it for them. `--pick` therefore narrows esm's
+// bytes as well, re-expressing the picked surface as one aggregate
+// `export { … }` line — the same role module.exports plays for cjs, and the
+// only form that can carry an alias.
+
+// `node --check` treats a .mjs file as an ES module, so the generated esm
+// copies below are written with that extension and really are parsed as ESM.
+const importFile = (file) => import(pathToFileURL(file).href);
+
+test('esm format: --pick shakes the body and re-exports exactly the picks', async () => {
+  const dir = freshDir();
+  const bin = makeKitBin(dir, SHAKE_KIT);
+  const r = runKit(bin, ['--format', 'esm', '--pick', 'reachable', '--out', 'shaken.mjs'], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const file = join(dir, 'shaken.mjs');
+  const out = readFileSync(file, 'utf8');
+  assert.equal(syntaxCheck(file).status, 0, 'shaken esm output must parse as a module');
+  assert.match(r.stdout, /tree-shaken/);
+
+  assert.ok(out.includes('function reachable('), 'the picked export survives');
+  assert.ok(out.includes('function timesSmall('), 'a helper it calls survives');
+  assert.ok(out.includes('const SMALL = 2;'), 'a constant that helper reads survives');
+  assert.ok(out.includes('// doc for SMALL'), "a declaration's doc comment rides along");
+  assert.ok(out.includes('// Kit preamble'), 'the file preamble always survives');
+
+  for (const gone of ['unrelated', 'bigHelper', 'BIG_TABLE', 'the unrelated subsystem']) {
+    assert.ok(!out.includes(gone), `unreachable declaration dropped: ${gone}`);
+  }
+  // Exactly one export statement, and it is the aggregate line — no stray
+  // `export` keyword may survive on a declaration (that would widen the
+  // surface right back past the pick list).
+  assert.equal(out.match(/^export\b/gm).length, 1, 'exactly one export statement');
+  assert.match(out, /^export \{\n {2}reachable,\n\};\n$/m);
+
+  const mod = await importFile(file);
+  assert.deepEqual(Object.keys(mod), ['reachable'], 'only the picks are exported');
+  assert.equal(mod.reachable(21), 42, 'the shaken body still works');
+});
+
+test('esm format: a picked alias exports the LOCAL declaration under its alias', async () => {
+  const dir = freshDir();
+  const bin = makeKitBin(dir, SHAKE_KIT);
+  const r = runKit(bin, ['--format', 'esm', '--pick', 'timesSmallAlias', '--out', 'alias.mjs'], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const file = join(dir, 'alias.mjs');
+  const out = readFileSync(file, 'utf8');
+  assert.equal(syntaxCheck(file).status, 0);
+  assert.ok(out.includes('function timesSmall('), 'the alias roots its local declaration');
+  assert.ok(!out.includes('function reachable('), 'the export that merely calls it is not a root');
+  assert.match(out, /^export \{\n {2}timesSmall as timesSmallAlias,\n\};\n$/m);
+  const mod = await importFile(file);
+  assert.deepEqual(Object.keys(mod), ['timesSmallAlias']);
+  assert.equal(mod.timesSmallAlias(21), 42);
+});
+
+test('esm format: without --pick (and with a full pick list) the source is verbatim', () => {
+  const dir = freshDir();
+  const bin = makeKitBin(dir, SHAKE_KIT);
+  // The guarantee consumers' `vendor:check` diffs depend on: adding esm
+  // shaking must not move a single byte of an unnarrowed esm copy.
+  assert.equal(runKit(bin, ['--format', 'esm', '--out', 'full.mjs'], dir).status, 0);
+  const full = readFileSync(join(dir, 'full.mjs'), 'utf8');
+  assert.ok(full.endsWith(SHAKE_KIT), 'no --pick: the source is copied verbatim');
+  assert.ok(full.includes('// The unit tests import this verbatim ESM copy.'));
+
+  const all = 'reachable,unrelated,timesSmallAlias';
+  assert.equal(runKit(bin, ['--format', 'esm', '--pick', all, '--out', 'all.mjs'], dir).status, 0);
+  assert.equal(readFileSync(join(dir, 'all.mjs'), 'utf8'), full, 'a full pick list emits the same bytes');
+});
+
+test('esm format: shaken output is deterministic and --check-able', () => {
+  const dir = freshDir();
+  const bin = makeKitBin(dir, SHAKE_KIT);
+  const args = ['--format', 'esm', '--pick', 'reachable', '--out'];
+  assert.equal(runKit(bin, [...args, 'det1.mjs'], dir).status, 0);
+  assert.equal(runKit(bin, [...args, 'det2.mjs'], dir).status, 0);
+  assert.equal(readFileSync(join(dir, 'det1.mjs'), 'utf8'), readFileSync(join(dir, 'det2.mjs'), 'utf8'));
+  assert.equal(runKit(bin, [...args, 'det1.mjs', '--check'], dir).status, 0, 'a fresh shaken esm copy is in sync');
+  writeFileSync(join(dir, 'det1.mjs'), readFileSync(join(dir, 'det1.mjs'), 'utf8') + '\n// tampered\n');
+  assert.notEqual(runKit(bin, [...args, 'det1.mjs', '--check'], dir).status, 0, 'drift must fail the check');
+});
+
+test('esm format: sanitizer-policy regions survive a pick that cannot reach them', () => {
+  const dir = freshDir();
+  const kitBody =
+    'export function escape(s) {\n  return String(s);\n}\n' +
+    '\n' +
+    '// policy-managed constant, unreachable from `escape`\n' +
+    'const BLOCKED = new Set([\n' +
+    '  // @jfs-sanitizer-policy:blocked-tags:start case=upper quote=single\n' +
+    '  // @jfs-sanitizer-policy:blocked-tags:end\n' +
+    ']);\n' +
+    '\n' +
+    '// @jfs-sanitizer-policy:url-control-chars:start const=URL_CONTROL_CHARS\n' +
+    '// @jfs-sanitizer-policy:url-control-chars:end\n' +
+    '\n' +
+    'export function sanitize(html) {\n' +
+    '  return BLOCKED.has(html) ? "" : html.replace(URL_CONTROL_CHARS, "");\n' +
+    '}\n';
+  const bin = makeKitBin(dir, kitBody);
+  const kitDir = join(dir, `kit-${badKitSeq - 1}`);
+  const POLICY_BIN = join(KIT_DIR, '..', '..', 'bin', 'sanitizer-policy-sync.mjs');
+  assert.equal(spawnSync(process.execPath, [POLICY_BIN, 'index.js'], { cwd: kitDir, encoding: 'utf8' }).status, 0);
+
+  const r = runKit(bin, ['--format', 'esm', '--pick', 'escape', '--out', 'esc.mjs'], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const out = readFileSync(join(dir, 'esc.mjs'), 'utf8');
+  assert.equal(syntaxCheck(join(dir, 'esc.mjs')).status, 0);
+  assert.ok(!out.includes('function sanitize('), 'the unpicked sanitizer is still dropped');
+  // …and the family's policy gate still applies to the GENERATED esm copy.
+  const checked = spawnSync(process.execPath, [POLICY_BIN, '--check', 'esc.mjs'], { cwd: dir, encoding: 'utf8' });
+  assert.equal(checked.status, 0, `${checked.stdout}\n${checked.stderr}`);
+  assert.match(checked.stdout, /2 regions/);
+});
+
+test('esm format: no shaking without sideEffects:false — but the surface still narrows', async () => {
+  const dir = freshDir();
+  const bin = makeKitBin(dir, SHAKE_KIT, { sideEffects: true });
+  const r = runKit(bin, ['--format', 'esm', '--pick', 'reachable', '--out', 'unshaken.mjs'], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const file = join(dir, 'unshaken.mjs');
+  const out = readFileSync(file, 'utf8');
+  assert.equal(syntaxCheck(file).status, 0);
+  assert.match(r.stderr, /sideEffects/);
+  assert.doesNotMatch(r.stdout, /tree-shaken/);
+  assert.ok(out.includes('function unrelated('), 'the whole body is kept');
+  // …and the generated file SAYS so — these copies are committed and read, so
+  // the header must not claim a shake that did not happen.
+  assert.match(out, /it was not\n\/\/ tree-shaken, because the kit does not declare "sideEffects": false/);
+  // The declaration survives, but unpicked — the module exports only the pick.
+  const mod = await importFile(file);
+  assert.deepEqual(Object.keys(mod), ['reachable']);
+  assert.equal(mod.reachable(21), 42);
+});
+
+test('esm format: a static import in a shaken kit fails closed', () => {
+  // esm is the one format that tolerates a static import — but the shaker
+  // cannot account for one as a top-level declaration, so a narrowed esm
+  // build refuses rather than guessing at its extent.
+  const body = "import { createHash } from 'node:crypto';\n" +
+    'export const A = () => createHash;\n' +
+    'export const B = 2;\n';
+  const r = assertRefused('static import + --pick (esm)', body, 'esm', ['--pick', 'B']);
+  assert.match(r.stderr, /not a declaration this generator can account for/);
+  // …and the same kit still vendors verbatim at its FULL esm surface.
+  const dir = freshDir();
+  const bin = makeKitBin(dir, body);
+  assert.equal(runKit(bin, ['--format', 'esm', '--out', 'full.mjs'], dir).status, 0);
+});
+
+test('bare format: --pick narrows the body (there is no surface to narrow)', () => {
+  const dir = freshDir();
+  const bin = makeKitBin(dir, SHAKE_KIT);
+  const r = runKit(bin, ['--format', 'bare', '--pick', 'reachable', '--out', 'shaken.bare.js'], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const file = join(dir, 'shaken.bare.js');
+  const out = readFileSync(file, 'utf8');
+  assert.equal(syntaxCheck(file).status, 0, 'shaken bare output must parse as a classic script');
+  assert.match(r.stdout, /tree-shaken/);
+  assert.ok(!/^export\s/m.test(out), 'no export keywords may survive');
+  assert.ok(!out.includes('module.exports') && !/^globalThis\.[A-Za-z_$][A-Za-z0-9_$]* = \{$/m.test(out));
+  assert.ok(out.includes('function reachable(') && out.includes('function timesSmall('));
+  assert.ok(!out.includes('bigHelper'), 'the unreachable subsystem is dropped from the bundle');
+  // The declarations stay bundle-scoped under their own names, as bare always
+  // emits them — a pick list there is a statement about what the app calls.
+  assert.equal(new Function(`${out}\nreturn reachable(21);`)(), 42);
 });
 
 // ------------------------------------------------- fixture-exact assertions
