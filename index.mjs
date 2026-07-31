@@ -191,17 +191,27 @@ export function parseVendorArgs(argv) {
 // export form this function doesn't understand (today's `export var` /
 // `export function*` / `export const { a, b } = …`, or tomorrow's new syntax)
 // stops the build instead of silently vanishing from the generated surface.
-function deriveSurface(esm) {
+//
+// Both regexes are gated on the lexer mask: an `export` line that is really
+// COMMENTED OUT, or sitting inside a template literal, is not an export. Left
+// ungated they walked straight into the derived surface — a commented-out
+// export became a `globalThis.X = { gone: gone }` ReferenceError at load, and a
+// template literal holding an `export` line got its own contents rewritten by
+// strippedBody.
+function deriveSurface(esm, mask) {
   const surface = [];
   const accounted = new Set();
+  const isCode = (idx) => mask[idx] === M_CODE;
   const declRe = /^export\s+(?:async\s+)?(?:function|const|let|class)\s+([A-Za-z0-9_$]+)/gm;
   let m;
   while ((m = declRe.exec(esm)) !== null) {
+    if (!isCode(m.index)) continue;
     surface.push({ exported: m[1], local: m[1] });
     accounted.add(m.index);
   }
   const aggRe = /^export\s*\{([^}]*)\}\s*;?\s*$/gm;
   while ((m = aggRe.exec(esm)) !== null) {
+    if (!isCode(m.index)) continue;
     accounted.add(m.index);
     for (const part of m[1].split(',')) {
       const spec = part.trim();
@@ -234,6 +244,20 @@ const SUPPORTED_FORMS =
 // imports / import.meta in formats that can't express them, and an empty
 // surface. Returns the ordered surface array; every refusal throws.
 function deriveKitSurface(source, opts, kitDir) {
+  // Classify every character FIRST. Every `export` scan below is a regex over
+  // the raw text, and a regex cannot tell code from a comment or a template
+  // literal; the mask can. The lex is therefore a prerequisite of deriving a
+  // surface at all — if the scanner cannot say what is code here, it cannot
+  // assert the derived surface is complete either, so a lex failure refuses the
+  // generation instead of falling back to unmasked guessing.
+  const { mask } = lexKitSource(source, (msg) =>
+    vendorFail(
+      `${kitDir}/index.js could not be scanned: ${msg}. The generator classifies every character ` +
+        '(code / comment / literal) before deriving the export surface, and will not guess without it.'
+    )
+  );
+  const isCode = (idx) => mask[idx] === M_CODE;
+
   // The derivation (and the export-stripping in strippedBody) is only sound for
   // the forms the kits deliberately restrict themselves to. A default export or
   // a re-export-from would previously slip through both regexes and emit BROKEN
@@ -243,9 +267,12 @@ function deriveKitSurface(source, opts, kitDir) {
   // at generation time instead. (The catch-all gate below would also stop these;
   // this one is kept because it names the form.)
   {
-    const unsupported = source.match(
-      /^export\s+default\b|^export\s*\{[^}]*\}\s*from\b|^export\s*\*/m
-    );
+    const unsupportedRe = /^export\s+default\b|^export\s*\{[^}]*\}\s*from\b|^export\s*\*/gm;
+    let unsupported = null;
+    let u;
+    while ((u = unsupportedRe.exec(source)) !== null) {
+      if (isCode(u.index)) { unsupported = u; break; }
+    }
     if (unsupported) {
       vendorFail(
         `unsupported export form "${unsupported[0].trim()}…" in ${kitDir}/index.js — ` +
@@ -256,7 +283,7 @@ function deriveKitSurface(source, opts, kitDir) {
     }
   }
 
-  const { surface, accounted } = deriveSurface(source);
+  const { surface, accounted } = deriveSurface(source, mask);
 
   // ------------------------------------------------------------- fail closed
   // Enumerating bad forms can only ever cover the ones we thought of, and the
@@ -265,12 +292,21 @@ function deriveKitSurface(source, opts, kitDir) {
   // the committed copy and the regenerated copy share the omission. So instead
   // of listing what's rejected, assert that the derivation ACCOUNTED FOR every
   // `export` in the source, and refuse otherwise.
+  //
+  // The scan allows LEADING INDENTATION (`^[ \t]*export\b`). An indented
+  // top-level `export` is invisible to `declRe`, to `strippedBody`'s
+  // `^export\s+` strip, and — while this scan was anchored hard at `^` — to this
+  // gate too, so it sailed through as a `SyntaxError: Unexpected token 'export'`
+  // inside the emitted IIFE. And the scan is mask-gated, so an `export` that is
+  // commented out or inside a template literal is correctly NOT an orphan.
   {
     const orphans = [];
-    const exportRe = /^export\b/gm;
+    const exportRe = /^[ \t]*export\b/gm;
     let m;
     while ((m = exportRe.exec(source)) !== null) {
-      if (!accounted.has(m.index)) orphans.push(lineInfo(source, m.index));
+      const kw = m.index + m[0].indexOf('export');
+      if (!isCode(kw) || accounted.has(kw)) continue;
+      orphans.push(lineInfo(source, kw));
     }
     if (orphans.length) {
       vendorFail(
@@ -336,7 +372,10 @@ function deriveKitSurface(source, opts, kitDir) {
     vendorFail(`found no top-level exports in ${kitDir}/index.js — refusing to generate an empty surface.`);
   }
 
-  return surface;
+  // `mask` and `accounted` are handed on rather than recomputed: the body
+  // emitters need the same classification this derivation was gated on, and a
+  // second, independently-derived mask could disagree with the first.
+  return { surface, accounted, mask };
 }
 
 // --pick / --global pick lists must name real exports — a typo is an error,
@@ -429,10 +468,25 @@ function resolveKitExposure(surface, opts, globalSpecs, pkgName) {
 const M_CODE = 0;
 const M_COMMENT = 1;
 const M_LITERAL = 2;
+// Template-literal punctuation: the `$` of a `${…}` interpolation. It is
+// neither the string's text nor an expression — and it is emphatically not an
+// identifier, which is what reading it as M_CODE made it (see lexKitSource).
+const M_PUNCT = 3;
 
 // A `/` opens a regex literal only where the previous significant token cannot
 // end an expression. Word tokens are the ambiguous case, so keep the exact set
 // of keywords after which a regex is legal.
+//
+// A word in this set is only a KEYWORD when it stands on its own: after a `.`
+// (or `?.`) the very same spelling is a property name, which ends an expression
+// like any other operand. Missing that read `o.default / TOTAL` as the start of
+// a regex literal — usually fatal at the newline (fail-closed), but a trailing
+// `//` comment or a second `/` on the line CLOSES the phantom regex, masking
+// every identifier in between so its declaration looks unreferenced and gets
+// dropped. That is a silent ReferenceError in a consumer's vendored copy, and
+// `vendor:check` cannot see it because regeneration repeats the mistake. So
+// lexKitSource tracks the previous token's character and treats a word in
+// property position as an expression-ender.
 const REGEX_AFTER_WORD = new Set([
   'return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void', 'do',
   'else', 'yield', 'await', 'throw', 'case', 'default',
@@ -451,7 +505,11 @@ function lexKitSource(src, fail) {
   const stack = []; // template-literal / `${}`-interpolation frames
   let d = 0;
   let i = 0;
-  let prev = null; // last significant code token: { endsExpr }
+  // Last significant code token: { endsExpr, ch }. `ch` is the token's single
+  // character for punctuation (null for words/numbers/literals) — the `/`
+  // disambiguation below needs to know whether a word sits in property position
+  // (`o.default`) and whether the token before a `/` was a `}`.
+  let prev = null;
   const span = (from, to, m) => {
     for (let k = from; k < to; k++) {
       mask[k] = m;
@@ -476,10 +534,16 @@ function lexKitSource(src, fail) {
         span(i, i + 1, M_LITERAL);
         i++;
         stack.pop();
-        prev = { endsExpr: true };
+        prev = { endsExpr: true, ch: null };
         continue;
       }
-      span(i, i + 2, M_CODE); // `${` — code resumes inside the interpolation
+      // `${` — code resumes inside the interpolation. The `$` is template
+      // PUNCTUATION, not code: marking it M_CODE made collectIdentifiers read a
+      // bare `$` out of every interpolation, which rooted (and retained) a kit's
+      // top-level `$` export in every narrowed build containing a template
+      // literal. Only the `{` opens the code region.
+      span(i, i + 1, M_PUNCT);
+      span(i + 1, i + 2, M_CODE);
       stack.push({ kind: 'interp', depth: d });
       d++;
       i += 2;
@@ -512,7 +576,7 @@ function lexKitSource(src, fail) {
       if (j >= n) fail(`unterminated string literal at ${at(i)}`);
       span(i, j + 1, M_LITERAL);
       i = j + 1;
-      prev = { endsExpr: true };
+      prev = { endsExpr: true, ch: null };
       continue;
     }
     if (c === '`') {
@@ -520,6 +584,22 @@ function lexKitSource(src, fail) {
       i++;
       stack.push({ kind: 'template' });
       continue;
+    }
+    // A `/` after a `}` is the one case no character-level scanner can settle:
+    // `}` closes a BLOCK (statement position — `/…/` after it is a regex) just
+    // as readily as it closes an object literal, a function/class expression or
+    // a destructuring pattern (expression position — `/` is division). Picking
+    // either reading silently mis-lexes the other, and both mis-readings can
+    // mask identifiers out of the reachability scan. So refuse, the way every
+    // other thing this scanner cannot account for is refused. No kit in the
+    // family writes either form.
+    if (c === '/' && prev && prev.ch === '}') {
+      fail(
+        `a '/' directly after a '}' at ${at(i)} is ambiguous — it is division if the '}' closed an ` +
+          'object literal / function expression / destructuring pattern, and a regex literal if it ' +
+          'closed a block. The scanner will not guess, so nothing was shaken. Parenthesize the ' +
+          'expression (or hoist it) to disambiguate.'
+      );
     }
     if (c === '/' && (!prev || !prev.endsExpr)) {
       let j = i + 1;
@@ -538,7 +618,7 @@ function lexKitSource(src, fail) {
       while (j < n && /[a-z]/.test(src[j])) j++; // flags
       span(i, j, M_LITERAL);
       i = j;
-      prev = { endsExpr: true };
+      prev = { endsExpr: true, ch: null };
       continue;
     }
     if (c === '(' || c === '[' || c === '{') {
@@ -546,7 +626,7 @@ function lexKitSource(src, fail) {
       depth[i] = d;
       d++;
       i++;
-      prev = { endsExpr: false };
+      prev = { endsExpr: false, ch: c };
       continue;
     }
     if (c === ')' || c === ']' || c === '}') {
@@ -565,16 +645,22 @@ function lexKitSource(src, fail) {
       mask[i] = M_CODE;
       depth[i] = d;
       i++;
-      // `}` can close a block (statement position — a regex may follow); `)`
-      // and `]` always end an expression.
-      prev = { endsExpr: c !== '}' };
+      // `)` and `]` always end an expression. A `}` is ambiguous, and the guard
+      // above refuses the only place that ambiguity can matter (a following
+      // `/`), so the value recorded here is never consulted for it.
+      prev = { endsExpr: c !== '}', ch: c };
       continue;
     }
     if (/[A-Za-z_$]/.test(c)) {
       let j = i + 1;
       while (j < n && /[A-Za-z0-9_$]/.test(src[j])) j++;
       span(i, j, M_CODE);
-      prev = { endsExpr: !REGEX_AFTER_WORD.has(src.slice(i, j)) };
+      // In property position (`o.default`, `o?.in`) the spelling is a property
+      // name, not a keyword, and a property access ends an expression. `...foo`
+      // also ends in a dot but can only spread a real binding, and no word in
+      // REGEX_AFTER_WORD is spreadable, so the simple test is sound.
+      const isProperty = prev !== null && prev.ch === '.';
+      prev = { endsExpr: isProperty || !REGEX_AFTER_WORD.has(src.slice(i, j)), ch: null };
       i = j;
       continue;
     }
@@ -583,12 +669,18 @@ function lexKitSource(src, fail) {
       while (j < n && /[0-9a-zA-Z_.]/.test(src[j])) j++; // 0x1f, 1e9, 4_000_000, 8.64e15
       span(i, j, M_CODE);
       i = j;
-      prev = { endsExpr: true };
+      prev = { endsExpr: true, ch: null };
       continue;
     }
     mask[i] = M_CODE;
     depth[i] = d;
-    if (!/\s/.test(c)) prev = { endsExpr: false };
+    // `a++ / b` and `a-- / b` are divisions: the operand is the postfix
+    // update, and `++`/`--` cannot be followed by a regex in any valid
+    // program. Every other punctuator leaves the expression open.
+    if (!/\s/.test(c)) {
+      const postfix = (c === '+' || c === '-') && src[i - 1] === c;
+      prev = { endsExpr: postfix, ch: c };
+    }
     i++;
   }
 
@@ -606,10 +698,15 @@ const STMT_HEAD_RE =
 const EXPORT_BRACE_HEAD_RE = /^export[\s]*\{/;
 const POLICY_MARKER_TEXT = '@jfs-sanitizer-policy:';
 
-// True when only whitespace separates `idx` from the start of its line.
-function startsFreshLine(src, idx) {
+// True when only whitespace and COMMENTS separate `idx` from the start of its
+// line. Comments have to count: `const A = 1\n/* note */ const B = 2;` is the
+// same missing-semicolon hazard as the un-commented form, and skipping only
+// spaces/tabs made the scanner run the two declarations together into one
+// statement — so `declaredNames` registered neither `A` nor `B`, no pick could
+// root them, and the emitted copy referenced declarations it had dropped.
+function startsFreshLine(src, mask, idx) {
   let k = idx - 1;
-  while (k >= 0 && (src[k] === ' ' || src[k] === '\t')) k--;
+  while (k >= 0 && (mask[k] === M_COMMENT || src[k] === ' ' || src[k] === '\t')) k--;
   return k < 0 || src[k] === '\n';
 }
 
@@ -675,7 +772,7 @@ function sliceTopLevel(src, mask, depth, fail) {
       // new identifier while the declaration already reads as complete (the
       // last thing before it ends an operand, rather than being an operator
       // that a continuation line would follow).
-      if (!blockForm && j > start && startsFreshLine(src, j) && /[A-Za-z_$]/.test(src[j]) && endsOperand(src, mask, j, start)) {
+      if (!blockForm && j > start && startsFreshLine(src, mask, j) && /[A-Za-z_$]/.test(src[j]) && endsOperand(src, mask, j, start)) {
         fail(
           `the declaration at line ${lineOf(start)} has no terminating \`;\` before what looks like a new ` +
             `statement at line ${lineOf(j)} — the shaker will not guess at automatic semicolon insertion.`
@@ -712,6 +809,11 @@ function sliceTopLevel(src, mask, depth, fail) {
 // negative would drop one that is still needed. Property names (`x.foo`) are
 // excluded because they are never a top-level binding reference; comments and
 // string/regex text are excluded via the lexer mask.
+//
+// M_PUNCT is skipped along with comments and literals: the `$` of a `${…}` is
+// template punctuation, not a one-character identifier. Reading it as one
+// rooted (and retained) a kit's exported `$` in every narrowed build that
+// happened to contain a template literal.
 function collectIdentifiers(src, mask, from, to) {
   const names = new Set();
   for (let i = from; i < to; i++) {
@@ -735,16 +837,33 @@ function collectIdentifiers(src, mask, from, to) {
 // both, so take the head name plus any identifier that follows a depth-0 comma
 // inside the statement — otherwise `b` would look like a free global and its
 // declaration could be dropped out from under a reference to it.
-function declaredNames(src, mask, depth, stmt) {
+//
+// A destructuring declarator binds names this scanner cannot enumerate, and
+// STMT_HEAD_RE already refuses `const { a } = x` as a HEAD form for exactly
+// that reason. A destructuring pattern in a SECOND declarator
+// (`const NAME = 'x', { parse, stringify } = JSON;`) is the same hazard wearing
+// a different hat — it used to register only `NAME`, leaving `parse` and
+// `stringify` looking like free globals whose declaration was droppable — so it
+// is refused here too, rather than silently under-registered.
+function declaredNames(src, mask, depth, stmt, fail) {
   if (stmt.kind === 'exportBrace') return [];
   const names = [];
   const head = STMT_HEAD_RE.exec(src.slice(stmt.start, stmt.start + 200));
   if (head) names.push(head[2]);
+  const lineOf = (idx) => src.slice(0, idx).split('\n').length;
   if (stmt.kind === 'const' || stmt.kind === 'let' || stmt.kind === 'var') {
     for (let i = stmt.start; i < stmt.end; i++) {
       if (mask[i] !== M_CODE || depth[i] !== 0 || src[i] !== ',') continue;
       let j = i + 1;
       while (j < stmt.end && /\s/.test(src[j])) j++;
+      if (src[j] === '{' || src[j] === '[') {
+        fail(
+          `the declaration at line ${lineOf(stmt.start)} destructures in a later declarator ` +
+            `(\`${src[j]}\` at line ${lineOf(j)}) — the scanner cannot enumerate the names a pattern ` +
+            'binds, so they would look like free globals and their declaration could be dropped out ' +
+            'from under a reference. Split the pattern onto its own `const` statement.'
+        );
+      }
       const m = /^[A-Za-z_$][A-Za-z0-9_$]*/.exec(src.slice(j, stmt.end));
       if (m) names.push(m[0]);
     }
@@ -759,7 +878,11 @@ function declaredNames(src, mask, depth, stmt) {
 // declaration that follows. The gap at the top of the file splits at its LAST
 // blank line instead — everything above that is the kit's preamble, which
 // documents the file rather than any one declaration and is always kept.
-const BLANK_LINE_RE = /\n[ \t]*\n/;
+// CRLF-tolerant: `/\n[ \t]*\n/` never matches a `\r\n\r\n` gap, so a kit with
+// Windows line endings attached EVERY gap to the following declaration — the
+// file-top preamble included, which is then dropped by any pick that doesn't
+// keep the first declaration.
+const BLANK_LINE_RE = /\r?\n[ \t]*\r?\n/;
 
 function splitAtFirstBlank(gap) {
   const m = BLANK_LINE_RE.exec(gap);
@@ -804,7 +927,7 @@ function buildShakeChunks(src, mask, depth, stmts, fail) {
     return {
       text: text.trim(),
       kind: stmt.kind,
-      declares: declaredNames(src, mask, depth, stmt),
+      declares: declaredNames(src, mask, depth, stmt, fail),
       refs: collectIdentifiers(src, mask, stmt.start, stmt.end),
       hasPolicyRegion: text.includes(POLICY_MARKER_TEXT),
     };
@@ -893,6 +1016,49 @@ export function treeShakeKitSource(source, rootLocals, { fail = vendorFail, expo
         '`jfs-sanitizer-policy-sync --check` still gates it. Refusing to shake.'
     );
   }
+
+  // ------------------------------------------------------ dangling-reference gate
+  // The reachability analysis above is only as good as the two scans that feed
+  // it: `collectIdentifiers` (what a chunk READS) and `declaredNames` (what a
+  // chunk BINDS). A hole in either drops a declaration the emitted body still
+  // names, and the failure surfaces as a `ReferenceError` in a consumer's
+  // browser, with `vendor:check` blind to it because regeneration repeats the
+  // same mistake.
+  //
+  // So verify the CONCLUSION rather than the route to it: re-lex the EMITTED
+  // body and assert that no dropped top-level name survives in it as a live
+  // identifier. It reads a different artifact than the reachability walk did,
+  // so a bookkeeping slip — a root that never got queued, an alias resolved to
+  // the wrong local — becomes a refusal here.
+  //
+  // It scans M_CODE only, and skips property names, exactly as the reachability
+  // scan does. Widening it to literal text was tried and is not viable: a
+  // dropped name spelled inside a genuine regex or string then refuses a
+  // correct build (`$` is both a valid export name and a regex anchor — five of
+  // the family's eight consumers hit that on the first try). The lexer's own
+  // ambiguities are handled where they arise, by refusing there.
+  {
+    const emitted = new Set();
+    chunks.forEach((chunk, idx) => {
+      if (keep.has(idx)) for (const name of chunk.declares) emitted.add(name);
+    });
+    const dropped = new Set([...declaredBy.keys()].filter((name) => !emitted.has(name)));
+    if (dropped.size) {
+      const { mask: outMask } = lexKitSource(out, (msg) =>
+        fail(`the tree-shaken body could not be re-scanned: ${msg}. Refusing to shake.`)
+      );
+      const live = collectIdentifiers(out, outMask, 0, out.length);
+      const dangling = [...dropped].filter((name) => live.has(name));
+      if (dangling.length) {
+        fail(
+          `tree-shaking dropped ${dangling.length} declaration(s) the emitted body still references: ` +
+            `${dangling.sort().join(', ')}. That would be a ReferenceError in the consumer, so nothing ` +
+            'was written. (The reachability scan and the emitted body disagree — treat this as a ' +
+            'generator bug, not a kit bug.)'
+        );
+      }
+    }
+  }
   return out;
 }
 
@@ -905,7 +1071,7 @@ export function treeShakeKitSource(source, rootLocals, { fail = vendorFail, expo
 //     existing full-surface vendored copies don't move, or
 //   * the kit has not declared `"sideEffects": false`, i.e. its author has not
 //     asserted that dropping an unreferenced top-level declaration is safe.
-function narrowKitBody(source, { exposed, globals }, surface, pkg) {
+function narrowKitBody(source, { exposed, globals }, surface, pkg, accounted) {
   const rootLocals = new Set(
     (globals ? globals.flatMap((g) => g.exposed) : exposed).map((s) => s.local)
   );
@@ -922,7 +1088,6 @@ function narrowKitBody(source, { exposed, globals }, surface, pkg) {
     };
   }
 
-  const { accounted } = deriveSurface(source);
   return { body: treeShakeKitSource(source, rootLocals, { exportOffsets: accounted }), shaken: true };
 }
 
@@ -946,11 +1111,29 @@ function vendorHeader(pkg, repo, extra) {
 // Strip aggregate alias lines first (they're re-expressed via the surface
 // map in global/cjs, and deliberately dropped in bare), then the `export`
 // keyword from every top-level declaration.
-function strippedBody(esm) {
-  return esm
-    .replace(/^export\s*\{[^}]*\}\s*;?\s*$/gm, '')
-    .replace(/^export\s+/gm, '')
-    .replace(/\n{3,}/g, '\n\n');
+//
+// Mask-gated, for the same reason deriveSurface is: `^export` inside a template
+// literal is that STRING'S content, and rewriting it silently corrupts the
+// emitted data. (The gate is applied to the text actually being emitted — the
+// shaken body when there is one — so it is re-lexed here rather than reusing
+// the source mask.)
+function strippedBody(esm, fail = vendorFail) {
+  const { mask } = lexKitSource(esm, (msg) =>
+    fail(`the body to emit could not be scanned: ${msg}. Nothing was written.`)
+  );
+  // One ordered pass so both strips read the SAME mask offsets (a second pass
+  // over already-rewritten text could not). The aggregate-line alternative is
+  // first, so it wins wherever both would match.
+  const re = /^export\s*\{[^}]*\}\s*;?\s*$|^export\s+/gm;
+  let out = '';
+  let cursor = 0;
+  let m;
+  while ((m = re.exec(esm)) !== null) {
+    if (mask[m.index] !== M_CODE) continue;
+    out += esm.slice(cursor, m.index);
+    cursor = m.index + m[0].length;
+  }
+  return (out + esm.slice(cursor)).replace(/\n{3,}/g, '\n\n');
 }
 
 // Emit the generated file for one format. Pure string-in/string-out: the
@@ -1072,9 +1255,9 @@ export function runVendorCli(kitDir, argv = process.argv.slice(2)) {
 
   try {
     const { opts, globalSpecs } = parseVendorArgs(argv);
-    const surface = deriveKitSurface(source, opts, kitDir);
+    const { surface, accounted } = deriveKitSurface(source, opts, kitDir);
     const exposure = resolveKitExposure(surface, opts, globalSpecs, pkg.name);
-    const narrowed = narrowKitBody(source, exposure, surface, pkg);
+    const narrowed = narrowKitBody(source, exposure, surface, pkg, accounted);
     if (narrowed.note) console.warn(`${pkg.name} vendor: ${narrowed.note}`);
     const expected = emitVendoredOutput(
       opts.format,
