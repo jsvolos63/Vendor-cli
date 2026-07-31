@@ -57,6 +57,24 @@ jobs:
 Same rules as family-ci: edits land in every consumer's next scheduled bump
 at once — treat them like kit API changes.
 
+## Tree-shaking in the vendoring generator
+
+`--pick` / `--global Name:picks` narrow the emitted BODY, not just the
+exposed API: the generator roots at the picked exports' local declarations
+and drops every top-level declaration they can't reach. It is a
+purpose-built pass over the kit source (a lexer that classifies every
+character as code/comment/literal, statement segmentation, reachability),
+NOT a bundler — a bundler would reprint every kit and erase every comment,
+and these files are committed and reviewed. Four invariants, all tested:
+surviving declarations are exact source slices (readability), any
+declaration carrying a `@jfs-sanitizer-policy:` marker is a root and the
+generator refuses to emit fewer markers than the source (the consumers run
+the policy check against the GENERATED copy), the output is a pure function
+of source+picks (`vendor:check`), and anything the scanner can't account for
+fails the generation. A full surface is never shaken — its bytes are
+unchanged from the pre-tree-shaking CLI. A kit that does not declare
+`"sideEffects": false` is never shaken either.
+
 ## Kit extraction policy (the bar for kit #9)
 
 The family's per-repo overhead — CI, pins, vendoring, release tagging, a
