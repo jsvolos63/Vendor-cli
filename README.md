@@ -169,7 +169,8 @@ vendored copy:
                   unless --global is used instead)
 --format bare     export-stripped copy for classic-script bundle concatenation
 --format cjs      CommonJS transform for require() from CJS Netlify Functions
---pick a,b,c      global/cjs: expose just this subset (typos are an error)
+--pick a,b,c      global/cjs: expose just this subset (typos are an error).
+                  Narrows the shipped BYTES too — see "Tree-shaking" below
 --global Name[:a,b,c]
                   global format only; repeatable. Each occurrence adds a named
                   global to the SAME emitted file, exposing its `:`-suffixed
@@ -195,6 +196,44 @@ jfs-news-kit-vendor --format global \
 
 The exposed surface for global/cjs is derived from the kit source's own
 top-level `export` declarations — never a hand-maintained list.
+
+### Tree-shaking
+
+A narrowed surface (`--pick`, or `--global Name:picks`) narrows the emitted
+**body** as well: the generator roots at the picked exports' local
+declarations, keeps every top-level declaration they transitively reference,
+and drops the rest. Real numbers from the family's own invocations:
+`--pick escapeHtml` on dom-kit goes 15,314 → 4,014 bytes; Surf-Tracker's
+two-global news-kit build 73,265 → 36,141.
+
+This is what makes merging kits affordable — without it, a consumer that
+wants one escaper out of a merged kit would ship the whole thing.
+
+Four properties are guaranteed, because the family's tooling depends on
+them:
+
+- **Readable.** Surviving declarations are emitted as exact source slices
+  with their comments; nothing is reprinted or minified. (That is also why
+  this is a purpose-built pass rather than a bundler: a bundler would
+  reprint every kit and erase every comment.)
+- **Markers survive.** Any declaration carrying a
+  `@jfs-sanitizer-policy:…` marker is a shaking root, and the generator
+  refuses to emit output with fewer markers than the source — so
+  `jfs-sanitizer-policy-sync --check` still gates the *generated* copy no
+  matter what a consumer picked.
+- **Deterministic.** The output is a pure function of (source, picks) —
+  original order, original text — which is what makes `vendor:check` on a
+  shaken copy meaningful.
+- **Fail-closed.** The scanner refuses to shake anything it cannot account
+  for byte-for-byte (a top-level statement that is not a declaration, a
+  declaration with no terminating `;`, unbalanced lexical state), and the
+  whole pass is skipped for a kit that does not declare
+  `"sideEffects": false` — i.e. one whose author has not asserted that
+  dropping an unreferenced top-level declaration is safe.
+
+A full surface (no picks, or picks covering every export) is **not** shaken:
+the body is emitted verbatim, byte-identical to what this CLI produced
+before tree-shaking existed.
 
 ## Tests
 

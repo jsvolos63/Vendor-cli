@@ -8,5 +8,6 @@
     "type": "git",
     "url": "git+https://github.com/jsvolos63/fixture-kit.git"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "sideEffects": false
 }

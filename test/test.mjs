@@ -193,22 +193,23 @@ test('cjs format: parseable and exports the full derived surface', () => {
   assert.deepEqual([...mapped].sort(), [...NAMES].sort(), 'module.exports must expose exactly the derived exports');
 });
 
-test('cjs format: --pick narrows module.exports (body kept whole)', () => {
+test('cjs format: --pick narrows module.exports AND tree-shakes the body', () => {
   const dir = freshDir();
-  const pickTwo = NAMES.slice(0, 2);
-  const r = run(['--format', 'cjs', '--pick', pickTwo.join(','), '--out', 'picked.cjs'], dir);
+  const r = run(['--format', 'cjs', '--pick', 'greet,fetchThing', '--out', 'picked.cjs'], dir);
   assert.equal(r.status, 0, r.stderr);
   const file = join(dir, 'picked.cjs');
   const out = readFileSync(file, 'utf8');
   assert.equal(syntaxCheck(file).status, 0, 'picked cjs output must parse');
   const mapped = surfaceMapNames(out, 'module.exports = {');
-  assert.deepEqual([...mapped].sort(), [...pickTwo].sort());
-  // Unpicked DECLARATIONS still exist in the body — only the exposed API
-  // narrows. (Aggregate-alias names like helperAlias are exports-map-only, so
-  // assert on the fixture's local declaration names.)
-  for (const name of ['greet', 'fetchThing', 'ANSWER', 'Widget', 'doubled', 'internalHelper']) {
-    assert.ok(out.includes(name), `body keeps ${name}`);
+  assert.deepEqual([...mapped].sort(), ['fetchThing', 'greet']);
+  assert.ok(out.includes('function greet('), 'picked declarations survive');
+  assert.ok(out.includes('async function fetchThing('), 'picked declarations survive');
+  // …and everything the picks cannot reach is gone from the shipped bytes —
+  // the whole point: a narrowed surface must not carry the rest of the kit.
+  for (const gone of ['class Widget', 'function doubled(', 'function internalHelper(', 'const ANSWER']) {
+    assert.ok(!out.includes(gone), `unreachable declaration dropped: ${gone}`);
   }
+  assert.match(r.stdout, /tree-shaken/);
 });
 
 test('--check: passes in sync, fails on drift, fails when missing', () => {
@@ -248,12 +249,19 @@ const CLI_PATH = join(KIT_DIR, '..', '..', 'index.mjs');
 
 // Build a throwaway kit (package.json + index.js + the same bin shim shape the
 // real kits ship) around `body`, and return its bin path.
-function makeKitBin(dir, body) {
+function makeKitBin(dir, body, { sideEffects = false } = {}) {
   const kit = join(dir, `kit-${badKitSeq++}`);
   mkdirSync(join(kit, 'bin'), { recursive: true });
   writeFileSync(
     join(kit, 'package.json'),
-    JSON.stringify({ name: '@jfs/bad-kit', version: '1.0.0', type: 'module' }) + '\n'
+    JSON.stringify({
+      name: '@jfs/bad-kit',
+      version: '1.0.0',
+      type: 'module',
+      // The kits all declare this, and the tree-shaker requires it (see the
+      // gate test below), so the throwaway kits mirror them by default.
+      ...(sideEffects === false ? { sideEffects: false } : {}),
+    }) + '\n'
   );
   writeFileSync(join(kit, 'index.js'), body);
   writeFileSync(
@@ -270,9 +278,9 @@ function runKit(bin, args, cwd) {
 
 // Assert `body` is refused for `format`: non-zero exit, nothing written, and a
 // pre-existing destination left byte-identical.
-function assertRefused(label, body, format = 'cjs', extraArgs = []) {
+function assertRefused(label, body, format = 'cjs', extraArgs = [], kitOpts = {}) {
   const dir = freshDir();
-  const bin = makeKitBin(dir, body);
+  const bin = makeKitBin(dir, body, kitOpts);
   const out = 'out.generated.js';
   const dest = join(dir, out);
 
@@ -430,6 +438,252 @@ test('control: a well-formed kit still generates its FULL surface in every forma
   assert.equal(mod.greet('kit'), 'hi kit');
   assert.equal(mod.THE_ANSWER, 42);
   assert.equal(mod.helperAlias(21), 42);
+});
+
+// ------------------------------------------------------------ tree-shaking
+// A narrowed --pick/--global surface must narrow the emitted BYTES too (the
+// prerequisite for merging kits: otherwise a consumer that wants one escaper
+// pays for the whole merged kit). The properties asserted here are the ones
+// the family depends on: reachable code survives, unreachable code goes, a
+// full surface is untouched, sanitizer-policy markers always survive, and the
+// output is deterministic.
+
+// Kit shaped like a real one: a picked export, its private helper, and a
+// completely independent subsystem that the pick must not drag along.
+const SHAKE_KIT =
+  '// Kit preamble — documents the file, not any one declaration.\n' +
+  '\n' +
+  '// doc for SMALL\n' +
+  'const SMALL = 2;\n' +
+  '\n' +
+  'function timesSmall(x) {\n' +
+  '  return x * SMALL;\n' +
+  '}\n' +
+  '\n' +
+  'export function reachable(x) {\n' +
+  '  return timesSmall(x);\n' +
+  '}\n' +
+  '\n' +
+  '// ---- the unrelated subsystem ----\n' +
+  'const BIG_TABLE = { a: 1, b: 2 };\n' +
+  '\n' +
+  'function bigHelper(k) {\n' +
+  '  return BIG_TABLE[k];\n' +
+  '}\n' +
+  '\n' +
+  'export function unrelated(k) {\n' +
+  '  return bigHelper(k);\n' +
+  '}\n' +
+  '\n' +
+  'export { timesSmall as timesSmallAlias };\n';
+
+test('tree-shaking: a picked surface keeps what it reaches and drops what it does not', async () => {
+  const dir = freshDir();
+  const bin = makeKitBin(dir, SHAKE_KIT);
+  const r = runKit(bin, ['--format', 'cjs', '--pick', 'reachable', '--out', 'shaken.cjs'], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const file = join(dir, 'shaken.cjs');
+  const out = readFileSync(file, 'utf8');
+  assert.equal(syntaxCheck(file).status, 0, 'shaken output must parse');
+
+  assert.ok(out.includes('function reachable('), 'the picked export survives');
+  assert.ok(out.includes('function timesSmall('), 'a helper it calls survives');
+  assert.ok(out.includes('const SMALL = 2;'), 'a constant that helper reads survives');
+  assert.ok(out.includes('// doc for SMALL'), "a declaration's doc comment rides along");
+  assert.ok(out.includes('// Kit preamble'), 'the file preamble always survives');
+
+  assert.ok(!out.includes('unrelated'), 'an unpicked export is dropped');
+  assert.ok(!out.includes('bigHelper'), 'its private helper is dropped');
+  assert.ok(!out.includes('BIG_TABLE'), 'its data is dropped');
+  assert.ok(!out.includes('the unrelated subsystem'), "the dropped code's comments go with it");
+
+  const { createRequire } = await import('node:module');
+  const mod = createRequire(import.meta.url)(file);
+  assert.deepEqual(Object.keys(mod), ['reachable']);
+  assert.equal(mod.reachable(21), 42, 'the shaken body still works');
+});
+
+test('tree-shaking: an aggregate alias roots its LOCAL declaration', () => {
+  const dir = freshDir();
+  const bin = makeKitBin(dir, SHAKE_KIT);
+  // `timesSmallAlias` is exported only via `export { timesSmall as … }`, so the
+  // shake must root `timesSmall` (and, through it, SMALL) — not the alias name.
+  const r = runKit(bin, ['--format', 'cjs', '--pick', 'timesSmallAlias', '--out', 'alias.cjs'], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const out = readFileSync(join(dir, 'alias.cjs'), 'utf8');
+  assert.equal(syntaxCheck(join(dir, 'alias.cjs')).status, 0);
+  assert.ok(out.includes('function timesSmall('));
+  assert.ok(out.includes('const SMALL = 2;'));
+  assert.ok(!out.includes('function reachable('), 'the export that merely calls it is not a root');
+  assert.match(out, /module\.exports = \{\n {2}timesSmallAlias: timesSmall,\n\};/);
+});
+
+test('tree-shaking: multi --global shakes to the UNION of the picks, over one body', () => {
+  const dir = freshDir();
+  const bin = makeKitBin(dir, SHAKE_KIT);
+  const r = runKit(
+    bin,
+    ['--format', 'global', '--global', 'A:reachable', '--global', 'B:unrelated', '--out', 'union.js'],
+    dir
+  );
+  assert.equal(r.status, 0, r.stderr);
+  const out = readFileSync(join(dir, 'union.js'), 'utf8');
+  assert.equal(syntaxCheck(join(dir, 'union.js')).status, 0);
+  for (const kept of ['function reachable(', 'function timesSmall(', 'function unrelated(', 'function bigHelper(']) {
+    assert.ok(out.includes(kept), `union keeps ${kept}`);
+  }
+  assert.equal(out.split('function reachable(').length - 1, 1, 'still ONE shared body');
+  (0, eval)(out);
+  assert.equal(globalThis.A.reachable(21), 42);
+  assert.equal(globalThis.B.unrelated('b'), 2);
+  assert.equal(globalThis.A.unrelated, undefined);
+  delete globalThis.A;
+  delete globalThis.B;
+});
+
+test('tree-shaking: a FULL surface is not shaken — the body stays byte-identical', () => {
+  const dir = freshDir();
+  const bin = makeKitBin(dir, SHAKE_KIT);
+  // Same transformation the generator applies to an unshaken body.
+  const expectedBody = SHAKE_KIT.replace(/^export\s*\{[^}]*\}\s*;?\s*$/gm, '')
+    .replace(/^export\s+/gm, '')
+    .replace(/\n{3,}/g, '\n\n');
+
+  assert.equal(runKit(bin, ['--format', 'cjs', '--out', 'full.cjs'], dir).status, 0);
+  assert.ok(readFileSync(join(dir, 'full.cjs'), 'utf8').includes(expectedBody), 'no --pick: verbatim body');
+
+  // …and an explicit pick list covering the whole surface is the same thing.
+  const all = 'reachable,unrelated,timesSmallAlias';
+  assert.equal(runKit(bin, ['--format', 'cjs', '--pick', all, '--out', 'all.cjs'], dir).status, 0);
+  assert.ok(readFileSync(join(dir, 'all.cjs'), 'utf8').includes(expectedBody), 'full pick list: verbatim body');
+});
+
+test('tree-shaking: output is deterministic across runs', () => {
+  const dir = freshDir();
+  const bin = makeKitBin(dir, SHAKE_KIT);
+  const args = ['--format', 'global', '--global', 'D:reachable', '--out'];
+  assert.equal(runKit(bin, [...args, 'det1.js'], dir).status, 0);
+  assert.equal(runKit(bin, [...args, 'det2.js'], dir).status, 0);
+  assert.equal(readFileSync(join(dir, 'det1.js'), 'utf8'), readFileSync(join(dir, 'det2.js'), 'utf8'));
+  // …which is what makes `vendor:check` on a shaken copy meaningful.
+  assert.equal(runKit(bin, [...args, 'det1.js', '--check'], dir).status, 0);
+});
+
+// The load-bearing one: six consumers run `jfs-sanitizer-policy-sync --check`
+// against their VENDORED copies, so a pick that doesn't reach the sanitizer
+// must NOT strip the policy markers out of the generated file — that would
+// silently disarm the family's sanitizer-drift gate.
+test('tree-shaking: sanitizer-policy regions survive a pick that cannot reach them', () => {
+  const dir = freshDir();
+  const kitBody =
+    'export function escape(s) {\n  return String(s);\n}\n' +
+    '\n' +
+    '// policy-managed constant, unreachable from `escape`\n' +
+    'const BLOCKED = new Set([\n' +
+    '  // @jfs-sanitizer-policy:blocked-tags:start case=upper quote=single\n' +
+    '  // @jfs-sanitizer-policy:blocked-tags:end\n' +
+    ']);\n' +
+    '\n' +
+    '// @jfs-sanitizer-policy:url-control-chars:start const=URL_CONTROL_CHARS\n' +
+    '// @jfs-sanitizer-policy:url-control-chars:end\n' +
+    '\n' +
+    'export function sanitize(html) {\n' +
+    '  return BLOCKED.has(html) ? "" : html.replace(URL_CONTROL_CHARS, "");\n' +
+    '}\n';
+  const bin = makeKitBin(dir, kitBody);
+  const kitDir = join(dir, `kit-${badKitSeq - 1}`);
+
+  // Fill the regions from the canonical policy, the way each kit does.
+  const POLICY_BIN = join(KIT_DIR, '..', '..', 'bin', 'sanitizer-policy-sync.mjs');
+  const filled = spawnSync(process.execPath, [POLICY_BIN, 'index.js'], { cwd: kitDir, encoding: 'utf8' });
+  assert.equal(filled.status, 0, filled.stderr);
+
+  const r = runKit(bin, ['--format', 'global', '--name', 'Esc', '--pick', 'escape', '--out', 'esc.js'], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const out = readFileSync(join(dir, 'esc.js'), 'utf8');
+  assert.equal(syntaxCheck(join(dir, 'esc.js')).status, 0);
+  assert.ok(!out.includes('function sanitize('), 'the unpicked sanitizer is still dropped');
+
+  // Both marker regions — and their canonical values — reached the generated
+  // copy, so the consumer-side policy check passes against it.
+  const checked = spawnSync(process.execPath, [POLICY_BIN, '--check', 'esc.js'], { cwd: dir, encoding: 'utf8' });
+  assert.equal(checked.status, 0, `${checked.stdout}\n${checked.stderr}`);
+  assert.match(checked.stdout, /2 regions/);
+});
+
+test('tree-shaking: skipped (body kept whole) for a kit that does not declare sideEffects:false', () => {
+  const dir = freshDir();
+  const bin = makeKitBin(dir, SHAKE_KIT, { sideEffects: true });
+  const r = runKit(bin, ['--format', 'cjs', '--pick', 'reachable', '--out', 'unshaken.cjs'], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const out = readFileSync(join(dir, 'unshaken.cjs'), 'utf8');
+  assert.ok(out.includes('function unrelated('), 'no sideEffects:false means no shaking');
+  assert.match(r.stderr, /sideEffects/);
+  assert.doesNotMatch(r.stdout, /tree-shaken/);
+});
+
+test('fail-closed: a top-level statement the shaker cannot account for refuses the shake', () => {
+  // A bare top-level statement may have side effects, and mis-measuring its
+  // extent would drop or duplicate real code. Nothing is written.
+  const body = 'export const A = 1;\nexport const B = 2;\nglobalThis.__installed = true;\n';
+  const r = assertRefused('top-level expression statement', body, 'cjs', ['--pick', 'A']);
+  assert.match(r.stderr, /not a declaration this generator can account for/);
+  // …but the same kit still vendors fine at its FULL surface (no shake).
+  const dir = freshDir();
+  const bin = makeKitBin(dir, body);
+  assert.equal(runKit(bin, ['--format', 'cjs', '--out', 'full.cjs'], dir).status, 0);
+});
+
+test('fail-closed: a declaration with no terminating semicolon refuses the shake', () => {
+  // Both shapes ASI makes legal: a following declaration, and a following
+  // expression statement (which would otherwise be swallowed into — and
+  // dropped with — the declaration above it).
+  for (const [label, body] of [
+    ['next declaration', 'export const A = 1\nexport const B = 2;\n'],
+    ['next expression statement', 'export const A = 1\nglobalThis.x = 1;\nexport const B = 2;\n'],
+  ]) {
+    const r = assertRefused(`missing semicolon (${label})`, body, 'cjs', ['--pick', 'B']);
+    assert.match(r.stderr, /automatic semicolon insertion/);
+  }
+
+  // …but a declaration that genuinely continues onto the next line is fine:
+  // the line break follows an operator, so nothing reads as complete yet.
+  const dir = freshDir();
+  const bin = makeKitBin(dir, 'export const A = 1 +\n  2;\nexport const B =\n  A;\nexport const C = 3;\n');
+  const r = runKit(bin, ['--format', 'cjs', '--pick', 'B', '--out', 'cont.cjs'], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const out = readFileSync(join(dir, 'cont.cjs'), 'utf8');
+  assert.equal(syntaxCheck(join(dir, 'cont.cjs')).status, 0);
+  assert.ok(out.includes('const A = 1 +\n  2;'), 'the multi-line declaration it reads survives whole');
+  assert.ok(!out.includes('const C'), 'and the unreachable one still goes');
+});
+
+test('tree-shaking: template literals and regex literals do not confuse the scanner', () => {
+  // The scanner has to know that `}`/`;`/identifiers inside a CSS template or a
+  // regex are not statement structure — news-kit ships ~90 lines of CSS in a
+  // template literal, and every kit is full of regex literals.
+  const body =
+    'const CSS = `\n' +
+    '.card { color: red; }\n' +
+    '@media (min-width: 40em) { .card { color: blue; } }\n' +
+    '`;\n' +
+    'const NAME_RE = /[/{};]+/g;\n' +
+    'const dropped = 1;\n' +
+    'export function styles(x) {\n' +
+    '  return `${CSS}${String(x).replace(NAME_RE, "")}`;\n' +
+    '}\n' +
+    'export function other() {\n' +
+    '  return dropped;\n' +
+    '}\n';
+  const dir = freshDir();
+  const bin = makeKitBin(dir, body);
+  const r = runKit(bin, ['--format', 'cjs', '--pick', 'styles', '--out', 'css.cjs'], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const out = readFileSync(join(dir, 'css.cjs'), 'utf8');
+  assert.equal(syntaxCheck(join(dir, 'css.cjs')).status, 0);
+  assert.ok(out.includes('const CSS = `'), 'the template a pick reaches survives whole');
+  assert.ok(out.includes('const NAME_RE'), 'so does the regex it uses');
+  assert.ok(!out.includes('const dropped'), 'and the unreachable declaration still goes');
 });
 
 // ------------------------------------------------- fixture-exact assertions

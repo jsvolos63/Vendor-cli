@@ -53,11 +53,12 @@
 //                     for `require()` from CommonJS Netlify Functions
 //   --pick a,b,c      global and cjs formats: expose just this subset (each
 //                     name must exist in the derived surface — typos are an
-//                     error). Narrows the EXPOSED API (the global object /
-//                     module.exports map), not the shipped bytes — the body
-//                     is kept whole because internal helpers are shared and
-//                     regex-level tree-shaking would be unsound. Use it to
-//                     keep a consumer's coupling surface explicit.
+//                     error). Narrows the exposed API (the global object /
+//                     module.exports map) AND the shipped bytes: the body is
+//                     tree-shaken down to the declarations the picks actually
+//                     reach (see "tree-shaking" below). Use it to keep a
+//                     consumer's coupling surface — and its payload —
+//                     explicit.
 //   --check           don't write; exit 1 if <dest> differs from what would
 //                     be generated (consumers run this in CI as vendor:check)
 //
@@ -74,6 +75,16 @@
 // them. An export form the generator doesn't understand aborts generation
 // (non-zero exit, nothing written) rather than producing a plausible artifact
 // with a silently missing export.
+//
+// TREE-SHAKING (see the treeShakeKitSource section further down): a NARROWED
+// surface also narrows the emitted body. Without it, merging two kits would
+// tax every consumer that wants one helper from one of them with the whole
+// other kit's bytes. The shaker is source-preserving — it drops whole
+// top-level declarations and emits the surviving ones VERBATIM, so comments
+// (including the `@jfs-sanitizer-policy` marker regions the family's policy
+// gate checks in the vendored copies), formatting and readability survive, and
+// the output is byte-deterministic. A full surface still emits the source
+// unshaken, byte-for-byte as before.
 
 import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { dirname, resolve, join } from 'node:path';
@@ -354,6 +365,547 @@ function resolveKitExposure(surface, opts, globalSpecs, pkgName) {
   return { exposed, globals, exposedCount };
 }
 
+// ------------------------------------------------------------ tree-shaking
+//
+// `--pick` / `--global Name:picks` used to narrow only the exposed API — the
+// body was shipped whole. That was tolerable while each kit was small and
+// single-purpose; it stops being tolerable the moment kits merge, because then
+// a consumer that wants one escaper pays for a whole news-river renderer.
+//
+// So a narrowed surface now narrows the BYTES too. The kits are single-file,
+// import-free ES modules whose top level is nothing but declarations (the
+// derivation gates above already refuse anything else), which makes reachability
+// the whole of the analysis: root at the picked exports' local bindings, keep
+// every top-level declaration they transitively name, drop the rest.
+//
+// Three properties are load-bearing, and each is a design constraint here:
+//
+//   READABLE   — vendored copies are committed and code-reviewed. The shaker
+//                never reprints code: surviving declarations are emitted as
+//                exact source slices, with their attached comments. (This is
+//                also why esbuild is not used: it would reprint every kit,
+//                erase every comment, and make each vendored copy a diff
+//                against nothing recognizable.)
+//   MARKERS    — the `@jfs-sanitizer-policy:<region>:start/:end` comments must
+//                reach the vendored copy: six consumers run
+//                `jfs-sanitizer-policy-sync --check` against the GENERATED
+//                file. Comments ride along with their declaration, and any
+//                declaration carrying a policy region is a shaking ROOT, so a
+//                pick that doesn't reach the sanitizer still can't disarm the
+//                family's drift gate.
+//   DETERMINISM— `vendor:check` diffs a regeneration against the committed
+//                copy, so the same (source, picks) must give the same bytes.
+//                The output is a pure function of those two: original order,
+//                original text, fixed joining.
+//
+// FAIL-CLOSED, like everything else here: the scanner below refuses to shake
+// anything it cannot account for byte-for-byte (see the head-form check and
+// the tiling assertion, both in sliceTopLevel), and the whole
+// pass is skipped — emitting today's whole body — for a kit that doesn't
+// declare `"sideEffects": false`, i.e. one whose author has NOT asserted that
+// dropping an unreferenced top-level declaration is safe.
+
+// Per-character classification produced by lexKitSource.
+const M_CODE = 0;
+const M_COMMENT = 1;
+const M_LITERAL = 2;
+
+// A `/` opens a regex literal only where the previous significant token cannot
+// end an expression. Word tokens are the ambiguous case, so keep the exact set
+// of keywords after which a regex is legal.
+const REGEX_AFTER_WORD = new Set([
+  'return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void', 'do',
+  'else', 'yield', 'await', 'throw', 'case', 'default',
+]);
+
+// One pass over the kit source producing, per character, what it IS (code /
+// comment / string-or-regex-or-template text) and the bracket depth it sits at.
+// Everything downstream — statement segmentation, identifier collection — reads
+// these two arrays instead of re-guessing lexical context, which is what makes
+// it safe to look for a `;` or an identifier without tripping over the CSS
+// living inside news-kit's template literals.
+function lexKitSource(src, fail) {
+  const n = src.length;
+  const mask = new Uint8Array(n);
+  const depth = new Int32Array(n);
+  const stack = []; // template-literal / `${}`-interpolation frames
+  let d = 0;
+  let i = 0;
+  let prev = null; // last significant code token: { endsExpr }
+  const span = (from, to, m) => {
+    for (let k = from; k < to; k++) {
+      mask[k] = m;
+      depth[k] = d;
+    }
+  };
+  const top = () => (stack.length ? stack[stack.length - 1] : null);
+  const at = (idx) => `offset ${idx} (line ${src.slice(0, idx).split('\n').length})`;
+
+  while (i < n) {
+    if (top() && top().kind === 'template') {
+      const start = i;
+      while (i < n) {
+        const c = src[i];
+        if (c === '\\') { i += 2; continue; }
+        if (c === '`' || (c === '$' && src[i + 1] === '{')) break;
+        i++;
+      }
+      span(start, Math.min(i, n), M_LITERAL);
+      if (i >= n) fail(`unterminated template literal at ${at(start)}`);
+      if (src[i] === '`') {
+        span(i, i + 1, M_LITERAL);
+        i++;
+        stack.pop();
+        prev = { endsExpr: true };
+        continue;
+      }
+      span(i, i + 2, M_CODE); // `${` — code resumes inside the interpolation
+      stack.push({ kind: 'interp', depth: d });
+      d++;
+      i += 2;
+      prev = null;
+      continue;
+    }
+
+    const c = src[i];
+    if (c === '/' && src[i + 1] === '/') {
+      let j = src.indexOf('\n', i);
+      if (j === -1) j = n;
+      span(i, j, M_COMMENT);
+      i = j;
+      continue;
+    }
+    if (c === '/' && src[i + 1] === '*') {
+      const j = src.indexOf('*/', i + 2);
+      if (j === -1) fail(`unterminated block comment at ${at(i)}`);
+      span(i, j + 2, M_COMMENT);
+      i = j + 2;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      let j = i + 1;
+      while (j < n && src[j] !== c) {
+        if (src[j] === '\\') { j += 2; continue; }
+        if (src[j] === '\n') fail(`unterminated string literal at ${at(i)}`);
+        j++;
+      }
+      if (j >= n) fail(`unterminated string literal at ${at(i)}`);
+      span(i, j + 1, M_LITERAL);
+      i = j + 1;
+      prev = { endsExpr: true };
+      continue;
+    }
+    if (c === '`') {
+      span(i, i + 1, M_LITERAL);
+      i++;
+      stack.push({ kind: 'template' });
+      continue;
+    }
+    if (c === '/' && (!prev || !prev.endsExpr)) {
+      let j = i + 1;
+      let inClass = false;
+      while (j < n) {
+        const ch = src[j];
+        if (ch === '\\') { j += 2; continue; }
+        if (ch === '\n') fail(`unterminated regex literal at ${at(i)}`);
+        if (inClass) { if (ch === ']') inClass = false; }
+        else if (ch === '[') inClass = true;
+        else if (ch === '/') break;
+        j++;
+      }
+      if (j >= n) fail(`unterminated regex literal at ${at(i)}`);
+      j++;
+      while (j < n && /[a-z]/.test(src[j])) j++; // flags
+      span(i, j, M_LITERAL);
+      i = j;
+      prev = { endsExpr: true };
+      continue;
+    }
+    if (c === '(' || c === '[' || c === '{') {
+      mask[i] = M_CODE;
+      depth[i] = d;
+      d++;
+      i++;
+      prev = { endsExpr: false };
+      continue;
+    }
+    if (c === ')' || c === ']' || c === '}') {
+      // The `}` that closes a `${…}` hands control back to the template text.
+      if (c === '}' && top() && top().kind === 'interp' && d === top().depth + 1) {
+        d--;
+        mask[i] = M_CODE;
+        depth[i] = d;
+        i++;
+        stack.pop();
+        prev = null;
+        continue;
+      }
+      d--;
+      if (d < 0) fail(`unbalanced '${c}' at ${at(i)}`);
+      mask[i] = M_CODE;
+      depth[i] = d;
+      i++;
+      // `}` can close a block (statement position — a regex may follow); `)`
+      // and `]` always end an expression.
+      prev = { endsExpr: c !== '}' };
+      continue;
+    }
+    if (/[A-Za-z_$]/.test(c)) {
+      let j = i + 1;
+      while (j < n && /[A-Za-z0-9_$]/.test(src[j])) j++;
+      span(i, j, M_CODE);
+      prev = { endsExpr: !REGEX_AFTER_WORD.has(src.slice(i, j)) };
+      i = j;
+      continue;
+    }
+    if (/[0-9]/.test(c)) {
+      let j = i + 1;
+      while (j < n && /[0-9a-zA-Z_.]/.test(src[j])) j++; // 0x1f, 1e9, 4_000_000, 8.64e15
+      span(i, j, M_CODE);
+      i = j;
+      prev = { endsExpr: true };
+      continue;
+    }
+    mask[i] = M_CODE;
+    depth[i] = d;
+    if (!/\s/.test(c)) prev = { endsExpr: false };
+    i++;
+  }
+
+  if (d !== 0 || stack.length) {
+    fail('brackets/quotes do not balance across the file — the scanner lost track of lexical context, so nothing was shaken.');
+  }
+  return { mask, depth };
+}
+
+// The top-level statement forms the shaker understands. Anything else at depth
+// 0 aborts the shake (it could be a side-effecting statement, and dropping —
+// or misjudging the extent of — one is exactly the unsound move).
+const STMT_HEAD_RE =
+  /^(?:export[\s]+)?(?:async[\s]+)?(function[\s]*\*?|class|const|let|var)[\s]+([A-Za-z0-9_$]+)/;
+const EXPORT_BRACE_HEAD_RE = /^export[\s]*\{/;
+const POLICY_MARKER_TEXT = '@jfs-sanitizer-policy:';
+
+// True when only whitespace separates `idx` from the start of its line.
+function startsFreshLine(src, idx) {
+  let k = idx - 1;
+  while (k >= 0 && (src[k] === ' ' || src[k] === '\t')) k--;
+  return k < 0 || src[k] === '\n';
+}
+
+// True when the last significant thing before `idx` closes an operand (a value,
+// a `)`/`]`/`}`) rather than leaving an expression open (an operator, a comma,
+// an opening bracket) — i.e. when the statement so far already reads complete.
+const OPERATOR_CHARS = /[-+*/%=<>!&|^~?:,.([{]/;
+function endsOperand(src, mask, idx, floor) {
+  let k = idx - 1;
+  while (k >= floor && (mask[k] === M_COMMENT || /\s/.test(src[k]))) k--;
+  if (k < floor) return false;
+  if (mask[k] !== M_CODE) return true; // a string / template / regex literal
+  return !OPERATOR_CHARS.test(src[k]);
+}
+
+// Split the source into ordered top-level statements. Returns the statement
+// spans only; the text BETWEEN them (comments, blank lines) is attributed by
+// buildShakeChunks below.
+function sliceTopLevel(src, mask, depth, fail) {
+  const n = src.length;
+  const stmts = [];
+  const isTopCode = (k) => mask[k] === M_CODE && depth[k] === 0;
+  const lineOf = (idx) => src.slice(0, idx).split('\n').length;
+  let i = 0;
+
+  while (i < n) {
+    // Skip the gap: whitespace and comments carry no statement of their own.
+    while (i < n && (mask[i] === M_COMMENT || /\s/.test(src[i]))) i++;
+    if (i >= n) break;
+
+    const start = i;
+    const head = src.slice(start, start + 200);
+    const decl = STMT_HEAD_RE.exec(head);
+    const isExportBrace = !decl && EXPORT_BRACE_HEAD_RE.test(head);
+    if (!decl && !isExportBrace) {
+      fail(
+        `top-level statement at line ${lineOf(start)} (\`${head.split('\n')[0].slice(0, 60)}\`) is not a ` +
+          'declaration this generator can account for. Tree-shaking a narrowed --pick/--global surface ' +
+          'requires every top-level statement to be a declaration (it may otherwise have side effects ' +
+          'that dropping — or mis-measuring — would lose), so nothing was written.'
+      );
+    }
+    const kind = isExportBrace ? 'exportBrace' : decl[1].startsWith('function') ? 'function' : decl[1];
+    const blockForm = kind === 'function' || kind === 'class' || kind === 'exportBrace';
+
+    // Find the end: the depth-0 `}` that closes a function/class/export body,
+    // or the depth-0 `;` that terminates a variable declaration.
+    let j = start;
+    let end = -1;
+    for (; j < n; j++) {
+      if (!isTopCode(j)) continue;
+      const c = src[j];
+      if (c === ';') { end = j + 1; break; }
+      if (blockForm && c === '}') {
+        let k = j + 1;
+        while (k < n && /[ \t]/.test(src[k])) k++;
+        end = isTopCode(k) && src[k] === ';' ? k + 1 : j + 1;
+        break;
+      }
+      // A `const` with no terminating `;` would swallow whatever follows it,
+      // and the ASI rules that make that legal are exactly what a scanner this
+      // size must not pretend to implement. The tell: a fresh line starting a
+      // new identifier while the declaration already reads as complete (the
+      // last thing before it ends an operand, rather than being an operator
+      // that a continuation line would follow).
+      if (!blockForm && j > start && startsFreshLine(src, j) && /[A-Za-z_$]/.test(src[j]) && endsOperand(src, mask, j, start)) {
+        fail(
+          `the declaration at line ${lineOf(start)} has no terminating \`;\` before what looks like a new ` +
+            `statement at line ${lineOf(j)} — the shaker will not guess at automatic semicolon insertion.`
+        );
+      }
+    }
+    if (end === -1) {
+      fail(`could not find the end of the top-level statement starting at line ${lineOf(start)}.`);
+    }
+
+    stmts.push({ start, end, kind });
+    i = end;
+  }
+
+  if (!stmts.length) fail('found no top-level declarations to shake.');
+  // Tiling assertion: statements are disjoint, in order, and everything not
+  // covered by one is whitespace or comment. A scanner that lost its place
+  // would break this before it could drop the wrong bytes.
+  let cursor = 0;
+  for (const s of stmts) {
+    if (s.start < cursor || s.end <= s.start) fail('statement spans overlap — refusing to shake.');
+    for (let k = cursor; k < s.start; k++) {
+      if (mask[k] !== M_COMMENT && !/\s/.test(src[k])) {
+        fail(`unaccounted top-level text at line ${lineOf(k)} — refusing to shake.`);
+      }
+    }
+    cursor = s.end;
+  }
+  return stmts;
+}
+
+// Every identifier a statement READS, over-approximated on purpose: a false
+// positive only keeps a declaration that could have been dropped, while a false
+// negative would drop one that is still needed. Property names (`x.foo`) are
+// excluded because they are never a top-level binding reference; comments and
+// string/regex text are excluded via the lexer mask.
+function collectIdentifiers(src, mask, from, to) {
+  const names = new Set();
+  for (let i = from; i < to; i++) {
+    if (mask[i] !== M_CODE || !/[A-Za-z_$]/.test(src[i])) continue;
+    if (i > from && mask[i - 1] === M_CODE && /[A-Za-z0-9_$]/.test(src[i - 1])) continue;
+    let j = i + 1;
+    while (j < to && /[A-Za-z0-9_$]/.test(src[j])) j++;
+    let k = i - 1;
+    while (k >= from && mask[k] === M_CODE && /\s/.test(src[k])) k--;
+    // `x.foo` / `x?.foo` is a property name, never a binding — but `...foo`
+    // ends in a dot too and IS a reference (spreading a top-level binding).
+    const isMember =
+      k >= from && mask[k] === M_CODE && src[k] === '.' && !(k - 1 >= 0 && src[k - 1] === '.');
+    if (!isMember) names.add(src.slice(i, j));
+    i = j - 1;
+  }
+  return names;
+}
+
+// The names a declaration BINDS. Multi-declarator `const a = 1, b = 2;` binds
+// both, so take the head name plus any identifier that follows a depth-0 comma
+// inside the statement — otherwise `b` would look like a free global and its
+// declaration could be dropped out from under a reference to it.
+function declaredNames(src, mask, depth, stmt) {
+  if (stmt.kind === 'exportBrace') return [];
+  const names = [];
+  const head = STMT_HEAD_RE.exec(src.slice(stmt.start, stmt.start + 200));
+  if (head) names.push(head[2]);
+  if (stmt.kind === 'const' || stmt.kind === 'let' || stmt.kind === 'var') {
+    for (let i = stmt.start; i < stmt.end; i++) {
+      if (mask[i] !== M_CODE || depth[i] !== 0 || src[i] !== ',') continue;
+      let j = i + 1;
+      while (j < stmt.end && /\s/.test(src[j])) j++;
+      const m = /^[A-Za-z_$][A-Za-z0-9_$]*/.exec(src.slice(j, stmt.end));
+      if (m) names.push(m[0]);
+    }
+  }
+  return names;
+}
+
+// Comment attribution. A gap between two declarations splits at its FIRST
+// blank line: comments sitting directly under a declaration are ITS trailing
+// comments (this is what carries a `@jfs-sanitizer-policy:…:end` marker along
+// with the constant it closes), everything after the blank line documents the
+// declaration that follows. The gap at the top of the file splits at its LAST
+// blank line instead — everything above that is the kit's preamble, which
+// documents the file rather than any one declaration and is always kept.
+const BLANK_LINE_RE = /\n[ \t]*\n/;
+
+function splitAtFirstBlank(gap) {
+  const m = BLANK_LINE_RE.exec(gap);
+  return m ? [gap.slice(0, m.index), gap.slice(m.index)] : ['', gap];
+}
+
+function splitAtLastBlank(gap) {
+  const re = new RegExp(BLANK_LINE_RE.source, 'g');
+  let idx = -1;
+  let m;
+  while ((m = re.exec(gap)) !== null) {
+    idx = m.index;
+    re.lastIndex = m.index + 1;
+  }
+  return idx === -1 ? ['', gap] : [gap.slice(0, idx), gap.slice(idx)];
+}
+
+// Turn the statement spans into shakeable chunks: each carries the text that
+// will be emitted (its attached comments plus the statement itself), what it
+// declares, what it references, and whether it holds a sanitizer-policy marker.
+function buildShakeChunks(src, mask, depth, stmts, fail) {
+  const heads = [];
+  const tails = [];
+  let preamble = '';
+  for (let n = 0; n <= stmts.length; n++) {
+    const from = n === 0 ? 0 : stmts[n - 1].end;
+    const to = n === stmts.length ? src.length : stmts[n].start;
+    const gap = src.slice(from, to);
+    const [before, after] = n === 0 ? splitAtLastBlank(gap) : splitAtFirstBlank(gap);
+    if (n === 0) preamble = before.trim();
+    else tails[n - 1] = before;
+    if (n < stmts.length) heads[n] = after;
+    else if (after.trim()) {
+      // Prose after the LAST declaration has no following statement to
+      // document, so it rides with the one above it rather than being dropped.
+      tails[stmts.length - 1] = `${tails[stmts.length - 1] || ''}${after}`;
+    }
+  }
+
+  const chunks = stmts.map((stmt, n) => {
+    const text = `${heads[n] || ''}${src.slice(stmt.start, stmt.end)}${tails[n] || ''}`;
+    return {
+      text: text.trim(),
+      kind: stmt.kind,
+      declares: declaredNames(src, mask, depth, stmt),
+      refs: collectIdentifiers(src, mask, stmt.start, stmt.end),
+      hasPolicyRegion: text.includes(POLICY_MARKER_TEXT),
+    };
+  });
+  if (!chunks.length) fail('nothing to emit after chunking — refusing to shake.');
+  return { preamble, chunks };
+}
+
+// Drop every top-level declaration the picked surface cannot reach.
+// `rootLocals` are the LOCAL binding names behind the exposed exports (an
+// aggregate alias exposes `helperAlias` but roots `internalHelper`).
+// `exportOffsets` is the set of `export` keyword offsets the surface derivation
+// consumed — used as an independent cross-check that this scanner agrees with
+// it about where top-level statements begin.
+export function treeShakeKitSource(source, rootLocals, { fail = vendorFail, exportOffsets = null } = {}) {
+  const { mask, depth } = lexKitSource(source, fail);
+  const stmts = sliceTopLevel(source, mask, depth, fail);
+
+  if (exportOffsets) {
+    const starts = new Set(stmts.map((s) => s.start));
+    for (const off of exportOffsets) {
+      if (!starts.has(off)) {
+        fail(
+          `internal disagreement: the surface derivation found an export at offset ${off} that the ` +
+            'tree-shaker does not see as a top-level statement start. Refusing to shake.'
+        );
+      }
+    }
+  }
+
+  const { preamble, chunks } = buildShakeChunks(source, mask, depth, stmts, fail);
+
+  const declaredBy = new Map();
+  chunks.forEach((chunk, idx) => {
+    for (const name of chunk.declares) {
+      if (declaredBy.has(name)) {
+        fail(`top-level name "${name}" is declared twice — refusing to shake.`);
+      }
+      declaredBy.set(name, idx);
+    }
+  });
+
+  for (const name of rootLocals) {
+    if (!declaredBy.has(name)) {
+      fail(`picked export "${name}" has no top-level declaration the tree-shaker can find — refusing to shake.`);
+    }
+  }
+
+  // Roots: the picked exports' locals, plus every declaration carrying a
+  // sanitizer-policy marker — six consumers run the policy check against their
+  // GENERATED copy, so a pick that doesn't reach the sanitizer must not be able
+  // to strip the markers (and with them, silently, the family's drift gate).
+  const keep = new Set();
+  const queue = [];
+  const root = (idx) => {
+    if (idx === undefined || keep.has(idx)) return;
+    keep.add(idx);
+    queue.push(idx);
+  };
+  for (const name of rootLocals) root(declaredBy.get(name));
+  chunks.forEach((chunk, idx) => {
+    if (chunk.hasPolicyRegion) root(idx);
+  });
+
+  while (queue.length) {
+    const chunk = chunks[queue.shift()];
+    for (const ref of chunk.refs) root(declaredBy.get(ref));
+  }
+
+  // Aggregate `export { a as b }` lines are re-expressed as the surface map in
+  // every format this runs for, and stripped from the body — never emit them.
+  const body = chunks
+    .filter((chunk, idx) => keep.has(idx) && chunk.kind !== 'exportBrace')
+    .map((chunk) => chunk.text);
+
+  const out = `${(preamble ? [preamble, ...body] : body).join('\n\n')}\n`;
+
+  // Belt and braces on the marker guarantee above: every policy marker in the
+  // source must be in the output. If comment attribution ever changes shape,
+  // this fails the generation rather than quietly disarming the policy gate.
+  const markers = (text) => text.split(POLICY_MARKER_TEXT).length - 1;
+  if (markers(out) !== markers(source)) {
+    fail(
+      `tree-shaking would emit ${markers(out)} of the source's ${markers(source)} ` +
+        `\`${POLICY_MARKER_TEXT}\` markers — the vendored copy must keep them all so ` +
+        '`jfs-sanitizer-policy-sync --check` still gates it. Refusing to shake.'
+    );
+  }
+  return out;
+}
+
+// Decide whether this generation shakes, and do it. Returns the body the
+// formats below emit. Unshaken (verbatim source) whenever:
+//   * the format keeps the source as-is (esm) or has no narrowed surface,
+//   * the picks cover the whole surface — today's bytes, unchanged, so
+//     existing full-surface vendored copies don't move, or
+//   * the kit has not declared `"sideEffects": false`, i.e. its author has not
+//     asserted that dropping an unreferenced top-level declaration is safe.
+function narrowKitBody(source, format, { exposed, globals }, surface, pkg) {
+  if (format !== 'global' && format !== 'cjs') return { body: source, shaken: false };
+
+  const rootLocals = new Set(
+    (globals ? globals.flatMap((g) => g.exposed) : exposed).map((s) => s.local)
+  );
+  const allLocals = new Set(surface.map((s) => s.local));
+  if ([...allLocals].every((name) => rootLocals.has(name))) return { body: source, shaken: false };
+
+  if (pkg.sideEffects !== false) {
+    return {
+      body: source,
+      shaken: false,
+      note:
+        `${pkg.name} does not declare "sideEffects": false, so the narrowed surface was NOT tree-shaken ` +
+        '(dropping an unreferenced top-level declaration could drop a module-level side effect).',
+    };
+  }
+
+  const { accounted } = deriveSurface(source);
+  return { body: treeShakeKitSource(source, rootLocals, { exportOffsets: accounted }), shaken: true };
+}
+
 // -------------------------------------------------------------- generation
 
 function vendorHeader(pkg, repo, extra) {
@@ -436,7 +988,7 @@ function emitVendoredOutput(format, source, { exposed, globals }, pkg, repo) {
 // throws on a missing or drifted copy (vendor:check in consumer CI); otherwise
 // write the file. `surfaceCount` is the full derived surface size for the
 // "<n> of <m> exports" log lines.
-function writeOrCheckOutput(expected, opts, { pkgName, exposedCount, surfaceCount, globals }) {
+function writeOrCheckOutput(expected, opts, { pkgName, exposedCount, surfaceCount, globals, shaken }) {
   const dest = resolve(process.cwd(), opts.out);
 
   if (opts.check) {
@@ -454,7 +1006,8 @@ function writeOrCheckOutput(expected, opts, { pkgName, exposedCount, surfaceCoun
     mkdirSync(dirname(dest), { recursive: true });
     writeFileSync(dest, expected);
     const shape = globals && globals.length > 1 ? `${globals.length} globals, ` : '';
-    console.log(`${pkgName} vendor: wrote ${opts.out} (format ${opts.format}, ${shape}${exposedCount} of ${surfaceCount} exports).`);
+    const shape2 = shaken ? ', tree-shaken to the reachable body' : '';
+    console.log(`${pkgName} vendor: wrote ${opts.out} (format ${opts.format}, ${shape}${exposedCount} of ${surfaceCount} exports${shape2}).`);
   }
 }
 
@@ -478,12 +1031,15 @@ export function runVendorCli(kitDir, argv = process.argv.slice(2)) {
     const { opts, globalSpecs } = parseVendorArgs(argv);
     const surface = deriveKitSurface(source, opts, kitDir);
     const exposure = resolveKitExposure(surface, opts, globalSpecs, pkg.name);
-    const expected = emitVendoredOutput(opts.format, source, exposure, pkg, repo);
+    const narrowed = narrowKitBody(source, opts.format, exposure, surface, pkg);
+    if (narrowed.note) console.warn(`${pkg.name} vendor: ${narrowed.note}`);
+    const expected = emitVendoredOutput(opts.format, narrowed.body, exposure, pkg, repo);
     writeOrCheckOutput(expected, opts, {
       pkgName: pkg.name,
       exposedCount: exposure.exposedCount,
       surfaceCount: surface.length,
       globals: exposure.globals,
+      shaken: narrowed.shaken,
     });
   } catch (err) {
     // Only the CLI's own refusals become the classic stderr line + exit 1;
