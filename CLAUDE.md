@@ -88,6 +88,49 @@ fails the generation. A full surface is never shaken — its bytes are
 unchanged from the pre-tree-shaking CLI. A kit that does not declare
 `"sideEffects": false` is never shaken either.
 
+### The lexer mask is the load-bearing part (0.13.0)
+
+Everything downstream — statement segmentation, identifier collection, the
+surface derivation, the `export`-stripping pass — reads `lexKitSource`'s
+per-character mask instead of re-guessing lexical context. An adversarial
+audit found six ways that guessing leaked back in; all six shared one
+failure mode, the worst one this repo has: **exit 0, a plausible vendored
+file, and a `ReferenceError` (or `SyntaxError`) at load in the consumer** —
+which `vendor:check` cannot catch, because regeneration repeats the bug.
+
+- A `/` is division after a property named like a keyword (`o.default / N`)
+  and after a postfix `++`/`--`. Reading either as a regex opening masked
+  whatever followed, so its declaration looked unreachable and was dropped.
+- A `/` directly after a `}` is the one context no character-level scanner
+  can decide (block close vs. object literal / function expression), so it
+  is **refused**, not guessed.
+- `startsFreshLine` walks back over comments as well as spaces, so a comment
+  can no longer hide the missing semicolon between two declarations.
+- A destructuring pattern in a second-or-later declarator is refused, the
+  same way `STMT_HEAD_RE` already refuses it as a head form — the scanner
+  cannot enumerate the names a pattern binds.
+- The surface derivation and the `export` strip are mask-gated, and the
+  orphan gate matches `^[ \t]*export\b`: an `export` in a comment or a
+  template literal is not an export, a template literal's contents are never
+  rewritten, and an INDENTED top-level export is reported instead of being
+  emitted into an IIFE it cannot parse in.
+- The `$` of a `${…}` is its own mask class (`M_PUNCT`), not code — it was
+  being read as a bare `$` identifier, which retained a kit's exported `$`
+  in every narrowed build containing a template literal.
+
+Because the lex is now a prerequisite of deriving a surface at all, a source
+`lexKitSource` cannot classify refuses the generation outright, in every
+format — a kit whose lexical structure is unreadable is one whose derived
+surface cannot be asserted complete either.
+
+One more gate runs after every shake: no top-level name the shake DROPPED
+may survive as a live identifier in the emitted body. It is an assertion on
+the conclusion rather than on the route to it, so a bookkeeping slip in the
+reachability walk becomes a refusal. It scans `M_CODE` and skips property
+names, exactly as the reachability scan does — widening it to literal text
+was tried and refuses correct builds (`$` is both a valid export name and a
+regex anchor).
+
 ## Kit extraction policy (the bar for kit #9)
 
 The family's per-repo overhead — CI, pins, vendoring, release tagging, a

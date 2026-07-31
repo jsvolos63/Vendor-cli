@@ -867,6 +867,266 @@ test('bare format: --pick narrows the body (there is no surface to narrow)', () 
   assert.equal(new Function(`${out}\nreturn reachable(21);`)(), 42);
 });
 
+// ------------------------------------------ adversarial-audit regressions
+// Every case below was a LATENT defect: the CLI exited 0 and wrote a plausible
+// vendored file that would have thrown at load in a consumer's browser (or, for
+// the indented-export case, failed to parse at all). `vendor:check` is blind to
+// all of them by construction — the committed copy and the regenerated copy
+// come from the same generator, so they agree. Each test therefore asserts the
+// CORRECT outcome: the declaration retained, or a clean refusal — never a
+// silently wrong emission.
+
+// The body a format wraps, i.e. everything after the provenance header.
+const bodyOf = (out) => out.slice(out.indexOf('\n\n') + 2);
+
+// Whole-word identifiers in a generated body, found WITHOUT the generator's own
+// lexer — the point being that this scanner does not share whatever mistake the
+// generator might make about where code ends and a literal begins.
+function identifiersIn(text) {
+  const noComments = text.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ');
+  return new Set(noComments.match(/[A-Za-z_$][A-Za-z0-9_$]*/g) || []);
+}
+
+// Generate `body` with `args` and return the emitted text (asserting success).
+function generated(body, args, kitOpts = {}) {
+  const dir = freshDir();
+  const bin = makeKitBin(dir, body, kitOpts);
+  const out = `gen.${args.includes('esm') ? 'mjs' : 'js'}`;
+  const r = runKit(bin, [...args, '--out', out], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const file = join(dir, out);
+  assert.equal(syntaxCheck(file).status, 0, 'generated output must parse');
+  return readFileSync(file, 'utf8');
+}
+
+test('lexer: a keyword-spelled PROPERTY does not open a phantom regex literal', () => {
+  // `o.default` is a property access, not the `default` keyword, so the `/` is
+  // division. Reading it as a regex opening swallowed everything up to the next
+  // `/` on the line — a trailing `//` comment or a second division — hiding the
+  // reference to TOTAL/SCALE, whose declaration was then dropped as unreachable.
+  for (const [label, body, kept] of [
+    [
+      'closed by a trailing // comment',
+      'const TOTAL = 4;\n' +
+        'export function f(o) { return o.default / TOTAL; // normalized ratio\n}\n' +
+        'export function g() { return 1; }\n',
+      'const TOTAL = 4;',
+    ],
+    [
+      'closed by a second division on the line',
+      'const SCALE = 2;\nconst LIMIT = 3;\n' +
+        'export function f(opts) { return opts.default / SCALE / LIMIT; }\n' +
+        'export function g() { return 1; }\n',
+      'const SCALE = 2;',
+    ],
+    [
+      'optional chaining (`o?.in`)',
+      'const N = 7;\nconst M = 8;\n' +
+        'export function f(o) { return o?.in / N / M; }\n' +
+        'export function g() { return 1; }\n',
+      'const N = 7;',
+    ],
+    [
+      'postfix ++ is an operand, so the `/` after it is division',
+      'const N = 2;\nconst M = 3;\n' +
+        'export function f(i) { return i++ / N / M; }\n' +
+        'export function g() { return 1; }\n',
+      'const N = 2;',
+    ],
+  ]) {
+    const body_ = generated(body, ['--format', 'esm', '--pick', 'f']);
+    assert.ok(body_.includes(kept), `${label}: the divisor's declaration must survive`);
+    assert.ok(!body_.includes('function g('), `${label}: the unpicked export still goes`);
+  }
+});
+
+test("lexer: a '/' directly after a '}' is refused as ambiguous", () => {
+  // `}` closes a block (statement position — a regex may follow) exactly as
+  // readily as it closes an object literal / function expression (expression
+  // position — `/` is division). Both readings mis-lex the other, and both can
+  // mask a reference out of the reachability scan, so the scanner refuses
+  // instead of guessing. It is the only `/` context it cannot decide.
+  const body =
+    'const N = 2;\nconst M = 3;\n' +
+    'export function f() { return {a:1} / N / M; }\nexport function g() { return 1; }\n';
+  const r = assertRefused("'/' after '}'", body, 'esm', ['--pick', 'f']);
+  assert.match(r.stderr, /ambiguous/);
+  // The same expression parenthesized is not ambiguous and shakes normally.
+  const ok = generated(
+    'const N = 2;\nconst M = 3;\n' +
+      'export function f() { return ({a:1}).x / N / M; }\nexport function g() { return 1; }\n',
+    ['--format', 'esm', '--pick', 'f']
+  );
+  assert.ok(ok.includes('const N = 2;') && ok.includes('const M = 3;'));
+});
+
+test('fail-closed: a comment between a semicolon-less declaration and the next one still refuses', () => {
+  // `startsFreshLine` walked back over spaces and tabs only, so a comment in the
+  // gap hid the line break: the two declarations were run together into ONE
+  // statement, `declaredNames` registered only the first name, and a pick that
+  // needed the second dropped the pair out from under the reference. The
+  // un-commented spelling of the same hazard always refused; this one must too.
+  for (const [label, body] of [
+    ['block comment', 'const A = 1\n/* note */ const B = 2;\n'],
+    ['line comment', 'const A = 1\n// note\nconst B = 2;\n'],
+    ['multi-line block comment', 'const A = 1\n/* note\n   continues */\nconst B = 2;\n'],
+  ]) {
+    const full = `${body}export function useA() { return A; }\nexport function useB() { return B; }\n`;
+    const r = assertRefused(`missing semicolon before a comment (${label})`, full, 'esm', ['--pick', 'useB']);
+    assert.match(r.stderr, /automatic semicolon insertion/, label);
+  }
+  // …and a properly terminated pair with a comment between still shakes.
+  const ok = generated(
+    'const A = 1;\n/* note */\nconst B = 2;\n' +
+      'export function useA() { return A; }\nexport function useB() { return B; }\n',
+    ['--format', 'esm', '--pick', 'useB']
+  );
+  assert.ok(ok.includes('const B = 2;') && !ok.includes('const A = 1;'));
+});
+
+test('fail-closed: a destructuring pattern in a later declarator is refused', () => {
+  // STMT_HEAD_RE already refuses `const { a } = x` as a head form because the
+  // scanner cannot enumerate the names a pattern binds. The same pattern in a
+  // SECOND declarator used to be silently under-registered: only `NAME` was
+  // recorded, so `parse`/`stringify` looked like free globals and the whole
+  // declaration was dropped out from under the code that used them.
+  for (const [label, decl] of [
+    ['object pattern', "const NAME = 'x', { parse, stringify } = JSON;"],
+    ['array pattern', "const NAME = 'x', [first, second] = [1, 2];"],
+    ['pattern in a third declarator', "const NAME = 'x', OTHER = 2, { parse } = JSON;"],
+  ]) {
+    const body =
+      `${decl}\nexport function a() { return NAME; }\n` +
+      'export function b() { return typeof parse + typeof first + typeof second; }\n';
+    const r = assertRefused(`destructuring declarator (${label})`, body, 'esm', ['--pick', 'b']);
+    assert.match(r.stderr, /destructures in a later declarator/, label);
+  }
+  // Plain multi-declarator lists are unaffected — both names stay registered.
+  const ok = generated(
+    'const A = 1, B = 2;\nexport function useB() { return B; }\nexport function other() { return 9; }\n',
+    ['--format', 'esm', '--pick', 'useB']
+  );
+  assert.ok(ok.includes('const A = 1, B = 2;'), 'a multi-declarator list is still rooted by either name');
+});
+
+test('surface derivation: an `export` inside a comment or a template literal is not an export', () => {
+  // The three derivation regexes scanned raw text, so a commented-out export
+  // entered the surface (`globalThis.G = { gone: gone }` — a ReferenceError the
+  // moment the classic script loads) and an `export` line inside a template
+  // literal both entered the surface AND had the STRING'S OWN CONTENTS rewritten
+  // by the export-stripping pass.
+  const commented = generated('/*\nexport const gone = 2;\n*/\nexport const A = 1;\n', [
+    '--format', 'global', '--name', 'G',
+  ]);
+  assert.ok(!/^ {2}gone: /m.test(commented), 'a commented-out export must not enter the surface');
+  assert.ok(commented.includes('export const gone = 2;'), 'and the comment is emitted verbatim');
+  (0, eval)(commented);
+  assert.deepEqual(Object.keys(globalThis.G), ['A'], 'the global loads and exposes only the real export');
+  delete globalThis.G;
+
+  const templated = generated(
+    'export const SNIPPET = `\nexport const inner = 1;\n`;\nexport const A = 1;\n',
+    ['--format', 'global', '--name', 'G']
+  );
+  assert.ok(!/^ {2}inner: /m.test(templated), 'a template literal cannot contribute an export');
+  assert.ok(
+    templated.includes('export const inner = 1;'),
+    "the template literal's own contents must not be rewritten by the export strip"
+  );
+  (0, eval)(templated);
+  assert.deepEqual(Object.keys(globalThis.G).sort(), ['A', 'SNIPPET']);
+  assert.equal(globalThis.G.SNIPPET.trim(), 'export const inner = 1;');
+  delete globalThis.G;
+});
+
+test('fail-closed: an INDENTED top-level export is reported, not silently emitted', () => {
+  // Invisible to the surface derivation, to the export-stripping pass, and —
+  // while the orphan scan was anchored hard at `^` — to the fail-closed gate
+  // too. It sailed through into the emitted IIFE as
+  // `SyntaxError: Unexpected token 'export'`.
+  const r = assertRefused(
+    'indented top-level export',
+    'export const A = 1;\n  export const B = 2;\n',
+    'global',
+    ['--name', 'G']
+  );
+  assert.match(r.stderr, /cannot derive/);
+  assert.match(r.stderr, /line 2: export const B = 2;/);
+});
+
+test('tree-shaking: a `${…}` interpolation does not root a top-level `$`', () => {
+  // The lexer marked the `$` of `${` as code, so the identifier collector read a
+  // bare `$` out of every interpolation. Any kit exporting `$` therefore kept it
+  // in every narrowed build that contained a template literal anywhere in the
+  // reachable set — dead bytes in seven of the family's vendored copies.
+  const body = generated(
+    'export const $ = (s) => document.querySelector(s);\n' +
+      'export const TPL = (x) => `a${x}b`;\n',
+    ['--format', 'esm', '--pick', 'TPL']
+  );
+  assert.ok(body.includes('const TPL ='), 'the picked export survives');
+  assert.ok(!body.includes('querySelector'), 'the unreferenced `$` is dropped');
+  // …and a REAL reference to `$` still roots it.
+  const rooted = generated(
+    'export const $ = (s) => document.querySelector(s);\n' +
+      'export const TPL = (x) => `a${$(x)}b`;\n',
+    ['--format', 'esm', '--pick', 'TPL']
+  );
+  assert.ok(rooted.includes('querySelector'), 'calling `$` still roots it');
+});
+
+test('comment attribution survives CRLF line endings', () => {
+  // BLANK_LINE_RE was `/\n[ \t]*\n/`, which never matches `\r\n\r\n`. With a
+  // CRLF kit every gap attached to the FOLLOWING declaration, so the file-top
+  // preamble rode along with the first declaration and vanished with it.
+  const lf =
+    '// Kit preamble.\n\n// doc for A\nexport const A = 1;\n\n// doc for B\nexport const B = 2;\n';
+  const crlf = generated(lf.replace(/\n/g, '\r\n'), ['--format', 'esm', '--pick', 'B']);
+  assert.ok(crlf.includes('// Kit preamble.'), 'the preamble is always kept');
+  assert.ok(crlf.includes('// doc for B'), "the picked declaration keeps its own doc comment");
+  assert.ok(!crlf.includes('// doc for A'), 'the dropped one takes its comment with it');
+  // Same attribution as the LF spelling of the same file.
+  const plain = generated(lf, ['--format', 'esm', '--pick', 'B']);
+  assert.equal(bodyOf(crlf).replace(/\r/g, ''), bodyOf(plain));
+});
+
+test('tree-shaking: the emitted body never references a declaration it dropped', () => {
+  // The invariant behind the whole pass, checked here with a scanner that does
+  // NOT share the generator's lexer — so a future mistake about where code ends
+  // and a literal begins shows up as a failing test rather than as a
+  // ReferenceError in a consumer's browser. (The generator asserts the same
+  // invariant internally before writing, and refuses if it does not hold.)
+  const cases = [
+    [SHAKE_KIT, ['--pick', 'reachable']],
+    [SHAKE_KIT, ['--pick', 'timesSmallAlias']],
+    [SHAKE_KIT, ['--pick', 'unrelated']],
+    [
+      'const TOTAL = 4;\nexport function f(o) { return o.default / TOTAL; // ratio\n}\n' +
+        'export function g() { return 1; }\n',
+      ['--pick', 'f'],
+    ],
+    [
+      'const CSS = `.c { color: red }`;\nconst DROPPED = 1;\n' +
+        'export function styles() { return `${CSS}`; }\nexport function other() { return DROPPED; }\n',
+      ['--pick', 'styles'],
+    ],
+  ];
+  for (const [kit, args] of cases) {
+    const out = bodyOf(generated(kit, ['--format', 'esm', ...args]));
+    // Every top-level name the SOURCE declares, minus the ones still emitted.
+    const declared = [...kit.matchAll(/^(?:export\s+)?(?:async\s+)?(?:function\s*\*?|class|const|let|var)\s+([A-Za-z0-9_$]+)/gm)]
+      .map((m) => m[1]);
+    const emitted = new Set(
+      [...out.matchAll(/^(?:async\s+)?(?:function\s*\*?|class|const|let|var)\s+([A-Za-z0-9_$]+)/gm)].map((m) => m[1])
+    );
+    const live = identifiersIn(out.replace(/^export \{[\s\S]*$/m, ''));
+    for (const name of declared) {
+      if (emitted.has(name)) continue;
+      assert.ok(!live.has(name), `${args.join(' ')}: dropped "${name}" is still referenced by the emitted body`);
+    }
+  }
+});
+
 // ------------------------------------------------- fixture-exact assertions
 // The generic tests above derive expectations from the fixture's source; these
 // pin the concrete surface so a regression in the derivation itself (not just
