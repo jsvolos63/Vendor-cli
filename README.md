@@ -164,13 +164,18 @@ runVendorCli(dirname(dirname(fileURLToPath(import.meta.url))));
 vendored copy:
 
 ```
---format esm      verbatim ESM copy (unit tests import this)
+--format esm      ESM copy (unit tests import this; the buildless consumers
+                  import it directly in the browser). Verbatim source without
+                  --pick; with one, the tree-shaken body plus an aggregate
+                  `export { … }` line carrying exactly the picked surface
 --format global   classic-script IIFE on globalThis.<Name> (--name required,
                   unless --global is used instead)
 --format bare     export-stripped copy for classic-script bundle concatenation
 --format cjs      CommonJS transform for require() from CJS Netlify Functions
---pick a,b,c      global/cjs: expose just this subset (typos are an error).
-                  Narrows the shipped BYTES too — see "Tree-shaking" below
+--pick a,b,c      expose just this subset (typos are an error). Narrows the
+                  shipped BYTES too — see "Tree-shaking" below. Valid in every
+                  format; `bare` has no exposed surface, so there it narrows
+                  the body only
 --global Name[:a,b,c]
                   global format only; repeatable. Each occurrence adds a named
                   global to the SAME emitted file, exposing its `:`-suffixed
@@ -208,6 +213,24 @@ two-global news-kit build 73,265 → 36,141.
 
 This is what makes merging kits affordable — without it, a consumer that
 wants one escaper out of a merged kit would ship the whole thing.
+
+It applies to **every format**, `esm` included. That was not always true:
+`--pick` used to be rejected outside `global`/`cjs` on the assumption that an
+ESM copy is bundler input which something downstream would shake. It isn't —
+the family's consumers are buildless and load the vendored ESM file directly
+in the browser (Art-Gallery caches it as a cache-first service-worker shell
+asset), so an unshaken copy is shipped bytes. After news-kit v0.12.0 absorbed
+dom-kit and modal-kit, the ESM consumers' copies went to 113,067 bytes each;
+with their real pick lists they are 16,329 (Art-Gallery, 4 exports), 70,095
+(market-monitor, 9) and 90,018 (John's News, 10).
+
+An esm copy narrowed this way emits the surviving declarations with their
+`export` keywords stripped, followed by a single aggregate
+`export { local as exported, … }` line — the same role `module.exports` plays
+for `cjs`, and the only form that can carry an alias. `bare` shakes too, but
+it has no exposed surface at all (it emits export-free declarations for
+bundle concatenation), so `--pick` there is a statement about which entry
+points the app calls, and narrows the body only.
 
 Four properties are guaranteed, because the family's tooling depends on
 them:
