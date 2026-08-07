@@ -184,6 +184,27 @@ PRs opened by automated Claude Code sessions too: some hosted environments
 default to creating drafts, so mark the PR ready as part of opening it
 rather than leaving it for a follow-up.
 
+### Session autonomy
+
+These repos are worked by automated Claude Code sessions with the owner
+away, so a session that stops to ask has usually failed at the task. Every
+repo's `.claude/settings.json` carries the family allowlist and
+`acceptEdits`, so the ordinary tools of the job — reads, edits, git, the
+npm scripts, the GitHub API — run without a permission prompt. Use them.
+
+Ask a follow-up question only when proceeding either way would be wrong: a
+genuine product decision, or an ambiguity whose two readings produce
+materially different work. Routine calls — naming, file placement, patch
+vs. minor, which helper to extract — belong to the session: pick the
+obvious one, say so in the PR body, and keep going.
+
+Merging is the session's job too. Open the PR ready for review, dispatch
+CI, and squash-merge it once that run is green on the head commit. A
+finished, green PR left open for a human to click is the outcome this
+section exists to prevent. The gate itself does not move: green CI on the
+head commit is still the precondition for every merge, and a red run means
+fix it and re-dispatch — never merge anyway, and never park it and ask.
+
 ### Kit extraction bar
 
 Extract shared code into a NEW `@jfs/*` kit only when both hold: a third
