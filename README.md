@@ -1,7 +1,7 @@
 # @jfs/vendor-cli
 
-Shared **dev CLI** for the `@jfs/*` kit family (`dom-kit`, `pwa-kit`,
-`cache-kit`, `news-kit`, `netlify-kit`). It owns three jobs that used to be
+Shared **dev CLI** for the `@jfs/*` kit family (`news-kit`, `pwa-kit`,
+`netlify-kit`, `fetch-kit`, `cache-kit`). It owns three jobs that used to be
 byte-identical copies scattered across the kits and their consumers:
 
 1. **Vendoring** (`runVendorCli`, via each kit's `jfs-<kit>-vendor` bin) —

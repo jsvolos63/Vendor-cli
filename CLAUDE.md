@@ -131,14 +131,19 @@ names, exactly as the reachability scan does — widening it to literal text
 was tried and refuses correct builds (`$` is both a valid export name and a
 regex anchor).
 
-## Kit extraction policy (the bar for kit #9)
+## Kit extraction policy (the bar for kit #7)
+
+The family is **six kits** today — news-kit, pwa-kit, netlify-kit,
+fetch-kit, cache-kit, and this one — so the next new one would be #7. (It
+read "#9" until dom-kit and modal-kit were absorbed into news-kit at v0.12.0
+and archived; if you change the roster, change this number with it.)
 
 The family's per-repo overhead — CI, pins, vendoring, release tagging, a
 CLAUDE.md — is a permanent fixed cost that scales with repo count, not with
 usage. The short version of the bar lives in the synced block below and in
 every consumer's CLAUDE.md; the reasoning: a new kit is justified only by a
 third consumer AND demonstrated drift pain, because two repos copy-pasting
-a helper is strictly cheaper than a ninth kit until drift actually bites.
+a helper is strictly cheaper than a seventh kit until drift actually bites.
 When shared code does clear the bar, prefer landing it in an existing kit
 (news-kit has absorbed river + source-menu + sanitize; netlify-kit absorbed
 the Anthropic client) over creating a new repo.
