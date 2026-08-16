@@ -205,11 +205,12 @@ top-level `export` declarations — never a hand-maintained list.
 ### Tree-shaking
 
 A narrowed surface (`--pick`, or `--global Name:picks`) narrows the emitted
-**body** as well: the generator roots at the picked exports' local
-declarations, keeps every top-level declaration they transitively reference,
-and drops the rest. Real numbers from the family's own invocations:
-`--pick escapeHtml` on dom-kit goes 15,314 → 4,014 bytes; Surf-Tracker's
-two-global news-kit build 73,265 → 36,141.
+**body** as well: esbuild bundles a synthetic entry that re-exports exactly
+the picked names, keeping every declaration they transitively reference and
+dropping the rest. Real numbers from the family's own invocations against
+news-kit: Weather's 2-export pick emits 5,401 bytes, Art-Gallery's 4-export
+pick 7,688, Surf-Tracker's three-global classic build 35,358 — against the
+113 KB full surface.
 
 This is what makes merging kits affordable — without it, a consumer that
 wants one escaper out of a merged kit would ship the whole thing.
@@ -221,8 +222,9 @@ the family's consumers are buildless and load the vendored ESM file directly
 in the browser (Art-Gallery caches it as a cache-first service-worker shell
 asset), so an unshaken copy is shipped bytes. After news-kit v0.12.0 absorbed
 dom-kit and modal-kit, the ESM consumers' copies went to 113,067 bytes each;
-with their real pick lists they are 16,329 (Art-Gallery, 4 exports), 70,095
-(market-monitor, 9) and 90,018 (John's News, 10).
+with their real pick lists (and esbuild's reprint) they are 7,688
+(Art-Gallery, 4 exports), 44,686 (market-monitor, 9) and 52,427
+(John's News, 10).
 
 An esm copy narrowed this way emits the surviving declarations with their
 `export` keywords stripped, followed by a single aggregate
@@ -232,27 +234,36 @@ it has no exposed surface at all (it emits export-free declarations for
 bundle concatenation), so `--pick` there is a statement about which entry
 points the app calls, and narrows the body only.
 
-Four properties are guaranteed, because the family's tooling depends on
+Since 0.16.0 the reachability analysis is **esbuild's** (pinned to an exact
+version), not a hand-written pass: a synthetic entry re-exports the picked
+names from the kit and esbuild bundles it with tree-shaking on. A narrowed
+body is therefore esbuild's reprint of the surviving code — comments
+dropped, quoting normalized — rather than exact source slices; in exchange,
+the class of bug where a mis-lexed character silently dropped a declaration
+that was still referenced (exit 0, plausible file, `ReferenceError` in the
+consumer) is no longer this repo's to have.
+
+Three properties are guaranteed, because the family's tooling depends on
 them:
 
-- **Readable.** Surviving declarations are emitted as exact source slices
-  with their comments; nothing is reprinted or minified. (That is also why
-  this is a purpose-built pass rather than a bundler: a bundler would
-  reprint every kit and erase every comment.)
-- **Markers survive.** Any declaration carrying a
-  `@jfs-sanitizer-policy:…` marker is a shaking root, and the generator
-  refuses to emit output with fewer markers than the source — so
+- **Markers survive byte-exact.** Any declaration carrying a
+  `@jfs-sanitizer-policy:…` marker is swapped for a placeholder before the
+  bundle, force-rooted through a synthetic export, and grafted back
+  **verbatim** (attached comments and markers included) afterwards; the
+  generator refuses to emit output with fewer markers than the source — so
   `jfs-sanitizer-policy-sync --check` still gates the *generated* copy no
   matter what a consumer picked.
 - **Deterministic.** The output is a pure function of (source, picks) —
-  original order, original text — which is what makes `vendor:check` on a
-  shaken copy meaningful.
-- **Fail-closed.** The scanner refuses to shake anything it cannot account
-  for byte-for-byte (a top-level statement that is not a declaration, a
-  declaration with no terminating `;`, unbalanced lexical state), and the
-  whole pass is skipped for a kit that does not declare
-  `"sideEffects": false` — i.e. one whose author has not asserted that
-  dropping an unreferenced top-level declaration is safe.
+  exact-pinned esbuild, fixed options, pure string graft — which is what
+  makes `vendor:check` on a shaken copy meaningful.
+- **Fail-closed.** Anything the generator cannot account for refuses the
+  generation (a top-level statement that is not a declaration, a
+  declaration with no terminating `;`, unbalanced lexical state, a policy
+  placeholder that did not survive as a graftable line, a picked local not
+  declared under its own name in the bundle), and the whole pass is skipped
+  for a kit that does not declare `"sideEffects": false` — i.e. one whose
+  author has not asserted that dropping an unreferenced top-level
+  declaration is safe.
 
 A full surface (no picks, or picks covering every export) is **not** shaken:
 the body is emitted verbatim, byte-identical to what this CLI produced

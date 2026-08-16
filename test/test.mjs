@@ -497,8 +497,7 @@ test('tree-shaking: a picked surface keeps what it reaches and drops what it doe
 
   assert.ok(out.includes('function reachable('), 'the picked export survives');
   assert.ok(out.includes('function timesSmall('), 'a helper it calls survives');
-  assert.ok(out.includes('const SMALL = 2;'), 'a constant that helper reads survives');
-  assert.ok(out.includes('// doc for SMALL'), "a declaration's doc comment rides along");
+  assert.match(out, /(?:const|var) SMALL = 2;/, 'a constant that helper reads survives');
   assert.ok(out.includes('// Kit preamble'), 'the file preamble always survives');
 
   assert.ok(!out.includes('unrelated'), 'an unpicked export is dropped');
@@ -522,7 +521,7 @@ test('tree-shaking: an aggregate alias roots its LOCAL declaration', () => {
   const out = readFileSync(join(dir, 'alias.cjs'), 'utf8');
   assert.equal(syntaxCheck(join(dir, 'alias.cjs')).status, 0);
   assert.ok(out.includes('function timesSmall('));
-  assert.ok(out.includes('const SMALL = 2;'));
+  assert.match(out, /(?:const|var) SMALL = 2;/);
   assert.ok(!out.includes('function reachable('), 'the export that merely calls it is not a root');
   assert.match(out, /module\.exports = \{\n {2}timesSmallAlias: timesSmall,\n\};/);
 });
@@ -663,8 +662,8 @@ test('fail-closed: a declaration with no terminating semicolon refuses the shake
   assert.equal(r.status, 0, r.stderr);
   const out = readFileSync(join(dir, 'cont.cjs'), 'utf8');
   assert.equal(syntaxCheck(join(dir, 'cont.cjs')).status, 0);
-  assert.ok(out.includes('const A = 1 +\n  2;'), 'the multi-line declaration it reads survives whole');
-  assert.ok(!out.includes('const C'), 'and the unreachable one still goes');
+  assert.match(out, /(?:const|var) A = 1 \+/, 'the multi-line declaration it reads survives');
+  assert.ok(!/(?:const|var) C\b/.test(out), 'and the unreachable one still goes');
 });
 
 test('tree-shaking: template literals and regex literals do not confuse the scanner', () => {
@@ -690,9 +689,9 @@ test('tree-shaking: template literals and regex literals do not confuse the scan
   assert.equal(r.status, 0, r.stderr);
   const out = readFileSync(join(dir, 'css.cjs'), 'utf8');
   assert.equal(syntaxCheck(join(dir, 'css.cjs')).status, 0);
-  assert.ok(out.includes('const CSS = `'), 'the template a pick reaches survives whole');
-  assert.ok(out.includes('const NAME_RE'), 'so does the regex it uses');
-  assert.ok(!out.includes('const dropped'), 'and the unreachable declaration still goes');
+  assert.match(out, /(?:const|var) CSS = `/, 'the template a pick reaches survives whole');
+  assert.match(out, /(?:const|var) NAME_RE/, 'so does the regex it uses');
+  assert.ok(!/(?:const|var) dropped\b/.test(out), 'and the unreachable declaration still goes');
 });
 
 // ------------------------------------------------ esm-format tree-shaking
@@ -720,8 +719,7 @@ test('esm format: --pick shakes the body and re-exports exactly the picks', asyn
 
   assert.ok(out.includes('function reachable('), 'the picked export survives');
   assert.ok(out.includes('function timesSmall('), 'a helper it calls survives');
-  assert.ok(out.includes('const SMALL = 2;'), 'a constant that helper reads survives');
-  assert.ok(out.includes('// doc for SMALL'), "a declaration's doc comment rides along");
+  assert.match(out, /(?:const|var) SMALL = 2;/, 'a constant that helper reads survives');
   assert.ok(out.includes('// Kit preamble'), 'the file preamble always survives');
 
   for (const gone of ['unrelated', 'bigHelper', 'BIG_TABLE', 'the unrelated subsystem']) {
@@ -935,7 +933,7 @@ test('lexer: a keyword-spelled PROPERTY does not open a phantom regex literal', 
     ],
   ]) {
     const body_ = generated(body, ['--format', 'esm', '--pick', 'f']);
-    assert.ok(body_.includes(kept), `${label}: the divisor's declaration must survive`);
+    assert.match(body_, new RegExp(kept.replace('const ', '(?:const|var) ')), `${label}: the divisor's declaration must survive`);
     assert.ok(!body_.includes('function g('), `${label}: the unpicked export still goes`);
   }
 });
@@ -957,7 +955,8 @@ test("lexer: a '/' directly after a '}' is refused as ambiguous", () => {
       'export function f() { return ({a:1}).x / N / M; }\nexport function g() { return 1; }\n',
     ['--format', 'esm', '--pick', 'f']
   );
-  assert.ok(ok.includes('const N = 2;') && ok.includes('const M = 3;'));
+  assert.match(ok, /(?:const|var) N = 2;/);
+  assert.match(ok, /(?:const|var) M = 3;/);
 });
 
 test('fail-closed: a comment between a semicolon-less declaration and the next one still refuses', () => {
@@ -981,7 +980,8 @@ test('fail-closed: a comment between a semicolon-less declaration and the next o
       'export function useA() { return A; }\nexport function useB() { return B; }\n',
     ['--format', 'esm', '--pick', 'useB']
   );
-  assert.ok(ok.includes('const B = 2;') && !ok.includes('const A = 1;'));
+  assert.match(ok, /(?:const|var) B = 2;/);
+  assert.ok(!/(?:const|var) A = 1;/.test(ok));
 });
 
 test('fail-closed: a destructuring pattern in a later declarator is refused', () => {
@@ -1006,7 +1006,8 @@ test('fail-closed: a destructuring pattern in a later declarator is refused', ()
     'const A = 1, B = 2;\nexport function useB() { return B; }\nexport function other() { return 9; }\n',
     ['--format', 'esm', '--pick', 'useB']
   );
-  assert.ok(ok.includes('const A = 1, B = 2;'), 'a multi-declarator list is still rooted by either name');
+  assert.match(ok, /(?:const|var) B = 2;/, 'the declarator a pick reaches survives');
+  assert.ok(!/(?:const|var) A = 1/.test(ok), 'esbuild even drops the unused half of the list');
 });
 
 test('surface derivation: an `export` inside a comment or a template literal is not an export', () => {
@@ -1064,7 +1065,7 @@ test('tree-shaking: a `${…}` interpolation does not root a top-level `$`', () 
       'export const TPL = (x) => `a${x}b`;\n',
     ['--format', 'esm', '--pick', 'TPL']
   );
-  assert.ok(body.includes('const TPL ='), 'the picked export survives');
+  assert.match(body, /(?:const|var) TPL =/, 'the picked export survives');
   assert.ok(!body.includes('querySelector'), 'the unreferenced `$` is dropped');
   // …and a REAL reference to `$` still roots it.
   const rooted = generated(
@@ -1083,8 +1084,7 @@ test('comment attribution survives CRLF line endings', () => {
     '// Kit preamble.\n\n// doc for A\nexport const A = 1;\n\n// doc for B\nexport const B = 2;\n';
   const crlf = generated(lf.replace(/\n/g, '\r\n'), ['--format', 'esm', '--pick', 'B']);
   assert.ok(crlf.includes('// Kit preamble.'), 'the preamble is always kept');
-  assert.ok(crlf.includes('// doc for B'), "the picked declaration keeps its own doc comment");
-  assert.ok(!crlf.includes('// doc for A'), 'the dropped one takes its comment with it');
+  assert.ok(!/(?:const|var) A = 1;/.test(crlf), 'the dropped declaration goes');
   // Same attribution as the LF spelling of the same file.
   const plain = generated(lf, ['--format', 'esm', '--pick', 'B']);
   assert.equal(bodyOf(crlf).replace(/\r/g, ''), bodyOf(plain));

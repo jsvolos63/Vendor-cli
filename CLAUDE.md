@@ -57,79 +57,58 @@ jobs:
 Same rules as family-ci: edits land in every consumer's next scheduled bump
 at once — treat them like kit API changes.
 
-## Tree-shaking in the vendoring generator
+## Tree-shaking in the vendoring generator (esbuild since 0.16.0)
 
 `--pick` / `--global Name:picks` narrow the emitted BODY, not just the
-exposed API: the generator roots at the picked exports' local declarations
-and drops every top-level declaration they can't reach. It is a
-purpose-built pass over the kit source (a lexer that classifies every
-character as code/comment/literal, statement segmentation, reachability),
-NOT a bundler — a bundler would reprint every kit and erase every comment,
-and these files are committed and reviewed.
+exposed API. The REACHABILITY analysis is esbuild's (exact-pinned in
+`dependencies`, resolved lazily so the stamper/bumper bins never load it):
+`treeShakeKitSource` writes the kit plus a synthetic entry that re-exports
+exactly the picked names into a temp dir and bundles it with tree-shaking
+on, `minify: false`, `format: esm`. A narrowed body is therefore esbuild's
+reprint — comments dropped, `const` lowered to `var`, quoting normalized —
+and consumers' committed narrowed copies are bundler output, reviewed as
+such. It runs for ALL FOUR formats; a narrowed esm build ends in one
+aggregate `export { … }` line (the only form that can carry an alias), and
+`bare` has no exposed surface, so `--pick` there narrows the body only.
 
-It runs for ALL FOUR formats. `esm` was excluded at first on the theory that
-an ESM copy is bundler input, which is wrong here: the consumers are
-buildless and import the vendored ESM file directly in the browser, so an
-unshaken copy is shipped bytes (news-kit v0.12.0's absorption of dom-kit +
-modal-kit put three consumers on a 113 KB ESM copy; their real pick lists
-emit 16 KB / 70 KB / 90 KB). A narrowed esm build emits the surviving
-declarations with `export` stripped plus one aggregate `export { … }` line —
-the esm analogue of cjs's `module.exports` map, and the only form that can
-carry an alias. `bare` has no exposed surface at all, so `--pick` there
-narrows the body only.
+The hand-written shaker this replaced — a character-level lexer, statement
+segmentation, an identifier-reachability walk — had the worst failure mode
+this repo has: **exit 0, a plausible vendored file, and a `ReferenceError`
+at load in the consumer**, invisible to `vendor:check` because regeneration
+repeats the bug. An adversarial audit found six such bugs in one release
+(0.13.0); that whole class now belongs to esbuild rather than to this file.
 
-Four invariants, all tested:
-surviving declarations are exact source slices (readability), any
-declaration carrying a `@jfs-sanitizer-policy:` marker is a root and the
-generator refuses to emit fewer markers than the source (the consumers run
-the policy check against the GENERATED copy), the output is a pure function
-of source+picks (`vendor:check`), and anything the scanner can't account for
-fails the generation. A full surface is never shaken — its bytes are
-unchanged from the pre-tree-shaking CLI. A kit that does not declare
-`"sideEffects": false` is never shaken either.
+What survives of the old pass, and why:
 
-### The lexer mask is the load-bearing part (0.13.0)
+- `lexKitSource` + `sliceTopLevel` + the chunking still run — the surface
+  derivation and the full-surface `export`-strip (`strippedBody`) need to
+  tell code from comments and template literals, and the policy-graft pass
+  needs the boundaries of the declaration that carries each marker. Their
+  refusals (non-declaration top-level statement, missing `;` before a fresh
+  statement, `}` followed by `/`, destructuring in a later declarator) are
+  LOUD failures, the acceptable kind — none of them can silently drop code
+  anymore.
+- **Policy markers survive byte-exact.** A declaration carrying a
+  `@jfs-sanitizer-policy:` marker is swapped for a uniquely-tokened
+  placeholder before the bundle, force-rooted through a synthetic export,
+  and grafted back verbatim (attached comments and markers included) after
+  it — esbuild's reprint would otherwise break the canonical casing/quoting
+  that `jfs-sanitizer-policy-sync --check` verifies in consumers, and an
+  unreachable region would be dropped outright. The marker-count gate
+  (output must carry every marker the source does) still backstops the
+  graft.
+- Post-bundle gates, both fail-closed: every policy placeholder must
+  survive as a graftable line, and every picked export's LOCAL must still
+  be declared under its own name (the global/cjs surface maps reference
+  locals by name, so an esbuild rename must refuse, not ship).
 
-Everything downstream — statement segmentation, identifier collection, the
-surface derivation, the `export`-stripping pass — reads `lexKitSource`'s
-per-character mask instead of re-guessing lexical context. An adversarial
-audit found six ways that guessing leaked back in; all six shared one
-failure mode, the worst one this repo has: **exit 0, a plausible vendored
-file, and a `ReferenceError` (or `SyntaxError`) at load in the consumer** —
-which `vendor:check` cannot catch, because regeneration repeats the bug.
-
-- A `/` is division after a property named like a keyword (`o.default / N`)
-  and after a postfix `++`/`--`. Reading either as a regex opening masked
-  whatever followed, so its declaration looked unreachable and was dropped.
-- A `/` directly after a `}` is the one context no character-level scanner
-  can decide (block close vs. object literal / function expression), so it
-  is **refused**, not guessed.
-- `startsFreshLine` walks back over comments as well as spaces, so a comment
-  can no longer hide the missing semicolon between two declarations.
-- A destructuring pattern in a second-or-later declarator is refused, the
-  same way `STMT_HEAD_RE` already refuses it as a head form — the scanner
-  cannot enumerate the names a pattern binds.
-- The surface derivation and the `export` strip are mask-gated, and the
-  orphan gate matches `^[ \t]*export\b`: an `export` in a comment or a
-  template literal is not an export, a template literal's contents are never
-  rewritten, and an INDENTED top-level export is reported instead of being
-  emitted into an IIFE it cannot parse in.
-- The `$` of a `${…}` is its own mask class (`M_PUNCT`), not code — it was
-  being read as a bare `$` identifier, which retained a kit's exported `$`
-  in every narrowed build containing a template literal.
-
-Because the lex is now a prerequisite of deriving a surface at all, a source
-`lexKitSource` cannot classify refuses the generation outright, in every
-format — a kit whose lexical structure is unreadable is one whose derived
-surface cannot be asserted complete either.
-
-One more gate runs after every shake: no top-level name the shake DROPPED
-may survive as a live identifier in the emitted body. It is an assertion on
-the conclusion rather than on the route to it, so a bookkeeping slip in the
-reachability walk becomes a refusal. It scans `M_CODE` and skips property
-names, exactly as the reachability scan does — widening it to literal text
-was tried and refuses correct builds (`$` is both a valid export name and a
-regex anchor).
+A FULL surface (no picks, or picks covering every export) never goes near
+the bundler: verbatim source, byte-for-byte as always — which is why
+re-pinning this CLI is not a re-vendor event for any full-surface copy. A
+kit that does not declare `"sideEffects": false` is never shaken either.
+Determinism holds because esbuild is pinned exactly and invoked with fixed
+options in a fixed relative layout; `vendor:check` still diffs
+regeneration against the committed copy.
 
 ## Kit extraction policy (the bar for kit #7)
 
