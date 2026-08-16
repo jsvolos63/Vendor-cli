@@ -1274,6 +1274,25 @@ export function runVendorCli(kitDir, argv = process.argv.slice(2)) {
       pkg,
       repo
     );
+    // Sanitizer-policy gate, at the choke point: any emitted copy carrying a
+    // policy marker is validated against the canonical
+    // family/sanitizer-policy.json before it is written or checked. Because
+    // every consumer's vendor:check regenerates through this CLI, canonical
+    // policy is re-verified on every CI run with no separate policy:check
+    // step in the consumer — and a pin to a kit commit whose regions drifted
+    // (one that never passed the kit's own policy:check) is refused here
+    // rather than vendored.
+    if (expected.includes(POLICY_MARKER_TEXT)) {
+      const { drifts } = syncPolicyText(expected, sanitizerPolicy(), opts.out, vendorFail);
+      if (drifts.length) {
+        vendorFail(
+          `the emitted copy's sanitizer-policy region(s) ${drifts.map((d) => `'${d.region}'`).join(', ')} ` +
+            `disagree with the canonical family/sanitizer-policy.json — the pinned ${pkg.name} source is ` +
+            'out of sync with the family policy. Sync the kit (`jfs-sanitizer-policy-sync index.js`), land ' +
+            'that, and re-pin; nothing was written.'
+        );
+      }
+    }
     writeOrCheckOutput(expected, opts, {
       pkgName: pkg.name,
       exposedCount: exposure.exposedCount,
@@ -2058,6 +2077,65 @@ const POLICY_REGIONS = {
   'url-control-chars': renderUrlControlChars,
 };
 
+// Walk one text's policy regions against the canonical policy. Shared by the
+// sanitizer-policy-sync bin (which rewrites or --checks whole kit files) and
+// the vendoring generator (which validates every emitted copy that carries a
+// marker, so a consumer's vendor:check re-verifies canonical policy on every
+// regeneration with no separate policy:check step). `fail(msg)` must throw or
+// exit — structural problems (mangled/nested/unclosed markers, unknown
+// regions or params) never fall through. Returns the rebuilt text, the
+// region count, and the drifted regions.
+function syncPolicyText(src, policy, label, fail) {
+  const lines = src.split('\n');
+  const out = [];
+  const drifts = [];
+  let regions = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const m = POLICY_START_RE.exec(lines[i]);
+    if (!m) {
+      // A stray end marker outside a region means a hand edit mangled its
+      // start; rewriting around it would eat or duplicate code, so stop.
+      if (POLICY_MARKER_RE.test(lines[i])) {
+        fail(`${label}:${i + 1}: sanitizer-policy markers are mangled (end without start, or a malformed start marker) — restore the marker pair, then re-run.`);
+      }
+      out.push(lines[i]);
+      continue;
+    }
+    const [, indent, region, rawParams] = m;
+    const render = POLICY_REGIONS[region];
+    if (!render) {
+      fail(`${label}:${i + 1}: unknown region '${region}' (known: ${Object.keys(POLICY_REGIONS).join(', ')})`);
+    }
+    const endMarker = `@jfs-sanitizer-policy:${region}:end`;
+    let j = i + 1;
+    while (j < lines.length && !lines[j].includes(endMarker)) {
+      if (POLICY_MARKER_RE.test(lines[j])) {
+        fail(`${label}:${j + 1}: sanitizer-policy markers are mangled (nested or mismatched marker inside region '${region}') — restore the marker pair, then re-run.`);
+      }
+      j++;
+    }
+    if (j === lines.length) {
+      fail(`${label}:${i + 1}: region '${region}' has no end marker — restore it, then re-run.`);
+    }
+    const params = {};
+    for (const tok of rawParams.trim().split(/\s+/).filter(Boolean)) {
+      const pm = /^([a-z]+)=(\S+)$/.exec(tok);
+      if (!pm) fail(`${label}:${i + 1}: malformed param '${tok}' in region '${region}' (expected key=value)`);
+      params[pm[1]] = pm[2];
+    }
+    const bad = (msg) => fail(`${label}:${i + 1}: ${msg}`);
+    const body = render(policy, params, indent, bad);
+    const current = lines.slice(i + 1, j);
+    if (current.join('\n') !== body.join('\n')) {
+      drifts.push({ region, current, body });
+    }
+    out.push(lines[i], ...body, lines[j]);
+    i = j;
+    regions++;
+  }
+  return { next: out.join('\n'), regions, drifts };
+}
+
 export function sanitizerPolicySync(rootDir = process.cwd(), argv = []) {
   const check = argv.includes('--check');
   const fail = (msg) => {
@@ -2080,63 +2158,22 @@ export function sanitizerPolicySync(rootDir = process.cwd(), argv = []) {
     } catch (e) {
       return fail(`cannot read ${file}: ${e.message}`);
     }
-    const lines = src.split('\n');
-    const out = [];
-    let regions = 0;
-    for (let i = 0; i < lines.length; i++) {
-      const m = POLICY_START_RE.exec(lines[i]);
-      if (!m) {
-        // A stray end marker outside a region means a hand edit mangled its
-        // start; rewriting around it would eat or duplicate code, so stop.
-        if (POLICY_MARKER_RE.test(lines[i])) {
-          return fail(`${file}:${i + 1}: sanitizer-policy markers are mangled (end without start, or a malformed start marker) — restore the marker pair, then re-run.`);
-        }
-        out.push(lines[i]);
-        continue;
-      }
-      const [, indent, region, rawParams] = m;
-      const render = POLICY_REGIONS[region];
-      if (!render) {
-        return fail(`${file}:${i + 1}: unknown region '${region}' (known: ${Object.keys(POLICY_REGIONS).join(', ')})`);
-      }
-      const endMarker = `@jfs-sanitizer-policy:${region}:end`;
-      let j = i + 1;
-      while (j < lines.length && !lines[j].includes(endMarker)) {
-        if (POLICY_MARKER_RE.test(lines[j])) {
-          return fail(`${file}:${j + 1}: sanitizer-policy markers are mangled (nested or mismatched marker inside region '${region}') — restore the marker pair, then re-run.`);
-        }
-        j++;
-      }
-      if (j === lines.length) {
-        return fail(`${file}:${i + 1}: region '${region}' has no end marker — restore it, then re-run.`);
-      }
-      const params = {};
-      for (const tok of rawParams.trim().split(/\s+/).filter(Boolean)) {
-        const pm = /^([a-z]+)=(\S+)$/.exec(tok);
-        if (!pm) return fail(`${file}:${i + 1}: malformed param '${tok}' in region '${region}' (expected key=value)`);
-        params[pm[1]] = pm[2];
-      }
-      const bad = (msg) => fail(`${file}:${i + 1}: ${msg}`);
-      const body = render(policy, params, indent, bad);
-      const current = lines.slice(i + 1, j);
-      if (current.join('\n') !== body.join('\n')) {
-        drift = true;
-        if (check) {
-          console.error(`sanitizer-policy-sync: ${file} region '${region}' is out of date:`);
-          for (const l of current) console.error(`- ${l}`);
-          for (const l of body) console.error(`+ ${l}`);
+    const { next, regions, drifts } = syncPolicyText(src, policy, file, fail);
+    if (drifts.length) {
+      drift = true;
+      if (check) {
+        for (const d of drifts) {
+          console.error(`sanitizer-policy-sync: ${file} region '${d.region}' is out of date:`);
+          for (const l of d.current) console.error(`- ${l}`);
+          for (const l of d.body) console.error(`+ ${l}`);
         }
       }
-      out.push(lines[i], ...body, lines[j]);
-      i = j;
-      regions++;
     }
     if (regions === 0) {
       // A target with no regions is a misconfiguration, not "clean": passing
       // silently would let a deleted marker disable the gate.
       return fail(`${file}: no @jfs-sanitizer-policy regions found — add the start/end markers first.`);
     }
-    const next = out.join('\n');
     if (next === src) {
       console.log(`sanitizer-policy-sync: ${file} in sync (${regions} region${regions === 1 ? '' : 's'}).`);
     } else if (!check) {
