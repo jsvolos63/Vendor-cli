@@ -15,8 +15,9 @@ jobs:
   family-ci:
     uses: ./.github/workflows/family-ci.yml
     with:
-      # No dependencies — the suite imports index.mjs directly.
-      install-command: ''
+      # esbuild (the narrowing bundler, exact-pinned) must be installed for
+      # the tree-shaking tests; the suite imports index.mjs directly.
+      install-command: npm install
       run: npm test
       # family/ ships in the package (the canonical CLAUDE.md block), so its
       # edits need a version bump like any shipped-module change.
