@@ -246,13 +246,15 @@ consumer) is no longer this repo's to have.
 Three properties are guaranteed, because the family's tooling depends on
 them:
 
-- **Markers survive byte-exact.** Any declaration carrying a
-  `@jfs-sanitizer-policy:…` marker is swapped for a placeholder before the
-  bundle, force-rooted through a synthetic export, and grafted back
-  **verbatim** (attached comments and markers included) afterwards; the
-  generator refuses to emit output with fewer markers than the source — so
-  `jfs-sanitizer-policy-sync --check` still gates the *generated* copy no
-  matter what a consumer picked.
+- **Markers survive byte-exact — and are validated.** Any declaration
+  carrying a `@jfs-sanitizer-policy:…` marker is swapped for a placeholder
+  before the bundle, force-rooted through a synthetic export, and grafted
+  back **verbatim** (attached comments and markers included) afterwards;
+  the generator refuses to emit output with fewer markers than the source.
+  Since 0.17.0 it also validates every emitted copy's regions against the
+  canonical `family/sanitizer-policy.json` — a pin to a kit whose regions
+  drifted is refused rather than vendored, and consumers need no separate
+  `policy:check` step (their `vendor:check` regenerates through this CLI).
 - **Deterministic.** The output is a pure function of (source, picks) —
   exact-pinned esbuild, fixed options, pure string graft — which is what
   makes `vendor:check` on a shaken copy meaningful.

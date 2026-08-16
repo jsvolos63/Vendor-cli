@@ -93,8 +93,8 @@ What survives of the old pass, and why:
   placeholder before the bundle, force-rooted through a synthetic export,
   and grafted back verbatim (attached comments and markers included) after
   it — esbuild's reprint would otherwise break the canonical casing/quoting
-  that `jfs-sanitizer-policy-sync --check` verifies in consumers, and an
-  unreachable region would be dropped outright. The marker-count gate
+  the generator itself validates in every emitted copy (see the sanitizer
+  policy section), and an unreachable region would be dropped outright. The marker-count gate
   (output must carry every marker the source does) still backstops the
   graft.
 - Post-bundle gates, both fail-closed: every policy placeholder must
@@ -146,6 +146,16 @@ between `// @jfs-sanitizer-policy:<region>:start` / `:end` markers and
 regenerates them with `jfs-sanitizer-policy-sync` (start-marker params pick
 the kit's casing/quoting); the kits' CI runs the `--check` mode and fails on
 drift. Edit the JSON here, bump the version, and re-pin + re-sync the kits.
+
+Since 0.17.0 the gate also runs **inside the vendoring generator**: any
+emitted copy carrying a policy marker is validated against the canonical
+JSON before it is written or checked, so a pin to a kit commit whose
+regions drifted is refused rather than vendored. Because every consumer's
+`vendor:check` regenerates through this CLI, canonical policy is
+re-verified on every consumer CI run for free — which is why the
+consumer-side `policy:check` scripts were retired (the kit-side
+`policy:check` in news-kit's own CI remains the load-bearing source gate).
+Don't re-add per-consumer policy:check wiring; the choke point covers it.
 
 <!-- jfs-family-conventions:start — managed by jfs-claude-md-sync; edit family/family-conventions.md in @jfs/vendor-cli -->
 

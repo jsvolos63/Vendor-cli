@@ -619,6 +619,47 @@ test('tree-shaking: sanitizer-policy regions survive a pick that cannot reach th
   assert.match(checked.stdout, /2 regions/);
 });
 
+test('policy gate: a kit whose regions drifted from canonical policy is refused in every format', () => {
+  // The generation-time policy gate (0.17.0): every emitted copy carrying a
+  // marker is validated against family/sanitizer-policy.json, so a consumer's
+  // vendor:check re-verifies canonical policy on every regeneration — no
+  // separate consumer-side policy:check needed — and a pin to a kit commit
+  // whose regions drifted is refused rather than vendored.
+  const dir = freshDir();
+  const kitBody =
+    '// @jfs-sanitizer-policy:url-control-chars:start const=URL_CONTROL_CHARS\n' +
+    '// @jfs-sanitizer-policy:url-control-chars:end\n' +
+    '\n' +
+    'export function strip(s) {\n' +
+    '  return String(s).replace(URL_CONTROL_CHARS, "");\n' +
+    '}\n';
+  const bin = makeKitBin(dir, kitBody);
+  const kitDir = join(dir, `kit-${badKitSeq - 1}`);
+  const POLICY_BIN = join(KIT_DIR, '..', '..', 'bin', 'sanitizer-policy-sync.mjs');
+  const filled = spawnSync(process.execPath, [POLICY_BIN, 'index.js'], { cwd: kitDir, encoding: 'utf8' });
+  assert.equal(filled.status, 0, filled.stderr);
+
+  // In sync with canonical: a full-surface copy generates.
+  const ok = runKit(bin, ['--format', 'esm', '--out', 'ok.js'], dir);
+  assert.equal(ok.status, 0, ok.stderr);
+
+  // Drift the region's VALUE (keep the markers): every format refuses.
+  const synced = readFileSync(join(kitDir, 'index.js'), 'utf8');
+  const drifted = synced.replace('/g;', '/gi;');
+  assert.notEqual(drifted, synced, 'the tamper must land');
+  writeFileSync(join(kitDir, 'index.js'), drifted);
+  for (const args of [
+    ['--format', 'esm', '--out', 'a.js'],
+    ['--format', 'global', '--name', 'G', '--out', 'b.js'],
+    ['--format', 'cjs', '--out', 'c.cjs'],
+  ]) {
+    const r = runKit(bin, args, dir);
+    assert.notEqual(r.status, 0, `${args.join(' ')} must refuse a drifted policy region`);
+    assert.match(r.stderr, /disagree with the canonical/, args.join(' '));
+    assert.ok(!existsSync(join(dir, args[args.length - 1])), 'nothing may be written');
+  }
+});
+
 test('tree-shaking: skipped (body kept whole) for a kit that does not declare sideEffects:false', () => {
   const dir = freshDir();
   const bin = makeKitBin(dir, SHAKE_KIT, { sideEffects: true });
