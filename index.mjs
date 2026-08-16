@@ -86,12 +86,12 @@
 // TREE-SHAKING (see the treeShakeKitSource section further down): a NARROWED
 // surface also narrows the emitted body, in EVERY format. Without it, merging
 // two kits would tax every consumer that wants one helper from one of them
-// with the whole other kit's bytes. The shaker is source-preserving — it drops
-// whole top-level declarations and emits the surviving ones VERBATIM, so
-// comments (including the `@jfs-sanitizer-policy` marker regions the family's
-// policy gate checks in the vendored copies), formatting and readability
-// survive, and the output is byte-deterministic. A full surface still emits
-// the source unshaken, byte-for-byte as before.
+// with the whole other kit's bytes. The reachability analysis is esbuild's
+// (exact-pinned): a narrowed body is the bundler's deterministic reprint of
+// the surviving declarations, except that any declaration carrying a
+// `@jfs-sanitizer-policy` marker region is grafted back VERBATIM so the
+// family's policy gate still verifies the generated copy byte-exactly. A
+// full surface still emits the source unshaken, byte-for-byte as before.
 //
 // `esm` was excluded from this at first, on the assumption that an ESM copy is
 // consumed by a bundler that would shake it downstream. It isn't: the family's
@@ -105,6 +105,7 @@ import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'nod
 import { dirname, resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 
 // The generation is staged as named, parameter-passing functions —
 // parseVendorArgs → deriveKitSurface → resolveKitExposure →
@@ -431,38 +432,52 @@ function resolveKitExposure(surface, opts, globalSpecs, pkgName) {
 // single-purpose; it stops being tolerable the moment kits merge, because then
 // a consumer that wants one escaper pays for a whole news-river renderer.
 //
-// So a narrowed surface now narrows the BYTES too. The kits are single-file,
-// import-free ES modules whose top level is nothing but declarations (the
-// derivation gates above already refuse anything else), which makes reachability
-// the whole of the analysis: root at the picked exports' local bindings, keep
-// every top-level declaration they transitively name, drop the rest.
+// So a narrowed surface narrows the BYTES too. The REACHABILITY analysis —
+// which declarations a pick keeps — is esbuild's, not ours: a synthetic entry
+// re-exports exactly the picked names from the kit and esbuild bundles it with
+// tree-shaking on. This replaced a hand-written pass (a character-level lexer,
+// statement segmentation, an identifier-reachability walk) whose failure mode
+// was the worst this repo has — exit 0, a plausible vendored file, and a
+// ReferenceError at load in the consumer, invisible to `vendor:check` because
+// regeneration repeats the bug. An adversarial audit found six such bugs in
+// one release (see CLAUDE.md, 0.13.0); a bundler with esbuild's usage carries
+// that class of risk for us instead. The cost, accepted deliberately: a
+// narrowed body is esbuild's REPRINT of the surviving code — comments dropped,
+// quoting normalized — rather than exact source slices. (A FULL surface still
+// never goes near the bundler: verbatim source, byte-for-byte, as always.)
 //
-// Three properties are load-bearing, and each is a design constraint here:
+// Two properties survive the change as hard constraints:
 //
-//   READABLE   — vendored copies are committed and code-reviewed. The shaker
-//                never reprints code: surviving declarations are emitted as
-//                exact source slices, with their attached comments. (This is
-//                also why esbuild is not used: it would reprint every kit,
-//                erase every comment, and make each vendored copy a diff
-//                against nothing recognizable.)
-//   MARKERS    — the `@jfs-sanitizer-policy:<region>:start/:end` comments must
-//                reach the vendored copy: six consumers run
+//   MARKERS    — the `@jfs-sanitizer-policy:<region>:start/:end` regions must
+//                reach the vendored copy BYTE-EXACT: consumers run
 //                `jfs-sanitizer-policy-sync --check` against the GENERATED
-//                file. Comments ride along with their declaration, and any
-//                declaration carrying a policy region is a shaking ROOT, so a
-//                pick that doesn't reach the sanitizer still can't disarm the
-//                family's drift gate.
+//                file, and that check knows the canonical casing/quoting —
+//                esbuild's reprint would break it, and an unreachable region
+//                would be dropped outright. So every top-level declaration
+//                carrying a marker is swapped for a uniquely-tokened
+//                placeholder before the bundle, force-rooted through a
+//                synthetic export, and the placeholder statement in esbuild's
+//                output is replaced with the ORIGINAL declaration text
+//                (attached comments and markers included) afterwards. A
+//                marker-count gate still refuses any generation that would
+//                emit fewer markers than the source.
 //   DETERMINISM— `vendor:check` diffs a regeneration against the committed
 //                copy, so the same (source, picks) must give the same bytes.
-//                The output is a pure function of those two: original order,
-//                original text, fixed joining.
+//                esbuild is pinned to an exact version and invoked with fixed
+//                options in a fixed relative layout, and the graft is pure
+//                string replacement, so the output stays a pure function of
+//                (source, picks).
 //
-// FAIL-CLOSED, like everything else here: the scanner below refuses to shake
-// anything it cannot account for byte-for-byte (see the head-form check and
-// the tiling assertion, both in sliceTopLevel), and the whole
-// pass is skipped — emitting today's whole body — for a kit that doesn't
-// declare `"sideEffects": false`, i.e. one whose author has NOT asserted that
-// dropping an unreferenced top-level declaration is safe.
+// The lexer and statement segmentation below are NOT the shaker anymore: they
+// remain because the full-surface formats still strip `export` keywords from
+// verbatim source (strippedBody), the surface derivation still needs to tell
+// code from comments, and the policy-placeholder pass needs the boundaries of
+// the declaration that carries each marker. Everything they cannot account for
+// still refuses generation — but a refusal is a loud failure, which is the
+// acceptable kind. The whole narrowing pass is skipped — emitting today's
+// whole body — for a kit that doesn't declare `"sideEffects": false`, i.e.
+// one whose author has NOT asserted that dropping an unreferenced top-level
+// declaration is safe.
 
 // Per-character classification produced by lexKitSource.
 const M_CODE = 0;
@@ -804,35 +819,6 @@ function sliceTopLevel(src, mask, depth, fail) {
   return stmts;
 }
 
-// Every identifier a statement READS, over-approximated on purpose: a false
-// positive only keeps a declaration that could have been dropped, while a false
-// negative would drop one that is still needed. Property names (`x.foo`) are
-// excluded because they are never a top-level binding reference; comments and
-// string/regex text are excluded via the lexer mask.
-//
-// M_PUNCT is skipped along with comments and literals: the `$` of a `${…}` is
-// template punctuation, not a one-character identifier. Reading it as one
-// rooted (and retained) a kit's exported `$` in every narrowed build that
-// happened to contain a template literal.
-function collectIdentifiers(src, mask, from, to) {
-  const names = new Set();
-  for (let i = from; i < to; i++) {
-    if (mask[i] !== M_CODE || !/[A-Za-z_$]/.test(src[i])) continue;
-    if (i > from && mask[i - 1] === M_CODE && /[A-Za-z0-9_$]/.test(src[i - 1])) continue;
-    let j = i + 1;
-    while (j < to && /[A-Za-z0-9_$]/.test(src[j])) j++;
-    let k = i - 1;
-    while (k >= from && mask[k] === M_CODE && /\s/.test(src[k])) k--;
-    // `x.foo` / `x?.foo` is a property name, never a binding — but `...foo`
-    // ends in a dot too and IS a reference (spreading a top-level binding).
-    const isMember =
-      k >= from && mask[k] === M_CODE && src[k] === '.' && !(k - 1 >= 0 && src[k - 1] === '.');
-    if (!isMember) names.add(src.slice(i, j));
-    i = j - 1;
-  }
-  return names;
-}
-
 // The names a declaration BINDS. Multi-declarator `const a = 1, b = 2;` binds
 // both, so take the head name plus any identifier that follows a depth-0 comma
 // inside the statement — otherwise `b` would look like a free global and its
@@ -928,7 +914,6 @@ function buildShakeChunks(src, mask, depth, stmts, fail) {
       text: text.trim(),
       kind: stmt.kind,
       declares: declaredNames(src, mask, depth, stmt, fail),
-      refs: collectIdentifiers(src, mask, stmt.start, stmt.end),
       hasPolicyRegion: text.includes(POLICY_MARKER_TEXT),
     };
   });
@@ -936,79 +921,118 @@ function buildShakeChunks(src, mask, depth, stmts, fail) {
   return { preamble, chunks };
 }
 
-// Drop every top-level declaration the picked surface cannot reach.
-// `rootLocals` are the LOCAL binding names behind the exposed exports (an
-// aggregate alias exposes `helperAlias` but roots `internalHelper`).
-// `exportOffsets` is the set of `export` keyword offsets the surface derivation
-// consumed — used as an independent cross-check that this scanner agrees with
-// it about where top-level statements begin.
-export function treeShakeKitSource(source, rootLocals, { fail = vendorFail, exportOffsets = null } = {}) {
+// Narrow the kit body to what the picked exports reach, via esbuild.
+// `rootExports` are the EXPORTED names to keep (esbuild resolves them to
+// their local declarations itself — an aggregate alias exposes `helperAlias`
+// and esbuild roots `internalHelper` behind it). `rootLocals` are the same
+// picks' LOCAL binding names, used only for the declared-in-output gate.
+//
+// Returns the narrowed body in the same shape the old hand-written shaker
+// produced: the kit's file-top preamble comment, then the surviving
+// declarations (no aggregate `export { … }` lines — every format re-expresses
+// the surface its own way). The declarations are esbuild's reprint, except
+// for policy-marked ones, which are grafted back verbatim.
+export function treeShakeKitSource(source, rootExports, { fail = vendorFail, rootLocals = [] } = {}) {
   const { mask, depth } = lexKitSource(source, fail);
   const stmts = sliceTopLevel(source, mask, depth, fail);
-
-  if (exportOffsets) {
-    const starts = new Set(stmts.map((s) => s.start));
-    for (const off of exportOffsets) {
-      if (!starts.has(off)) {
-        fail(
-          `internal disagreement: the surface derivation found an export at offset ${off} that the ` +
-            'tree-shaker does not see as a top-level statement start. Refusing to shake.'
-        );
-      }
-    }
-  }
-
   const { preamble, chunks } = buildShakeChunks(source, mask, depth, stmts, fail);
-
-  const declaredBy = new Map();
-  chunks.forEach((chunk, idx) => {
-    for (const name of chunk.declares) {
-      if (declaredBy.has(name)) {
-        fail(`top-level name "${name}" is declared twice — refusing to shake.`);
-      }
-      declaredBy.set(name, idx);
-    }
-  });
-
-  for (const name of rootLocals) {
-    if (!declaredBy.has(name)) {
-      fail(`picked export "${name}" has no top-level declaration the tree-shaker can find — refusing to shake.`);
-    }
-  }
-
-  // Roots: the picked exports' locals, plus every declaration carrying a
-  // sanitizer-policy marker — six consumers run the policy check against their
-  // GENERATED copy, so a pick that doesn't reach the sanitizer must not be able
-  // to strip the markers (and with them, silently, the family's drift gate).
-  const keep = new Set();
-  const queue = [];
-  const root = (idx) => {
-    if (idx === undefined || keep.has(idx)) return;
-    keep.add(idx);
-    queue.push(idx);
-  };
-  for (const name of rootLocals) root(declaredBy.get(name));
-  chunks.forEach((chunk, idx) => {
-    if (chunk.hasPolicyRegion) root(idx);
-  });
-
-  while (queue.length) {
-    const chunk = chunks[queue.shift()];
-    for (const ref of chunk.refs) root(declaredBy.get(ref));
-  }
-
-  // Aggregate `export { a as b }` lines are re-expressed as the surface map in
-  // every format this runs for, and stripped from the body — never emit them.
-  const body = chunks
-    .filter((chunk, idx) => keep.has(idx) && chunk.kind !== 'exportBrace')
-    .map((chunk) => chunk.text);
-
-  const out = `${(preamble ? [preamble, ...body] : body).join('\n\n')}\n`;
-
-  // Belt and braces on the marker guarantee above: every policy marker in the
-  // source must be in the output. If comment attribution ever changes shape,
-  // this fails the generation rather than quietly disarming the policy gate.
   const markers = (text) => text.split(POLICY_MARKER_TEXT).length - 1;
+
+  // ---- policy placeholders -------------------------------------------------
+  // Swap each policy-marked declaration for a one-line placeholder whose
+  // initializer is a unique string token, so esbuild treats it as pure data,
+  // never inlines it (minify is off), and prints it back as one findable
+  // line. The original declaration text — attached comments and markers
+  // included — is grafted over that line after the bundle.
+  const policy = [];
+  let pre = '';
+  let cursor = 0;
+  stmts.forEach((stmt, idx) => {
+    const chunk = chunks[idx];
+    if (!chunk.hasPolicyRegion) return;
+    if (chunk.kind === 'exportBrace' || chunk.declares.length !== 1) {
+      fail(
+        `the \`${POLICY_MARKER_TEXT}\` region at/near line ` +
+          `${source.slice(0, stmt.start).split('\n').length} is not carried by exactly one top-level ` +
+          'declaration — the policy graft can only preserve a region that one declaration owns, so ' +
+          'nothing was written.'
+      );
+    }
+    const name = chunk.declares[0];
+    const token = `__JFS_POLICY_CHUNK_${policy.length}__`;
+    const stmtText = source.slice(stmt.start, stmt.end);
+    const exported = /^export\b/.test(stmtText);
+    policy.push({ name, token, text: chunk.text, alias: `__jfsPolicyRoot${policy.length}` });
+    pre += source.slice(cursor, stmt.start);
+    pre += `${exported ? 'export ' : ''}const ${name} = "${token}";`;
+    cursor = stmt.end;
+  });
+  pre += source.slice(cursor);
+  // Force-root every policy declaration through a synthetic export, so a pick
+  // that cannot reach the sanitizer still cannot strip its region.
+  for (const p of policy) pre += `\nexport { ${p.name} as ${p.alias} };`;
+
+  // ---- bundle --------------------------------------------------------------
+  const { buildSync } = requireEsbuild(fail);
+  const entryNames = [...rootExports, ...policy.map((p) => p.alias)];
+  const dir = mkdtempSync(join(tmpdir(), 'jfs-vendor-shake-'));
+  let out;
+  try {
+    writeFileSync(join(dir, 'package.json'), '{"name":"kit","type":"module","sideEffects":false}\n');
+    writeFileSync(join(dir, 'kit.js'), pre);
+    writeFileSync(join(dir, 'entry.js'), `export { ${entryNames.join(', ')} } from './kit.js';\n`);
+    let result;
+    try {
+      result = buildSync({
+        entryPoints: ['entry.js'],
+        absWorkingDir: dir,
+        bundle: true,
+        format: 'esm',
+        treeShaking: true,
+        minify: false,
+        target: 'esnext',
+        charset: 'utf8',
+        legalComments: 'none',
+        write: false,
+      });
+    } catch (err) {
+      const detail = err && err.errors ? err.errors.map((e) => e.text).join('; ') : String(err && err.message);
+      fail(`esbuild could not bundle the narrowed kit: ${detail}. Nothing was written.`);
+    }
+    out = result.outputFiles[0].text;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+
+  // ---- post-process --------------------------------------------------------
+  // Drop esbuild's leading `// kit.js` path banner. The bundle's trailing
+  // aggregate `export { … }` line is left in place: every format emitter runs
+  // the mask-gated strippedBody over this body, which removes it safely (a
+  // raw regex here could not tell a real aggregate line from one spelled
+  // inside a template literal).
+  out = out.replace(/^(?:\/\/ (?:kit|entry)\.js\n)+/, '').trim();
+
+  // Graft each policy declaration back verbatim over its placeholder line.
+  for (const p of policy) {
+    const lineRe = new RegExp(`^(?:export )?(?:var|const|let) ${p.name} = "${p.token}";$`, 'm');
+    if (!lineRe.test(out)) {
+      fail(
+        `the policy placeholder for "${p.name}" did not survive the bundle as a graftable line — ` +
+          'refusing to emit a copy whose sanitizer-policy region would drift. (Treat this as a ' +
+          'generator bug, not a kit bug.)'
+      );
+    }
+    out = out.replace(lineRe, () => p.text);
+  }
+  if (policy.some((p) => out.includes(p.token))) {
+    fail('a policy placeholder token survived the graft — refusing to emit. (Generator bug.)');
+  }
+
+  out = `${preamble ? `${preamble}\n\n` : ''}${out}\n`;
+
+  // Marker gate, unchanged from the hand-written shaker: every policy marker
+  // in the source must be in the output, or `jfs-sanitizer-policy-sync
+  // --check` would be silently disarmed in the consumer.
   if (markers(out) !== markers(source)) {
     fail(
       `tree-shaking would emit ${markers(out)} of the source's ${markers(source)} ` +
@@ -1017,49 +1041,33 @@ export function treeShakeKitSource(source, rootLocals, { fail = vendorFail, expo
     );
   }
 
-  // ------------------------------------------------------ dangling-reference gate
-  // The reachability analysis above is only as good as the two scans that feed
-  // it: `collectIdentifiers` (what a chunk READS) and `declaredNames` (what a
-  // chunk BINDS). A hole in either drops a declaration the emitted body still
-  // names, and the failure surfaces as a `ReferenceError` in a consumer's
-  // browser, with `vendor:check` blind to it because regeneration repeats the
-  // same mistake.
-  //
-  // So verify the CONCLUSION rather than the route to it: re-lex the EMITTED
-  // body and assert that no dropped top-level name survives in it as a live
-  // identifier. It reads a different artifact than the reachability walk did,
-  // so a bookkeeping slip — a root that never got queued, an alias resolved to
-  // the wrong local — becomes a refusal here.
-  //
-  // It scans M_CODE only, and skips property names, exactly as the reachability
-  // scan does. Widening it to literal text was tried and is not viable: a
-  // dropped name spelled inside a genuine regex or string then refuses a
-  // correct build (`$` is both a valid export name and a regex anchor — five of
-  // the family's eight consumers hit that on the first try). The lexer's own
-  // ambiguities are handled where they arise, by refusing there.
-  {
-    const emitted = new Set();
-    chunks.forEach((chunk, idx) => {
-      if (keep.has(idx)) for (const name of chunk.declares) emitted.add(name);
-    });
-    const dropped = new Set([...declaredBy.keys()].filter((name) => !emitted.has(name)));
-    if (dropped.size) {
-      const { mask: outMask } = lexKitSource(out, (msg) =>
-        fail(`the tree-shaken body could not be re-scanned: ${msg}. Refusing to shake.`)
+  // Every picked local must still be DECLARED in the emitted body under its
+  // own name — the global/cjs surface maps and the esm aggregate line all
+  // reference locals by name, so an esbuild rename (which pinned options and
+  // a single-file bundle should never produce) must refuse loudly rather than
+  // ship a ReferenceError.
+  for (const name of rootLocals) {
+    const declRe = new RegExp(`^(?:export )?(?:async )?(?:var|const|let|function\\*?|class) ${name}\\b`, 'm');
+    if (!declRe.test(out)) {
+      fail(
+        `picked export's local "${name}" is not declared under its own name in the bundled body — ` +
+          'refusing to emit a surface map that would be a ReferenceError. (Treat this as a generator ' +
+          'bug, not a kit bug.)'
       );
-      const live = collectIdentifiers(out, outMask, 0, out.length);
-      const dangling = [...dropped].filter((name) => live.has(name));
-      if (dangling.length) {
-        fail(
-          `tree-shaking dropped ${dangling.length} declaration(s) the emitted body still references: ` +
-            `${dangling.sort().join(', ')}. That would be a ReferenceError in the consumer, so nothing ` +
-            'was written. (The reachability scan and the emitted body disagree — treat this as a ' +
-            'generator bug, not a kit bug.)'
-        );
-      }
     }
   }
   return out;
+}
+
+// esbuild is resolved lazily so the stamper/bumper/sync bins — which import
+// this module for its other exports — never load the binary at all, and a
+// missing install fails with a message that names the fix.
+function requireEsbuild(fail) {
+  try {
+    return createRequire(import.meta.url)('esbuild');
+  } catch {
+    fail('esbuild is not installed — it is a dependency of @jfs/vendor-cli; run `npm install`.');
+  }
 }
 
 // Decide whether this generation shakes, and do it. Returns the body the
@@ -1071,10 +1079,9 @@ export function treeShakeKitSource(source, rootLocals, { fail = vendorFail, expo
 //     existing full-surface vendored copies don't move, or
 //   * the kit has not declared `"sideEffects": false`, i.e. its author has not
 //     asserted that dropping an unreferenced top-level declaration is safe.
-function narrowKitBody(source, { exposed, globals }, surface, pkg, accounted) {
-  const rootLocals = new Set(
-    (globals ? globals.flatMap((g) => g.exposed) : exposed).map((s) => s.local)
-  );
+function narrowKitBody(source, { exposed, globals }, surface, pkg) {
+  const exposedPairs = globals ? globals.flatMap((g) => g.exposed) : exposed;
+  const rootLocals = new Set(exposedPairs.map((s) => s.local));
   const allLocals = new Set(surface.map((s) => s.local));
   if ([...allLocals].every((name) => rootLocals.has(name))) return { body: source, shaken: false };
 
@@ -1088,7 +1095,8 @@ function narrowKitBody(source, { exposed, globals }, surface, pkg, accounted) {
     };
   }
 
-  return { body: treeShakeKitSource(source, rootLocals, { exportOffsets: accounted }), shaken: true };
+  const rootExports = [...new Set(exposedPairs.map((s) => s.exported))];
+  return { body: treeShakeKitSource(source, rootExports, { rootLocals: [...rootLocals] }), shaken: true };
 }
 
 // -------------------------------------------------------------- generation
@@ -1255,9 +1263,9 @@ export function runVendorCli(kitDir, argv = process.argv.slice(2)) {
 
   try {
     const { opts, globalSpecs } = parseVendorArgs(argv);
-    const { surface, accounted } = deriveKitSurface(source, opts, kitDir);
+    const { surface } = deriveKitSurface(source, opts, kitDir);
     const exposure = resolveKitExposure(surface, opts, globalSpecs, pkg.name);
-    const narrowed = narrowKitBody(source, exposure, surface, pkg, accounted);
+    const narrowed = narrowKitBody(source, exposure, surface, pkg);
     if (narrowed.note) console.warn(`${pkg.name} vendor: ${narrowed.note}`);
     const expected = emitVendoredOutput(
       opts.format,
