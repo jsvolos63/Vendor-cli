@@ -110,19 +110,20 @@ Determinism holds because esbuild is pinned exactly and invoked with fixed
 options in a fixed relative layout; `vendor:check` still diffs
 regeneration against the committed copy.
 
-## Kit extraction policy (the bar for kit #7)
+## Kit extraction policy (the bar for kit #6)
 
-The family is **six kits** today — news-kit, pwa-kit, netlify-kit,
-fetch-kit, cache-kit, and this one — so the next new one would be #7. (It
-read "#9" until dom-kit and modal-kit were absorbed into news-kit at v0.12.0
-and archived; if you change the roster, change this number with it.)
+The family is **five kits** today — news-kit, pwa-kit, netlify-kit,
+fetch-kit, and this one — so the next new one would be #6. (It read "#9"
+until dom-kit and modal-kit were absorbed into news-kit at v0.12.0 and
+archived, and "#7" until cache-kit was absorbed into fetch-kit at v0.2.0
+and retired; if you change the roster, change this number with it.)
 
 The family's per-repo overhead — CI, pins, vendoring, release tagging, a
 CLAUDE.md — is a permanent fixed cost that scales with repo count, not with
 usage. The short version of the bar lives in the synced block below and in
 every consumer's CLAUDE.md; the reasoning: a new kit is justified only by a
 third consumer AND demonstrated drift pain, because two repos copy-pasting
-a helper is strictly cheaper than a seventh kit until drift actually bites.
+a helper is strictly cheaper than a sixth kit until drift actually bites.
 When shared code does clear the bar, prefer landing it in an existing kit
 (news-kit has absorbed river + source-menu + sanitize; netlify-kit absorbed
 the Anthropic client) over creating a new repo.
