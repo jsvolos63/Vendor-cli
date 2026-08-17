@@ -1,0 +1,41 @@
+name: Release
+
+# Auto-tag a GitHub release whenever package.json's version lands on main
+# with a new value. Consumers pin this CLI by full commit SHA (via each
+# kit's dependencies); the releases give those SHAs stable, human-readable
+# version names. Every other kit has carried this workflow since its first
+# release — this repo shipped seventeen versions with none, so the family's
+# "releases tag by version" premise silently didn't hold for the one repo
+# whose version every kit pin names. workflow_dispatch backfills the
+# current version (a version-bump PR auto-merged with the default
+# GITHUB_TOKEN fires no push workflows, so a tag can be skipped).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Create release when the version is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v$VERSION"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — nothing to do"
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "@jfs/vendor-cli $TAG" \
+              --generate-notes
+          fi
