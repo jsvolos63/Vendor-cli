@@ -101,6 +101,7 @@
 // re-expressed (an aggregate `export { … }` line instead of a surface-map
 // object).
 
+import { randomBytes } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { dirname, resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -373,10 +374,10 @@ function deriveKitSurface(source, opts, kitDir) {
     vendorFail(`found no top-level exports in ${kitDir}/index.js — refusing to generate an empty surface.`);
   }
 
-  // `mask` and `accounted` are handed on rather than recomputed: the body
-  // emitters need the same classification this derivation was gated on, and a
-  // second, independently-derived mask could disagree with the first.
-  return { surface, accounted, mask };
+  // Only the surface travels: the body emitters deliberately RE-LEX whatever
+  // body they are given (see strippedBody), because a narrowed body is
+  // esbuild's reprint, for which this derivation's mask would be wrong.
+  return { surface };
 }
 
 // --pick / --global pick lists must name real exports — a typo is an error,
@@ -888,7 +889,8 @@ function splitAtLastBlank(gap) {
 
 // Turn the statement spans into shakeable chunks: each carries the text that
 // will be emitted (its attached comments plus the statement itself), what it
-// declares, what it references, and whether it holds a sanitizer-policy marker.
+// declares, and whether it holds a sanitizer-policy marker. (Reachability is
+// esbuild's job now — chunks no longer track what they reference.)
 function buildShakeChunks(src, mask, depth, stmts, fail) {
   const heads = [];
   const tails = [];
@@ -932,7 +934,8 @@ function buildShakeChunks(src, mask, depth, stmts, fail) {
 // declarations (no aggregate `export { … }` lines — every format re-expresses
 // the surface its own way). The declarations are esbuild's reprint, except
 // for policy-marked ones, which are grafted back verbatim.
-export function treeShakeKitSource(source, rootExports, { fail = vendorFail, rootLocals = [] } = {}) {
+function treeShakeKitSource(source, rootExports, rootLocals = []) {
+  const fail = vendorFail;
   const { mask, depth } = lexKitSource(source, fail);
   const stmts = sliceTopLevel(source, mask, depth, fail);
   const { preamble, chunks } = buildShakeChunks(source, mask, depth, stmts, fail);
@@ -959,7 +962,14 @@ export function treeShakeKitSource(source, rootExports, { fail = vendorFail, roo
       );
     }
     const name = chunk.declares[0];
-    const token = `__JFS_POLICY_CHUNK_${policy.length}__`;
+    // Random per run, so a kit body can never contain the token — it exists
+    // only between the placeholder swap and the graft, never in the output,
+    // so randomness costs nothing in determinism. The assert keeps even the
+    // theoretical collision fail-closed instead of mis-grafting.
+    const token = `__JFS_POLICY_CHUNK_${policy.length}_${randomBytes(12).toString('hex')}__`;
+    if (source.includes(token)) {
+      fail(`the kit source contains the policy placeholder token "${token}" — refusing to shake.`);
+    }
     const stmtText = source.slice(stmt.start, stmt.end);
     const exported = /^export\b/.test(stmtText);
     policy.push({ name, token, text: chunk.text, alias: `__jfsPolicyRoot${policy.length}` });
@@ -979,27 +989,65 @@ export function treeShakeKitSource(source, rootExports, { fail = vendorFail, roo
   let out;
   try {
     writeFileSync(join(dir, 'package.json'), '{"name":"kit","type":"module","sideEffects":false}\n');
-    writeFileSync(join(dir, 'kit.js'), pre);
-    writeFileSync(join(dir, 'entry.js'), `export { ${entryNames.join(', ')} } from './kit.js';\n`);
-    let result;
-    try {
-      result = buildSync({
-        entryPoints: ['entry.js'],
-        absWorkingDir: dir,
-        bundle: true,
-        format: 'esm',
-        treeShaking: true,
-        minify: false,
-        target: 'esnext',
-        charset: 'utf8',
-        legalComments: 'none',
-        write: false,
-      });
-    } catch (err) {
-      const detail = err && err.errors ? err.errors.map((e) => e.text).join('; ') : String(err && err.message);
-      fail(`esbuild could not bundle the narrowed kit: ${detail}. Nothing was written.`);
+    const bundle = (kitText, roots) => {
+      writeFileSync(join(dir, 'kit.js'), kitText);
+      writeFileSync(join(dir, 'entry.js'), `export { ${roots.join(', ')} } from './kit.js';\n`);
+      let result;
+      try {
+        result = buildSync({
+          entryPoints: ['entry.js'],
+          absWorkingDir: dir,
+          bundle: true,
+          format: 'esm',
+          treeShaking: true,
+          minify: false,
+          target: 'esnext',
+          charset: 'utf8',
+          legalComments: 'none',
+          write: false,
+          // Bare specifiers (a kit's dynamic `import('x')`) stay verbatim —
+          // matching the full-surface copy — instead of being resolved by
+          // walking node_modules up from the temp dir, where /tmp is a
+          // world-writable ancestor: a planted /tmp/node_modules/x would be
+          // INLINED into a file consumers commit and ship. Relative paths
+          // (./kit.js) still bundle.
+          packages: 'external',
+        });
+      } catch (err) {
+        const detail = err && err.errors ? err.errors.map((e) => e.text).join('; ') : String(err && err.message);
+        fail(`esbuild could not bundle the narrowed kit: ${detail}. Nothing was written.`);
+      }
+      return result.outputFiles[0].text;
+    };
+
+    // Analysis pass, only when a policy region is in play: the placeholder
+    // swap above blinds esbuild to everything a policy-marked declaration
+    // REFERENCES, and the graft restores its text but not its dependencies —
+    // so a helper only the policy region reaches would be shaken out from
+    // under the grafted code (exit 0, plausible file, ReferenceError at load
+    // in the consumer: the exact failure class this file must never ship).
+    // Bundling the ORIGINAL source with the same roots lets esbuild itself
+    // compute the true keep-set; every name it keeps is then force-rooted
+    // through the placeholder pass, where the aggregate export line that
+    // carries the extra aliases is stripped by strippedBody like the policy
+    // aliases already are. Self-contained regions root exactly the set the
+    // placeholder pass would keep anyway, so their output is unchanged.
+    let keepAliases = [];
+    if (policy.length) {
+      let analysisSrc = source;
+      for (const p of policy) analysisSrc += `\nexport { ${p.name} as ${p.alias} };`;
+      const outA = bundle(analysisSrc, entryNames);
+      const { mask: aMask, depth: aDepth } = lexKitSource(outA, fail);
+      const aStmts = sliceTopLevel(outA, aMask, aDepth, fail);
+      const { chunks: aChunks } = buildShakeChunks(outA, aMask, aDepth, aStmts, fail);
+      const policyNames = new Set(policy.map((p) => p.name));
+      keepAliases = [...new Set(aChunks.flatMap((c) => c.declares))]
+        .filter((n) => !policyNames.has(n))
+        .map((n, i) => ({ name: n, alias: `__jfsPolicyKeep${i}` }));
     }
-    out = result.outputFiles[0].text;
+    let shakeSrc = pre;
+    for (const k of keepAliases) shakeSrc += `\nexport { ${k.name} as ${k.alias} };`;
+    out = bundle(shakeSrc, [...entryNames, ...keepAliases.map((k) => k.alias)]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1013,8 +1061,13 @@ export function treeShakeKitSource(source, rootExports, { fail = vendorFail, roo
   out = out.replace(/^(?:\/\/ (?:kit|entry)\.js\n)+/, '').trim();
 
   // Graft each policy declaration back verbatim over its placeholder line.
+  // `$` is the one JS-identifier character that is also a regex
+  // metacharacter (and the family ships a kit with a top-level `$` export);
+  // interpolated raw it would turn this gate and the declared-locals gate
+  // below into never-matching refusals of a legitimate kit.
+  const reIdent = (name) => name.replace(/\$/g, '\\$');
   for (const p of policy) {
-    const lineRe = new RegExp(`^(?:export )?(?:var|const|let) ${p.name} = "${p.token}";$`, 'm');
+    const lineRe = new RegExp(`^(?:export )?(?:var|const|let) ${reIdent(p.name)} = "${p.token}";$`, 'm');
     if (!lineRe.test(out)) {
       fail(
         `the policy placeholder for "${p.name}" did not survive the bundle as a graftable line — ` +
@@ -1047,7 +1100,9 @@ export function treeShakeKitSource(source, rootExports, { fail = vendorFail, roo
   // a single-file bundle should never produce) must refuse loudly rather than
   // ship a ReferenceError.
   for (const name of rootLocals) {
-    const declRe = new RegExp(`^(?:export )?(?:async )?(?:var|const|let|function\\*?|class) ${name}\\b`, 'm');
+    // (?![A-Za-z0-9_$]) rather than \b: for a name ending in `$`, \b would
+    // demand a word character after a non-word one and never match.
+    const declRe = new RegExp(`^(?:export )?(?:async )?(?:var|const|let|function\\*?|class) ${reIdent(name)}(?![A-Za-z0-9_$])`, 'm');
     if (!declRe.test(out)) {
       fail(
         `picked export's local "${name}" is not declared under its own name in the bundled body — ` +
@@ -1096,7 +1151,7 @@ function narrowKitBody(source, { exposed, globals }, surface, pkg) {
   }
 
   const rootExports = [...new Set(exposedPairs.map((s) => s.exported))];
-  return { body: treeShakeKitSource(source, rootExports, { rootLocals: [...rootLocals] }), shaken: true };
+  return { body: treeShakeKitSource(source, rootExports, [...rootLocals]), shaken: true };
 }
 
 // -------------------------------------------------------------- generation
@@ -1283,7 +1338,17 @@ export function runVendorCli(kitDir, argv = process.argv.slice(2)) {
     // (one that never passed the kit's own policy:check) is refused here
     // rather than vendored.
     if (expected.includes(POLICY_MARKER_TEXT)) {
-      const { drifts } = syncPolicyText(expected, sanitizerPolicy(), opts.out, vendorFail);
+      const { regions, drifts } = syncPolicyText(expected, sanitizerPolicy(), opts.out, vendorFail);
+      if (regions === 0) {
+        // The entry guard above matched the bare marker prefix, but the sync
+        // recognized no region — a misspelled region name (a digit, an
+        // uppercase letter) would otherwise pass straight through and
+        // silently disable the gate. Same refusal sanitizerPolicySync makes.
+        vendorFail(
+          `the emitted copy carries \`${POLICY_MARKER_TEXT}\` text but no marker the policy sync ` +
+            'recognizes — fix the marker pair in the kit source; nothing was written.'
+        );
+      }
       if (drifts.length) {
         vendorFail(
           `the emitted copy's sanitizer-policy region(s) ${drifts.map((d) => `'${d.region}'`).join(', ')} ` +

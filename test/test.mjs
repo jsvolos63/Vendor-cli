@@ -406,6 +406,21 @@ test('fail-closed: dynamic import() is NOT refused (legal in every emitted forma
   }
 });
 
+test('tree-shaking: a dynamic import() stays verbatim, never resolved from the temp dir', () => {
+  // Bare specifiers must not be bundle-resolved: resolution from the shake
+  // temp dir walks up into /tmp/node_modules, a world-writable ancestor —
+  // a planted module there would be inlined into a committed, shipped copy.
+  const dir = freshDir();
+  const bin = makeKitBin(dir,
+    "export const load = () => import('some-lazy-pkg');\n" +
+    'export function unrelated() {\n  return 1;\n}\n');
+  const r = runKit(bin, ['--format', 'cjs', '--pick', 'load', '--out', 'dyn.cjs'], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const out = readFileSync(join(dir, 'dyn.cjs'), 'utf8');
+  assert.match(out, /import\("some-lazy-pkg"\)/, 'the specifier survives verbatim');
+  assert.ok(!out.includes('unrelated'), 'still narrowed');
+});
+
 test('control: a well-formed kit still generates its FULL surface in every format', async () => {
   // The regression the gate exists to prevent, from the other side: nothing
   // above may cost a well-formed kit any of its exports.
@@ -658,6 +673,85 @@ test('policy gate: a kit whose regions drifted from canonical policy is refused 
     assert.match(r.stderr, /disagree with the canonical/, args.join(' '));
     assert.ok(!existsSync(join(dir, args[args.length - 1])), 'nothing may be written');
   }
+});
+
+test('tree-shaking: a helper only a policy region references survives the shake', async () => {
+  // The placeholder swap blinds esbuild to everything a policy-marked
+  // declaration references; the graft restores its TEXT but not its
+  // dependencies. Without the analysis pass, EXTRA_BLOCKED is unreachable
+  // from every root, gets shaken out, and the grafted declaration throws a
+  // ReferenceError at load in the consumer — with exit 0 here. The exact
+  // silent-failure class the esbuild rebuild exists to prevent.
+  const dir = freshDir();
+  const kitBody =
+    'export function escape(s) {\n  return String(s);\n}\n' +
+    '\n' +
+    "const EXTRA_BLOCKED = ['jfs-extra'];\n" +
+    '\n' +
+    'const BLOCKED = new Set([\n' +
+    '  // @jfs-sanitizer-policy:blocked-tags:start case=upper quote=single\n' +
+    '  // @jfs-sanitizer-policy:blocked-tags:end\n' +
+    '].concat(EXTRA_BLOCKED));\n' +
+    '\n' +
+    '// @jfs-sanitizer-policy:url-control-chars:start const=URL_CONTROL_CHARS\n' +
+    '// @jfs-sanitizer-policy:url-control-chars:end\n' +
+    '\n' +
+    'export function sanitize(html) {\n' +
+    '  return BLOCKED.has(html) ? "" : html.replace(URL_CONTROL_CHARS, "");\n' +
+    '}\n';
+  const bin = makeKitBin(dir, kitBody);
+  const kitDir = join(dir, `kit-${badKitSeq - 1}`);
+  const POLICY_BIN = join(KIT_DIR, '..', '..', 'bin', 'sanitizer-policy-sync.mjs');
+  const filled = spawnSync(process.execPath, [POLICY_BIN, 'index.js'], { cwd: kitDir, encoding: 'utf8' });
+  assert.equal(filled.status, 0, filled.stderr);
+
+  const r = runKit(bin, ['--format', 'cjs', '--pick', 'escape', '--out', 'esc.cjs'], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const file = join(dir, 'esc.cjs');
+  const out = readFileSync(file, 'utf8');
+  assert.match(out, /EXTRA_BLOCKED = \[/, "the policy declaration's helper survives");
+  // The real proof: evaluating the copy runs the grafted declaration.
+  const { createRequire } = await import('node:module');
+  const mod = createRequire(import.meta.url)(file);
+  assert.equal(mod.escape(1), '1', 'the shaken body still works');
+});
+
+test('tree-shaking: a kit with a top-level `$` export can be narrowed', async () => {
+  // `$` is a legal identifier character and a regex metacharacter;
+  // interpolated raw into the post-bundle gates it becomes an end-anchor
+  // and the declared-locals gate refuses a legitimate kit.
+  const dir = freshDir();
+  const kitBody =
+    'export const $ = (s) => `[${s}]`;\n' +
+    '\n' +
+    'export function unrelated() {\n  return 1;\n}\n';
+  const bin = makeKitBin(dir, kitBody);
+  const r = runKit(bin, ['--format', 'cjs', '--pick', '$', '--out', 'dollar.cjs'], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const file = join(dir, 'dollar.cjs');
+  assert.ok(!readFileSync(file, 'utf8').includes('unrelated'), 'still narrowed');
+  const { createRequire } = await import('node:module');
+  const mod = createRequire(import.meta.url)(file);
+  assert.equal(mod.$('x'), '[x]');
+});
+
+test('policy gate: a marker the policy sync cannot recognize refuses generation', () => {
+  // The entry guard matches the bare marker prefix, but the sync only
+  // recognizes `[a-z-]+` region names — a misspelled name (digit or
+  // uppercase) used to open zero regions and pass straight through,
+  // silently disabling the gate for that copy.
+  const dir = freshDir();
+  const kitBody =
+    '// @jfs-sanitizer-policy:blockedTags:start\n' +
+    "const BLOCKED = ['script'];\n" +
+    '// @jfs-sanitizer-policy:blockedTags:end\n' +
+    '\n' +
+    'export function sanitize(s) {\n  return BLOCKED.includes(s) ? "" : s;\n}\n';
+  const bin = makeKitBin(dir, kitBody);
+  const r = runKit(bin, ['--format', 'esm', '--out', 'bad.js'], dir);
+  assert.notEqual(r.status, 0, 'generation must refuse');
+  assert.match(r.stderr, /no marker the policy sync recognizes/);
+  assert.ok(!existsSync(join(dir, 'bad.js')), 'nothing may be written');
 });
 
 test('tree-shaking: skipped (body kept whole) for a kit that does not declare sideEffects:false', () => {
