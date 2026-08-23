@@ -89,12 +89,18 @@ What survives of the old pass, and why:
   LOUD failures, the acceptable kind — none of them can silently drop code
   anymore.
 - **Policy markers survive byte-exact.** A declaration carrying a
-  `@jfs-sanitizer-policy:` marker is swapped for a uniquely-tokened
-  placeholder before the bundle, force-rooted through a synthetic export,
-  and grafted back verbatim (attached comments and markers included) after
-  it — esbuild's reprint would otherwise break the canonical casing/quoting
+  `@jfs-sanitizer-policy:` marker is swapped for a placeholder (tokened
+  with per-run random bytes, so a kit body can never collide with it)
+  before the bundle, force-rooted through a synthetic export, and grafted
+  back verbatim (attached comments and markers included) after it —
+  esbuild's reprint would otherwise break the canonical casing/quoting
   the generator itself validates in every emitted copy (see the sanitizer
-  policy section), and an unreachable region would be dropped outright. The marker-count gate
+  policy section), and an unreachable region would be dropped outright.
+  Because the placeholder blinds esbuild to everything the marked
+  declaration REFERENCES, an analysis pass first bundles the original
+  source with the same roots and force-roots every name it keeps through
+  the placeholder pass — so a helper only a policy region reaches can't be
+  shaken out from under the grafted code. The marker-count gate
   (output must carry every marker the source does) still backstops the
   graft.
 - Post-bundle gates, both fail-closed: every policy placeholder must

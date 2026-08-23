@@ -18,11 +18,23 @@ on:
 permissions:
   contents: write
 
+# Back-to-back pushes to main are the normal case here (auto-merged bump
+# PRs), and two concurrent runs both pass the release-view existence check
+# before racing into `gh release create` — one of them red-fails. Queue
+# them instead; a superseded run still exits cleanly on "already exists".
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          # The later steps only read package.json; don't leave a
+          # contents:write credential sitting in .git/config for them.
+          persist-credentials: false
 
       - name: Create release when the version is new
         env:
