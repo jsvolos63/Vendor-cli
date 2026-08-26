@@ -218,6 +218,26 @@ by hand: dispatch CI on the branch, and do not merge until that run is green
 on the head commit. A merge with no CI run defeats every gate the family
 maintains.
 
+### Look & feel baseline
+
+These are mechanical UI rules, not a shared design system — each app keeps
+its own look. They exist because each was violated in at least one family
+repo and shipped as a real defect.
+
+1. `env(safe-area-inset-*)` and `viewport-fit=cover` travel together — using
+   one without the other is a bug (the insets resolve to 0 without it, and
+   `black-translucent` status bars need it).
+2. Every app has a global `:focus-visible` rule and sets
+   `-webkit-tap-highlight-color` deliberately.
+3. The `theme-color` meta, the manifest `theme_color`, the manifest
+   `background_color`, and the app's `--bg` all agree (with a dark variant
+   where the app has a light mode).
+4. The version badge lives in the header and is rendered from build config,
+   never hand-typed in HTML.
+5. Webfonts are either self-hosted (subset, preloaded, `font-display: swap`)
+   or absent — a font-family the page doesn't load must not be named first
+   in a stack.
+
 <!-- jfs-family-conventions:end -->
 
 ## Session preferences (jsvolos63)
