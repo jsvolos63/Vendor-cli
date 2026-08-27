@@ -75,6 +75,17 @@ on:
         default: |
           npm version patch --no-git-tag-version
           npm run version:stamp
+      claude-md-sync-command:
+        description: >-
+          Commands that re-sync the CLAUDE.md family-conventions block from
+          the freshly installed @jfs/vendor-cli ('' skips). The default
+          re-installs first so the sync reads the canonical text at the
+          BUMPED pin — running the pinned-but-stale copy could regress the
+          block, which is worse than not syncing.
+        type: string
+        default: |
+          npm install
+          npx --no-install jfs-claude-md-sync
       check-command:
         description: >-
           The repo's CI checks, run against the bumped tree before the PR is
@@ -140,6 +151,19 @@ jobs:
         if: steps.diff.outputs.changed == 'true' && inputs.vendor-sync-command != ''
         run: ${{ inputs.vendor-sync-command }}
 
+      # The canonical family-conventions text lives in vendor-cli, so an
+      # edit to it always arrives at a consumer as a vendor-cli pin bump —
+      # this step is what carries the new block out. Before it existed the
+      # sync was manual and nothing ran it: when the canonical text gained
+      # a section, six consumers sat red on family CI's conventions check
+      # until a session re-synced them by hand. A modified CLAUDE.md rides
+      # the same PR below; it needs no version bump of its own (the bump
+      # step is for re-vendored shipped assets, and conventions text is
+      # not one — it just shares the PR the pin move already earns).
+      - name: Sync the CLAUDE.md family-conventions block
+        if: steps.diff.outputs.changed == 'true' && inputs.claude-md-sync-command != ''
+        run: ${{ inputs.claude-md-sync-command }}
+
       # The re-vendored copies are shipped assets, so the family's version
       # rule applies: patch-bump so the merged PR rolls the service-worker
       # cache instead of leaving returning visitors on the stale shell.
@@ -167,9 +191,10 @@ jobs:
             Automated pin bump: the pinned `@jfs/*` kits have new commits on
             their default branches. Pins updated by `npm run kit-pins:bump`
             (the @jfs/vendor-cli jfs-bump-kit-pins bin); vendored copies
-            regenerated and the app version bumped per this repo's caller
-            inputs; the repo's CI checks ran green inside the bump workflow
-            before this PR was opened. (PRs opened with the default
+            regenerated, the CLAUDE.md family-conventions block re-synced
+            from the bumped vendor-cli, and the app version bumped per this
+            repo's caller inputs; the repo's CI checks ran green inside the
+            bump workflow before this PR was opened. (PRs opened with the default
             GITHUB_TOKEN never trigger pull_request CI, so validation runs
             pre-merge instead, and the merge to main triggers the full CI
             run as a backstop.)
