@@ -28,9 +28,23 @@ Callers keep only the schedule and their repo-specific commands; everything
 else — checkout, node, install, `jfs-bump-kit-pins`, PR open, squash-merge —
 lives here. Inputs: `check-command` (required — the repo's CI checks, run
 in-workflow because default-token PRs never trigger pull_request CI),
-`install-command` (default `npm ci`), `vendor-sync-command` and
-`version-bump-command` ('' skips either), `node-version` (default 22),
-`auto-merge` (default true), `soft-fail` (default false), `pr-body-extra`.
+`install-command` (default `npm ci`), `vendor-sync-command`,
+`claude-md-sync-command` and `version-bump-command` ('' skips any),
+`node-version` (default 22), `auto-merge` (default true), `soft-fail`
+(default false), `pr-body-extra`.
+
+The `claude-md-sync-command` step (default: `npm install` then
+`npx --no-install jfs-claude-md-sync`) is how the canonical
+family-conventions text propagates: an edit to
+`family/family-conventions.md` is a vendor-cli commit, so it reaches every
+consumer as a vendor-cli pin bump, and the bump PR now carries the
+re-synced CLAUDE.md block with it. Before this step the sync was manual
+and nothing ran it — when the canonical text gained the Look & feel
+section, six consumers sat red on family CI's conventions check until a
+session re-synced them by hand. The re-install in the default matters:
+syncing from a stale pinned copy could regress the block, which is worse
+than skipping.
+
 The important behavior change vs. the old copies: a blocked auto-merge of a
 validated bump **fails the run** instead of emitting an invisible
 `::warning::` (the old failure mode is how pins silently drifted across the
