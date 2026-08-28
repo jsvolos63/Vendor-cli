@@ -49,6 +49,16 @@ on:
         description: Pre-flight that every pinned @jfs kit SHA resolves, before install
         type: boolean
         default: false
+      prod-audit:
+        description: >-
+          Run `npm audit --omit=dev --audit-level=high` after install, so a
+          high/critical advisory in a SHIPPED dependency fails the build.
+          Dev-only advisories never gate — the kits and test toolchains are
+          devDependencies everywhere, so they can't redden a PR. Cheap even
+          for a repo with zero prod dependencies today: the gate arms itself
+          the day one is added.
+        type: boolean
+        default: false
       claude-md-check:
         description: Check CLAUDE.md carries the current family-conventions block
         type: boolean
@@ -111,6 +121,12 @@ jobs:
       - name: Install dependencies
         if: inputs.install-command != ''
         run: ${{ inputs.install-command }}
+
+      # After install so audit sees the resolved tree (repos that gitignore
+      # their lockfile get one from the install itself).
+      - name: Audit shipped dependencies
+        if: inputs.prod-audit
+        run: npm audit --omit=dev --audit-level=high
 
       - name: Check CLAUDE.md family conventions are in sync
         if: inputs.claude-md-check
