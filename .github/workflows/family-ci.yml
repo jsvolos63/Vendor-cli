@@ -24,7 +24,8 @@
 # The workflow checks out THIS repo alongside the caller so the kit-pin
 # pre-flight and the CLAUDE.md family-conventions check run from a bare
 # checkout — consumers don't need @jfs/vendor-cli installed for either gate
-# (the kits deliberately don't depend on it). When the caller IS vendor-cli,
+# (every repo pins it, kits included, but these gates don't require the
+# install to have run). When the caller IS vendor-cli,
 # the local checkout is used instead so a PR here validates against its own
 # canonical text, not main's.
 name: Family CI
