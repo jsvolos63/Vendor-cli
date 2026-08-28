@@ -1,7 +1,7 @@
 # @jfs/vendor-cli — working notes for Claude
 
 Shared dev CLI for the `@jfs` kit family — the vendoring generator
-(esm/global/bare/cjs, surface derived from the kit's own exports) plus the
+(esm/global/cjs, surface derived from the kit's own exports) plus the
 consolidated kit-pin bumper (`jfs-bump-kit-pins`), kit-pin existence
 pre-flight, version stamper (`jfs-version-stamp`), and CLAUDE.md
 family-conventions synchronizer (`jfs-claude-md-sync`) the consumers used
@@ -81,9 +81,10 @@ exactly the picked names into a temp dir and bundles it with tree-shaking
 on, `minify: false`, `format: esm`. A narrowed body is therefore esbuild's
 reprint — comments dropped, `const` lowered to `var`, quoting normalized —
 and consumers' committed narrowed copies are bundler output, reviewed as
-such. It runs for ALL FOUR formats; a narrowed esm build ends in one
-aggregate `export { … }` line (the only form that can carry an alias), and
-`bare` has no exposed surface, so `--pick` there narrows the body only.
+such. It runs for ALL THREE formats; a narrowed esm build ends in one
+aggregate `export { … }` line (the only form that can carry an alias).
+(A fourth format, `bare`, existed through 0.18.x with zero consumers and
+was removed in 0.19.0 — don't re-add it without a consumer in hand.)
 
 The hand-written shaker this replaced — a character-level lexer, statement
 segmentation, an identifier-reachability walk — had the worst failure mode

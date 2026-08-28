@@ -170,12 +170,10 @@ vendored copy:
                   `export { … }` line carrying exactly the picked surface
 --format global   classic-script IIFE on globalThis.<Name> (--name required,
                   unless --global is used instead)
---format bare     export-stripped copy for classic-script bundle concatenation
 --format cjs      CommonJS transform for require() from CJS Netlify Functions
 --pick a,b,c      expose just this subset (typos are an error). Narrows the
                   shipped BYTES too — see "Tree-shaking" below. Valid in every
-                  format; `bare` has no exposed surface, so there it narrows
-                  the body only
+                  format
 --global Name[:a,b,c]
                   global format only; repeatable. Each occurrence adds a named
                   global to the SAME emitted file, exposing its `:`-suffixed
@@ -229,10 +227,10 @@ with their real pick lists (and esbuild's reprint) they are 7,688
 An esm copy narrowed this way emits the surviving declarations with their
 `export` keywords stripped, followed by a single aggregate
 `export { local as exported, … }` line — the same role `module.exports` plays
-for `cjs`, and the only form that can carry an alias. `bare` shakes too, but
-it has no exposed surface at all (it emits export-free declarations for
-bundle concatenation), so `--pick` there is a statement about which entry
-points the app calls, and narrows the body only.
+for `cjs`, and the only form that can carry an alias. (A fourth format,
+`bare` — export-stripped declarations for classic-script bundle
+concatenation — existed through 0.18.x with zero consumers ever using it,
+and was removed.)
 
 Since 0.16.0 the reachability analysis is **esbuild's** (pinned to an exact
 version), not a hand-written pass: a synthetic entry re-exports the picked
