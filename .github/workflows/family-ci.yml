@@ -146,7 +146,16 @@ jobs:
         if: github.repository != 'jsvolos63/vendor-cli'
         run: rm -rf .jfs-family
 
+      # The workflow token is exported so a caller's checks can make
+      # authenticated git/API calls (e.g. JFS-Sports fetching its ws-data
+      # branch) — the checkout above deliberately strips remote credentials,
+      # and `github.token` is not interpolatable in a caller's `with:` block,
+      # so this is the one place it can reach the run commands. Scope stays
+      # whatever the caller's `permissions:` grants (contents: read
+      # family-wide).
       - name: Run checks
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: ${{ inputs.run }}
 
   # The kit-style version-bump guard, formerly copy-pasted into eight repos.
