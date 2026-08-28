@@ -14,8 +14,10 @@ every app's CI at once.
 This repo also hosts the family's reusable CI workflow. Every repo's CI
 calls it (`uses: jsvolos63/vendor-cli/.github/workflows/family-ci.yml@main`)
 instead of hand-copying the checkout/node/install/check skeleton; it carries
-the kit-pin pre-flight, the CLAUDE.md family-conventions check, and the
-kit-style version-bump guard as opt-in inputs. Edits to it land in every
+the kit-pin pre-flight, the CLAUDE.md family-conventions check, the
+shipped-dependency audit gate (`prod-audit` — `npm audit --omit=dev
+--audit-level=high`), and the kit-style version-bump guard as opt-in
+inputs. Edits to it land in every
 repo's next CI run at once — treat them like kit API changes. This repo's
 own `test.yml` references it locally (`uses: ./…`) so a PR editing the
 workflow validates against its own copy.
