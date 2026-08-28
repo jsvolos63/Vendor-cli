@@ -116,6 +116,30 @@ jobs:
         if: inputs.claude-md-check
         run: node "$JFS_VENDOR_CLI_DIR/bin/claude-md-sync.mjs" --check
 
+      # vendor:check must be vendor:sync with `--check` appended per stage —
+      # the two are hand-duplicated command chains in every consumer's
+      # package.json, and nothing else enforces the duplication. A drifted
+      # pair silently turns the CI drift gate into a no-op: check validates a
+      # different generation than sync performs. Skips repos without the
+      # scripts (the kits, Zepbound-).
+      - name: Check vendor:sync / vendor:check agree
+        run: |
+          node -e '
+            const fs = require("fs");
+            if (!fs.existsSync("package.json")) { console.log("vendor-script-parity: no package.json - skipped"); process.exit(0); }
+            const s = JSON.parse(fs.readFileSync("package.json", "utf8")).scripts || {};
+            const sync = s["vendor:sync"], check = s["vendor:check"];
+            if (!sync || !check) { console.log("vendor-script-parity: scripts absent - skipped"); process.exit(0); }
+            const norm = check.split(" --check").join("");
+            if (norm !== sync) {
+              console.error("vendor-script-parity: vendor:check is NOT vendor:sync with --check appended per stage.");
+              console.error("sync              : " + sync);
+              console.error("check minus flags : " + norm);
+              process.exit(1);
+            }
+            console.log("vendor-script-parity: vendor:check matches vendor:sync + --check.");
+          '
+
       # The extra checkout must not leak into the caller's own checks (globbed
       # lints and syntax sweeps would pick it up).
       - name: Remove family tooling checkout
