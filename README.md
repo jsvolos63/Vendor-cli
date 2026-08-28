@@ -244,22 +244,26 @@ consumer) is no longer this repo's to have.
 Three properties are guaranteed, because the family's tooling depends on
 them:
 
-- **Markers survive byte-exact — and are validated.** Any declaration
-  carrying a `@jfs-sanitizer-policy:…` marker is swapped for a placeholder
-  before the bundle, force-rooted through a synthetic export, and grafted
-  back **verbatim** (attached comments and markers included) afterwards;
-  the generator refuses to emit output with fewer markers than the source.
-  Since 0.17.0 it also validates every emitted copy's regions against the
-  canonical `family/sanitizer-policy.json` — a pin to a kit whose regions
-  drifted is refused rather than vendored, and consumers need no separate
-  `policy:check` step (their `vendor:check` regenerates through this CLI).
+- **Policy is guarded at its sources, not grafted into narrowed output.**
+  A FULL-surface copy is verbatim, markers included, and the generator
+  validates its `@jfs-sanitizer-policy:…` regions against the canonical
+  `family/sanitizer-policy.json` — a pin to a kit whose regions drifted is
+  refused rather than vendored. A NARROWED copy is bundler output: its
+  policy code is esbuild's reprint of the same gated source (values intact,
+  an unreachable region dropped with the rest of the unreachable body), and
+  the generator strips the surviving marker comment lines so nothing can
+  misread a reprint as a canonical region. (Through 0.19.x a
+  placeholder/graft/analysis apparatus kept regions byte-exact inside
+  narrowed builds for per-consumer policy checks that no longer exist; it
+  was retired in 0.20.0. The load-bearing gates are the owning kit's own
+  `policy:check` over its source, and the full-surface gate here.)
 - **Deterministic.** The output is a pure function of (source, picks) —
-  exact-pinned esbuild, fixed options, pure string graft — which is what
-  makes `vendor:check` on a shaken copy meaningful.
+  exact-pinned esbuild, fixed options — which is what makes `vendor:check`
+  on a shaken copy meaningful.
 - **Fail-closed.** Anything the generator cannot account for refuses the
   generation (a top-level statement that is not a declaration, a
-  declaration with no terminating `;`, unbalanced lexical state, a policy
-  placeholder that did not survive as a graftable line, a picked local not
+  declaration with no terminating `;`, unbalanced lexical state, marker
+  text surviving outside a strippable comment line, a picked local not
   declared under its own name in the bundle), and the whole pass is skipped
   for a kit that does not declare `"sideEffects": false` — i.e. one whose
   author has not asserted that dropping an unreferenced top-level

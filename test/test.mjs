@@ -574,11 +574,13 @@ test('tree-shaking: output is deterministic across runs', () => {
   assert.equal(runKit(bin, [...args, 'det1.js', '--check'], dir).status, 0);
 });
 
-// The load-bearing one: six consumers run `jfs-sanitizer-policy-sync --check`
-// against their VENDORED copies, so a pick that doesn't reach the sanitizer
-// must NOT strip the policy markers out of the generated file — that would
-// silently disarm the family's sanitizer-drift gate.
-test('tree-shaking: sanitizer-policy regions survive a pick that cannot reach them', () => {
+// 0.20.0 contract: narrowed builds treat sanitizer-policy regions as
+// ordinary code. Nothing downstream reads markers off a vendored copy anymore
+// (the per-consumer policy checks were retired; the kit's own policy:check
+// gates the SOURCE, and the generation-time gate below covers full-surface
+// copies), so a pick that cannot reach the sanitizer drops the whole region —
+// no dead policy bytes, no stray markers.
+test('tree-shaking: an unreachable sanitizer-policy region is dropped, markers and all', () => {
   const dir = freshDir();
   const kitBody =
     'export function escape(s) {\n  return String(s);\n}\n' +
@@ -607,13 +609,9 @@ test('tree-shaking: sanitizer-policy regions survive a pick that cannot reach th
   assert.equal(r.status, 0, r.stderr);
   const out = readFileSync(join(dir, 'esc.js'), 'utf8');
   assert.equal(syntaxCheck(join(dir, 'esc.js')).status, 0);
-  assert.ok(!out.includes('function sanitize('), 'the unpicked sanitizer is still dropped');
-
-  // Both marker regions — and their canonical values — reached the generated
-  // copy, so the consumer-side policy check passes against it.
-  const checked = spawnSync(process.execPath, [POLICY_BIN, '--check', 'esc.js'], { cwd: dir, encoding: 'utf8' });
-  assert.equal(checked.status, 0, `${checked.stdout}\n${checked.stderr}`);
-  assert.match(checked.stdout, /2 regions/);
+  assert.ok(!out.includes('function sanitize('), 'the unpicked sanitizer is dropped');
+  assert.ok(!out.includes('@jfs-sanitizer-policy'), 'its markers go with it');
+  assert.ok(!out.includes('BLOCKED'), 'and so do the policy constants themselves');
 });
 
 test('policy gate: a kit whose regions drifted from canonical policy is refused in every format', () => {
@@ -657,13 +655,13 @@ test('policy gate: a kit whose regions drifted from canonical policy is refused 
   }
 });
 
-test('tree-shaking: a helper only a policy region references survives the shake', async () => {
-  // The placeholder swap blinds esbuild to everything a policy-marked
-  // declaration references; the graft restores its TEXT but not its
-  // dependencies. Without the analysis pass, EXTRA_BLOCKED is unreachable
-  // from every root, gets shaken out, and the grafted declaration throws a
-  // ReferenceError at load in the consumer — with exit 0 here. The exact
-  // silent-failure class the esbuild rebuild exists to prevent.
+test('tree-shaking: a reachable policy region ships as working code, helpers included', async () => {
+  // With the graft retired, a policy-marked declaration goes through esbuild
+  // like any other code — which is exactly what makes the old failure class
+  // (grafted text whose dependencies were shaken out from under it)
+  // impossible by construction: esbuild keeps EXTRA_BLOCKED because the kept
+  // sanitize() reaches it, values flow from the policy-synced source, and
+  // the emitted copy must EVALUATE, not just parse.
   const dir = freshDir();
   const kitBody =
     'export function escape(s) {\n  return String(s);\n}\n' +
@@ -687,15 +685,18 @@ test('tree-shaking: a helper only a policy region references survives the shake'
   const filled = spawnSync(process.execPath, [POLICY_BIN, 'index.js'], { cwd: kitDir, encoding: 'utf8' });
   assert.equal(filled.status, 0, filled.stderr);
 
-  const r = runKit(bin, ['--format', 'cjs', '--pick', 'escape', '--out', 'esc.cjs'], dir);
+  const r = runKit(bin, ['--format', 'cjs', '--pick', 'sanitize', '--out', 'san.cjs'], dir);
   assert.equal(r.status, 0, r.stderr);
-  const file = join(dir, 'esc.cjs');
+  const file = join(dir, 'san.cjs');
   const out = readFileSync(file, 'utf8');
   assert.match(out, /EXTRA_BLOCKED = \[/, "the policy declaration's helper survives");
-  // The real proof: evaluating the copy runs the grafted declaration.
+  assert.ok(!out.includes('function escape('), 'the unpicked escaper is still dropped');
+  // The real proof: the copy evaluates, and the canonical policy VALUES made
+  // it through the reprint — the control-char strip actually strips.
   const { createRequire } = await import('node:module');
   const mod = createRequire(import.meta.url)(file);
-  assert.equal(mod.escape(1), '1', 'the shaken body still works');
+  assert.equal(mod.sanitize('jfs-extra'), '', 'the baked blocked-list works');
+  assert.equal(mod.sanitize('a\u0000b\u001Fc'), 'abc', 'the canonical control-char regex works');
 });
 
 test('tree-shaking: a kit with a top-level `$` export can be narrowed', async () => {
@@ -896,7 +897,7 @@ test('esm format: shaken output is deterministic and --check-able', () => {
   assert.notEqual(runKit(bin, [...args, 'det1.mjs', '--check'], dir).status, 0, 'drift must fail the check');
 });
 
-test('esm format: sanitizer-policy regions survive a pick that cannot reach them', () => {
+test('esm format: an unreachable sanitizer-policy region is dropped, markers and all', () => {
   const dir = freshDir();
   const kitBody =
     'export function escape(s) {\n  return String(s);\n}\n' +
@@ -922,11 +923,8 @@ test('esm format: sanitizer-policy regions survive a pick that cannot reach them
   assert.equal(r.status, 0, r.stderr);
   const out = readFileSync(join(dir, 'esc.mjs'), 'utf8');
   assert.equal(syntaxCheck(join(dir, 'esc.mjs')).status, 0);
-  assert.ok(!out.includes('function sanitize('), 'the unpicked sanitizer is still dropped');
-  // …and the family's policy gate still applies to the GENERATED esm copy.
-  const checked = spawnSync(process.execPath, [POLICY_BIN, '--check', 'esc.mjs'], { cwd: dir, encoding: 'utf8' });
-  assert.equal(checked.status, 0, `${checked.stdout}\n${checked.stderr}`);
-  assert.match(checked.stdout, /2 regions/);
+  assert.ok(!out.includes('function sanitize('), 'the unpicked sanitizer is dropped');
+  assert.ok(!out.includes('@jfs-sanitizer-policy'), 'its markers go with it');
 });
 
 test('esm format: no shaking without sideEffects:false — but the surface still narrows', async () => {

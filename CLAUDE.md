@@ -97,29 +97,23 @@ What survives of the old pass, and why:
 
 - `lexKitSource` + `sliceTopLevel` + the chunking still run — the surface
   derivation and the full-surface `export`-strip (`strippedBody`) need to
-  tell code from comments and template literals, and the policy-graft pass
-  needs the boundaries of the declaration that carries each marker. Their
-  refusals (non-declaration top-level statement, missing `;` before a fresh
-  statement, `}` followed by `/`, destructuring in a later declarator) are
-  LOUD failures, the acceptable kind — none of them can silently drop code
-  anymore.
-- **Policy markers survive byte-exact.** A declaration carrying a
-  `@jfs-sanitizer-policy:` marker is swapped for a placeholder (tokened
-  with per-run random bytes, so a kit body can never collide with it)
-  before the bundle, force-rooted through a synthetic export, and grafted
-  back verbatim (attached comments and markers included) after it —
-  esbuild's reprint would otherwise break the canonical casing/quoting
-  the generator itself validates in every emitted copy (see the sanitizer
-  policy section), and an unreachable region would be dropped outright.
-  Because the placeholder blinds esbuild to everything the marked
-  declaration REFERENCES, an analysis pass first bundles the original
-  source with the same roots and force-roots every name it keeps through
-  the placeholder pass — so a helper only a policy region reaches can't be
-  shaken out from under the grafted code. The marker-count gate
-  (output must carry every marker the source does) still backstops the
-  graft.
-- Post-bundle gates, both fail-closed: every policy placeholder must
-  survive as a graftable line, and every picked export's LOCAL must still
+  tell code from comments and template literals, and the shake path keeps
+  them purely for their refusals. Those refusals (non-declaration top-level
+  statement, missing `;` before a fresh statement, `}` followed by `/`,
+  destructuring in a later declarator) are LOUD failures, the acceptable
+  kind — none of them can silently drop code anymore.
+- **Policy regions are ordinary code in narrowed builds** (0.20.0). Through
+  0.19.x a placeholder/graft/analysis apparatus (~200 lines) kept
+  `@jfs-sanitizer-policy:` regions byte-exact inside narrowed output, for
+  per-consumer policy checks that were themselves retired at 0.17.0 — it
+  defended markers nothing read. Now a narrowed build reprints policy code
+  like everything else (values flow from the gated source; an unreachable
+  region drops with the rest of the unreachable body), and the generator
+  STRIPS the marker comment lines that survive esbuild's reprint, refusing
+  if marker text survives anywhere else — a reprinted region must never
+  read as a canonical one. The load-bearing gates are the owning kit's own
+  `policy:check` over its SOURCE, and the full-surface gate below.
+- Post-bundle gate, fail-closed: every picked export's LOCAL must still
   be declared under its own name (the global/cjs surface maps reference
   locals by name, so an esbuild rename must refuse, not ship).
 
@@ -172,12 +166,17 @@ drift. Edit the JSON here, bump the version, and re-pin + re-sync the kits.
 Since 0.17.0 the gate also runs **inside the vendoring generator**: any
 emitted copy carrying a policy marker is validated against the canonical
 JSON before it is written or checked, so a pin to a kit commit whose
-regions drifted is refused rather than vendored. Because every consumer's
-`vendor:check` regenerates through this CLI, canonical policy is
-re-verified on every consumer CI run for free — which is why the
-consumer-side `policy:check` scripts were retired (the kit-side
-`policy:check` in news-kit's own CI remains the load-bearing source gate).
-Don't re-add per-consumer policy:check wiring; the choke point covers it.
+regions drifted is refused rather than vendored. In practice that is every
+FULL-surface copy (verbatim, markers included); since 0.20.0 a NARROWED
+copy carries no markers at all — the graft that used to preserve them was
+retired, its reprinted policy values flow from the gated source, and the
+generator strips the marker comment lines so a reprint can never read as a
+canonical region. Because every consumer's `vendor:check` regenerates
+through this CLI, the full-surface gate re-runs on every consumer CI run
+for free — which is why the consumer-side `policy:check` scripts were
+retired (the kit-side `policy:check` in news-kit's own CI remains the
+load-bearing source gate). Don't re-add per-consumer policy:check wiring;
+the choke points cover it.
 
 <!-- jfs-family-conventions:start — managed by jfs-claude-md-sync; edit family/family-conventions.md in @jfs/vendor-cli -->
 

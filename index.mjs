@@ -81,10 +81,14 @@
 // two kits would tax every consumer that wants one helper from one of them
 // with the whole other kit's bytes. The reachability analysis is esbuild's
 // (exact-pinned): a narrowed body is the bundler's deterministic reprint of
-// the surviving declarations, except that any declaration carrying a
-// `@jfs-sanitizer-policy` marker region is grafted back VERBATIM so the
-// family's policy gate still verifies the generated copy byte-exactly. A
-// full surface still emits the source unshaken, byte-for-byte as before.
+// the surviving declarations — sanitizer-policy regions included, which are
+// treated like any other code now that the kit-side source gate
+// (`jfs-sanitizer-policy-sync --check` in the kit's own CI) is the ONLY
+// marker consumer: an unreachable region is dropped with the rest of the
+// unreachable body, and a reachable one is reprinted with its values intact.
+// A full surface still emits the source unshaken, byte-for-byte as before —
+// markers included, which is what keeps the generation-time policy gate
+// meaningful for full-surface copies.
 //
 // `esm` was excluded from this at first, on the assumption that an ESM copy is
 // consumed by a bundler that would shake it downstream. It isn't: the family's
@@ -94,7 +98,6 @@
 // re-expressed (an aggregate `export { … }` line instead of a surface-map
 // object).
 
-import { randomBytes } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { dirname, resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -440,33 +443,33 @@ function resolveKitExposure(surface, opts, globalSpecs, pkgName) {
 // quoting normalized — rather than exact source slices. (A FULL surface still
 // never goes near the bundler: verbatim source, byte-for-byte, as always.)
 //
-// Two properties survive the change as hard constraints:
+// Two properties hold as hard constraints:
 //
-//   MARKERS    — the `@jfs-sanitizer-policy:<region>:start/:end` regions must
-//                reach the vendored copy BYTE-EXACT: consumers run
-//                `jfs-sanitizer-policy-sync --check` against the GENERATED
-//                file, and that check knows the canonical casing/quoting —
-//                esbuild's reprint would break it, and an unreachable region
-//                would be dropped outright. So every top-level declaration
-//                carrying a marker is swapped for a uniquely-tokened
-//                placeholder before the bundle, force-rooted through a
-//                synthetic export, and the placeholder statement in esbuild's
-//                output is replaced with the ORIGINAL declaration text
-//                (attached comments and markers included) afterwards. A
-//                marker-count gate still refuses any generation that would
-//                emit fewer markers than the source.
+//   POLICY     — `@jfs-sanitizer-policy:<region>:start/:end` regions are
+//                guarded at the SOURCE: the owning kit's own CI runs
+//                `jfs-sanitizer-policy-sync --check` against index.js, and
+//                this generator refuses to vendor any FULL-surface copy
+//                whose regions drifted from the canonical family policy
+//                (full copies are verbatim, so their markers survive). A
+//                NARROWED copy is bundler output: it carries no markers —
+//                esbuild drops comments — and its policy VALUES flow from
+//                the gated source like every other byte, so nothing
+//                downstream reads markers off it. (Through 0.19.x a
+//                ~200-line placeholder/graft/analysis apparatus kept the
+//                regions byte-exact inside narrowed builds for per-consumer
+//                policy checks that no longer exist; it was retired in
+//                0.20.0 — the choke points are the kit-side source gate and
+//                the full-surface generation gate.)
 //   DETERMINISM— `vendor:check` diffs a regeneration against the committed
 //                copy, so the same (source, picks) must give the same bytes.
 //                esbuild is pinned to an exact version and invoked with fixed
-//                options in a fixed relative layout, and the graft is pure
-//                string replacement, so the output stays a pure function of
-//                (source, picks).
+//                options in a fixed relative layout, so the output stays a
+//                pure function of (source, picks).
 //
 // The lexer and statement segmentation below are NOT the shaker anymore: they
 // remain because the full-surface formats still strip `export` keywords from
-// verbatim source (strippedBody), the surface derivation still needs to tell
-// code from comments, and the policy-placeholder pass needs the boundaries of
-// the declaration that carries each marker. Everything they cannot account for
+// verbatim source (strippedBody), and the surface derivation still needs to
+// tell code from comments. Everything they cannot account for
 // still refuses generation — but a refusal is a loud failure, which is the
 // acceptable kind. The whole narrowing pass is skipped — emitting today's
 // whole body — for a kit that doesn't declare `"sideEffects": false`, i.e.
@@ -909,7 +912,6 @@ function buildShakeChunks(src, mask, depth, stmts, fail) {
       text: text.trim(),
       kind: stmt.kind,
       declares: declaredNames(src, mask, depth, stmt, fail),
-      hasPolicyRegion: text.includes(POLICY_MARKER_TEXT),
     };
   });
   if (!chunks.length) fail('nothing to emit after chunking — refusing to shake.');
@@ -925,59 +927,22 @@ function buildShakeChunks(src, mask, depth, stmts, fail) {
 // Returns the narrowed body in the same shape the old hand-written shaker
 // produced: the kit's file-top preamble comment, then the surviving
 // declarations (no aggregate `export { … }` lines — every format re-expresses
-// the surface its own way). The declarations are esbuild's reprint, except
-// for policy-marked ones, which are grafted back verbatim.
+// the surface its own way). The declarations are esbuild's reprint —
+// sanitizer-policy regions included: they are ordinary code here, guarded at
+// the source by the kit's own policy:check rather than preserved byte-exact
+// in narrowed output (see the POLICY note in the section header above).
+// The lex/slice/chunk passes still run first purely for their fail-closed
+// refusals: a statement shape they cannot account for must refuse loudly
+// before anything is emitted, exactly as it does on the strippedBody path.
 function treeShakeKitSource(source, rootExports, rootLocals = []) {
   const fail = vendorFail;
   const { mask, depth } = lexKitSource(source, fail);
   const stmts = sliceTopLevel(source, mask, depth, fail);
-  const { preamble, chunks } = buildShakeChunks(source, mask, depth, stmts, fail);
-  const markers = (text) => text.split(POLICY_MARKER_TEXT).length - 1;
-
-  // ---- policy placeholders -------------------------------------------------
-  // Swap each policy-marked declaration for a one-line placeholder whose
-  // initializer is a unique string token, so esbuild treats it as pure data,
-  // never inlines it (minify is off), and prints it back as one findable
-  // line. The original declaration text — attached comments and markers
-  // included — is grafted over that line after the bundle.
-  const policy = [];
-  let pre = '';
-  let cursor = 0;
-  stmts.forEach((stmt, idx) => {
-    const chunk = chunks[idx];
-    if (!chunk.hasPolicyRegion) return;
-    if (chunk.kind === 'exportBrace' || chunk.declares.length !== 1) {
-      fail(
-        `the \`${POLICY_MARKER_TEXT}\` region at/near line ` +
-          `${source.slice(0, stmt.start).split('\n').length} is not carried by exactly one top-level ` +
-          'declaration — the policy graft can only preserve a region that one declaration owns, so ' +
-          'nothing was written.'
-      );
-    }
-    const name = chunk.declares[0];
-    // Random per run, so a kit body can never contain the token — it exists
-    // only between the placeholder swap and the graft, never in the output,
-    // so randomness costs nothing in determinism. The assert keeps even the
-    // theoretical collision fail-closed instead of mis-grafting.
-    const token = `__JFS_POLICY_CHUNK_${policy.length}_${randomBytes(12).toString('hex')}__`;
-    if (source.includes(token)) {
-      fail(`the kit source contains the policy placeholder token "${token}" — refusing to shake.`);
-    }
-    const stmtText = source.slice(stmt.start, stmt.end);
-    const exported = /^export\b/.test(stmtText);
-    policy.push({ name, token, text: chunk.text, alias: `__jfsPolicyRoot${policy.length}` });
-    pre += source.slice(cursor, stmt.start);
-    pre += `${exported ? 'export ' : ''}const ${name} = "${token}";`;
-    cursor = stmt.end;
-  });
-  pre += source.slice(cursor);
-  // Force-root every policy declaration through a synthetic export, so a pick
-  // that cannot reach the sanitizer still cannot strip its region.
-  for (const p of policy) pre += `\nexport { ${p.name} as ${p.alias} };`;
+  const { preamble } = buildShakeChunks(source, mask, depth, stmts, fail);
 
   // ---- bundle --------------------------------------------------------------
   const { buildSync } = requireEsbuild(fail);
-  const entryNames = [...rootExports, ...policy.map((p) => p.alias)];
+  const entryNames = [...rootExports];
   const dir = mkdtempSync(join(tmpdir(), 'jfs-vendor-shake-'));
   let out;
   try {
@@ -1013,34 +978,7 @@ function treeShakeKitSource(source, rootExports, rootLocals = []) {
       return result.outputFiles[0].text;
     };
 
-    // Analysis pass, only when a policy region is in play: the placeholder
-    // swap above blinds esbuild to everything a policy-marked declaration
-    // REFERENCES, and the graft restores its text but not its dependencies —
-    // so a helper only the policy region reaches would be shaken out from
-    // under the grafted code (exit 0, plausible file, ReferenceError at load
-    // in the consumer: the exact failure class this file must never ship).
-    // Bundling the ORIGINAL source with the same roots lets esbuild itself
-    // compute the true keep-set; every name it keeps is then force-rooted
-    // through the placeholder pass, where the aggregate export line that
-    // carries the extra aliases is stripped by strippedBody like the policy
-    // aliases already are. Self-contained regions root exactly the set the
-    // placeholder pass would keep anyway, so their output is unchanged.
-    let keepAliases = [];
-    if (policy.length) {
-      let analysisSrc = source;
-      for (const p of policy) analysisSrc += `\nexport { ${p.name} as ${p.alias} };`;
-      const outA = bundle(analysisSrc, entryNames);
-      const { mask: aMask, depth: aDepth } = lexKitSource(outA, fail);
-      const aStmts = sliceTopLevel(outA, aMask, aDepth, fail);
-      const { chunks: aChunks } = buildShakeChunks(outA, aMask, aDepth, aStmts, fail);
-      const policyNames = new Set(policy.map((p) => p.name));
-      keepAliases = [...new Set(aChunks.flatMap((c) => c.declares))]
-        .filter((n) => !policyNames.has(n))
-        .map((n, i) => ({ name: n, alias: `__jfsPolicyKeep${i}` }));
-    }
-    let shakeSrc = pre;
-    for (const k of keepAliases) shakeSrc += `\nexport { ${k.name} as ${k.alias} };`;
-    out = bundle(shakeSrc, [...entryNames, ...keepAliases.map((k) => k.alias)]);
+    out = bundle(source, entryNames);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1053,39 +991,32 @@ function treeShakeKitSource(source, rootExports, rootLocals = []) {
   // inside a template literal).
   out = out.replace(/^(?:\/\/ (?:kit|entry)\.js\n)+/, '').trim();
 
-  // Graft each policy declaration back verbatim over its placeholder line.
-  // `$` is the one JS-identifier character that is also a regex
-  // metacharacter (and the family ships a kit with a top-level `$` export);
-  // interpolated raw it would turn this gate and the declared-locals gate
-  // below into never-matching refusals of a legitimate kit.
-  const reIdent = (name) => name.replace(/\$/g, '\\$');
-  for (const p of policy) {
-    const lineRe = new RegExp(`^(?:export )?(?:var|const|let) ${reIdent(p.name)} = "${p.token}";$`, 'm');
-    if (!lineRe.test(out)) {
-      fail(
-        `the policy placeholder for "${p.name}" did not survive the bundle as a graftable line — ` +
-          'refusing to emit a copy whose sanitizer-policy region would drift. (Treat this as a ' +
-          'generator bug, not a kit bug.)'
-      );
-    }
-    out = out.replace(lineRe, () => p.text);
-  }
-  if (policy.some((p) => out.includes(p.token))) {
-    fail('a policy placeholder token survived the graft — refusing to emit. (Generator bug.)');
+  // Sanitizer-policy MARKER comments can survive esbuild's reprint (comments
+  // attached to expressions inside kept declarations do), while the code
+  // around them comes out quote-normalized. Nothing reads markers off a
+  // narrowed copy — the kit-side source gate owns them, and the full-surface
+  // generation gate expects canonical bytes a reprint cannot promise — so
+  // strip the marker lines here and refuse if marker text survives anywhere
+  // else (a marker inside a string literal would be exactly the confusion
+  // this removal exists to prevent).
+  out = out
+    .split('\n')
+    .filter((line) => !line.trimStart().startsWith(`// ${POLICY_MARKER_TEXT}`))
+    .join('\n');
+  if (out.includes(POLICY_MARKER_TEXT)) {
+    fail(
+      `the narrowed body still contains \`${POLICY_MARKER_TEXT}\` text outside a strippable ` +
+        'marker comment line — refusing to emit a copy that could read as carrying a policy region.'
+    );
   }
 
   out = `${preamble ? `${preamble}\n\n` : ''}${out}\n`;
 
-  // Marker gate, unchanged from the hand-written shaker: every policy marker
-  // in the source must be in the output, or `jfs-sanitizer-policy-sync
-  // --check` would be silently disarmed in the consumer.
-  if (markers(out) !== markers(source)) {
-    fail(
-      `tree-shaking would emit ${markers(out)} of the source's ${markers(source)} ` +
-        `\`${POLICY_MARKER_TEXT}\` markers — the vendored copy must keep them all so ` +
-        '`jfs-sanitizer-policy-sync --check` still gates it. Refusing to shake.'
-    );
-  }
+  // `$` is the one JS-identifier character that is also a regex
+  // metacharacter (and the family ships a kit with a top-level `$` export);
+  // interpolated raw it would turn the declared-locals gate below into a
+  // never-matching refusal of a legitimate kit.
+  const reIdent = (name) => name.replace(/\$/g, '\\$');
 
   // Every picked local must still be DECLARED in the emitted body under its
   // own name — the global/cjs surface maps and the esm aggregate line all
@@ -1316,12 +1247,14 @@ export function runVendorCli(kitDir, argv = process.argv.slice(2)) {
     );
     // Sanitizer-policy gate, at the choke point: any emitted copy carrying a
     // policy marker is validated against the canonical
-    // family/sanitizer-policy.json before it is written or checked. Because
-    // every consumer's vendor:check regenerates through this CLI, canonical
-    // policy is re-verified on every CI run with no separate policy:check
-    // step in the consumer — and a pin to a kit commit whose regions drifted
-    // (one that never passed the kit's own policy:check) is refused here
-    // rather than vendored.
+    // family/sanitizer-policy.json before it is written or checked. In
+    // practice that is every FULL-surface copy of a kit with regions — full
+    // copies are verbatim, markers included — so a pin to a kit commit whose
+    // regions drifted (one that never passed the kit's own policy:check) is
+    // refused here rather than vendored. A NARROWED copy is bundler output
+    // and carries no markers (0.20.0 retired the graft that used to preserve
+    // them); its policy values flow from the same gated source, so this
+    // gate correctly no-ops on it.
     if (expected.includes(POLICY_MARKER_TEXT)) {
       const { regions, drifts } = syncPolicyText(expected, sanitizerPolicy(), opts.out, vendorFail);
       if (regions === 0) {
