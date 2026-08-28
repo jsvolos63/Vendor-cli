@@ -14,7 +14,7 @@
 // runVendorCli(kitDir) reads the KIT's package.json + index.js from kitDir
 // and generates/checks the consumer-side vendored copy. See the usage block
 // below for the flag reference (unchanged from the per-kit era: --format
-// esm|global|bare|cjs, --out, --name, --pick, --check).
+// esm|global|cjs, --out, --name, --pick, --check).
 //
 // Vendor this kit into a consumer repo — the kit-side replacement for the
 // hand-rolled scripts/vendor-*.mjs copies that used to live in every consumer.
@@ -27,7 +27,7 @@
 //
 // Usage (from a consumer repo, with the kit installed as a devDependency):
 //
-//   <bin-name> --format <esm|global|bare|cjs> --out <dest> \
+//   <bin-name> --format <esm|global|cjs> --out <dest> \
 //              [--name <GlobalName>] [--pick a,b,c] \
 //              [--global <Name[:a,b,c]> ...] [--check]
 //
@@ -49,10 +49,6 @@
 //                     narrowed globals. Mutually exclusive with
 //                     --name/--pick (the legacy single-global spelling;
 //                     `--global X:a,b` ≡ `--name X --pick a,b`).
-//   --format bare     `export`-stripped copy whose declarations become
-//                     bundle-scoped when concatenated into a classic-script
-//                     bundle (aggregate `export { a as b }` alias lines are
-//                     dropped — aliases can't be expressed as declarations)
 //   --format cjs      CommonJS transform (module.exports of the public API)
 //                     for `require()` from CommonJS Netlify Functions
 //   --pick a,b,c      expose just this subset (each name must exist in the
@@ -62,10 +58,7 @@
 //                     body is tree-shaken down to the declarations the picks
 //                     actually reach (see "tree-shaking" below). Use it to
 //                     keep a consumer's coupling surface — and its payload —
-//                     explicit. Valid in every format; in `bare` there is no
-//                     exposed surface to narrow, so it narrows the body only
-//                     (the app references the surviving declarations by their
-//                     bundle-scoped names, as it already does there).
+//                     explicit. Valid in every format.
 //   --check           don't write; exit 1 if <dest> differs from what would
 //                     be generated (consumers run this in CI as vendor:check)
 //
@@ -123,7 +116,7 @@ function vendorFail(msg) {
 
 // ---------------------------------------------------------------- arguments
 
-const FORMATS = ['esm', 'global', 'bare', 'cjs'];
+const FORMATS = ['esm', 'global', 'cjs'];
 const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
 // Parse + validate the CLI argv into { opts, globalSpecs }. Validation
@@ -280,7 +273,7 @@ function deriveKitSurface(source, opts, kitDir) {
         `unsupported export form "${unsupported[0].trim()}…" in ${kitDir}/index.js — ` +
           'the kits use only top-level export declarations and aggregate `export { a as b }` ' +
           'lines (no default export, no re-export-from, no export *); the generated ' +
-          'global/bare/cjs output would be broken or silently incomplete.'
+          'global/cjs output would be broken or silently incomplete.'
       );
     }
   }
@@ -321,7 +314,7 @@ function deriveKitSurface(source, opts, kitDir) {
     }
   }
 
-  // Static `import` / `import.meta` are ES-module-only syntax. The bare, global
+  // Static `import` / `import.meta` are ES-module-only syntax. The global
   // and cjs builds are a classic script / a CommonJS module, so either one is a
   // hard syntax error there (a service worker importScripts()-ing such a file
   // fails install) — and a RELATIVE import means a multi-file kit, which no
@@ -1172,7 +1165,7 @@ function vendorHeader(pkg, repo, extra) {
 }
 
 // Strip aggregate alias lines first (they're re-expressed via the surface
-// map in global/cjs, and deliberately dropped in bare), then the `export`
+// map in global/cjs), then the `export`
 // keyword from every top-level declaration.
 //
 // Mask-gated, for the same reason deriveSurface is: `^export` inside a template
@@ -1231,14 +1224,6 @@ function emitVendoredOutput(format, source, { exposed, globals, narrowed, shaken
         `\nexport {\n${exposed
           .map((s) => (s.exported === s.local ? `  ${s.local},` : `  ${s.local} as ${s.exported},`))
           .join('\n')}\n};\n`
-      );
-    case 'bare':
-      return (
-        header(
-          '// Classic-script build: every `export` is stripped so the declarations\n' +
-          "// become bundle-scoped when this file is concatenated into the app's\n" +
-          '// classic-script bundle. Aggregate alias exports are dropped.'
-        ) + strippedBody(source).replace(/^\n+/, '')
       );
     case 'global': {
       // One shared body, then one surface-map assignment per global. With the

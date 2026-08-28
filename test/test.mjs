@@ -168,20 +168,6 @@ test('--check: passes in sync and fails on drift for a multi-global destination'
   assert.notEqual(run([...args, '--check'], dir).status, 0, 'tampered multi-global copy must fail the check');
 });
 
-test('bare format: parseable, export-free, no global assignment', () => {
-  const dir = freshDir();
-  const r = run(['--format', 'bare', '--out', 'out.bare.js'], dir);
-  assert.equal(r.status, 0, r.stderr);
-  const file = join(dir, 'out.bare.js');
-  const out = readFileSync(file, 'utf8');
-  assert.equal(syntaxCheck(file).status, 0, 'bare output must parse as a classic script');
-  assert.ok(!/^export\s/m.test(out), 'no export keywords may survive');
-  // The kit source may legitimately *reference* globalThis; what bare must
-  // not do is emit the surface-map assignment the global format adds.
-  assert.ok(!/^globalThis\.[A-Za-z_$][A-Za-z0-9_$]* = \{$/m.test(out), 'bare output must not assign a surface global');
-  assert.ok(!out.includes('module.exports'));
-});
-
 test('cjs format: parseable and exports the full derived surface', () => {
   const dir = freshDir();
   const r = run(['--format', 'cjs', '--out', 'out.cjs'], dir);
@@ -230,9 +216,9 @@ test('argument validation: bad format, missing --out, --pick in every format', (
   const dir = freshDir();
   assert.notEqual(run(['--format', 'nope', '--out', 'x.js'], dir).status, 0);
   assert.notEqual(run(['--format', 'esm'], dir).status, 0);
-  // --pick is accepted in EVERY format now (esm/bare shake the body too); an
+  // --pick is accepted in EVERY format now (esm shakes the body too); an
   // unknown name is still an error, and an empty list is refused outright.
-  for (const format of ['esm', 'bare', 'cjs']) {
+  for (const format of ['esm', 'cjs']) {
     const bad = run(['--format', format, '--out', 'x.js', '--pick', 'definitelyNotAnExport'], dir);
     assert.notEqual(bad.status, 0, `${format}: a typo'd pick must fail`);
     assert.match(bad.stderr, /definitelyNotAnExport/);
@@ -357,11 +343,11 @@ test('fail-closed: unsupported export forms (default / re-export-from / export *
 });
 
 test('fail-closed: a static import is refused for classic-script/CommonJS formats', () => {
-  // This emitted the `import` line verbatim into the cjs/global/bare builds:
+  // This emitted the `import` line verbatim into the cjs/global builds:
   // `node --check` on the result is a SyntaxError, and a classic service
   // worker importScripts()-ing it fails install.
   const body = "import { createHash } from 'node:crypto';\nexport const A = createHash;\n";
-  for (const format of ['cjs', 'bare', 'global']) {
+  for (const format of ['cjs', 'global']) {
     const extra = format === 'global' ? ['--name', 'G'] : [];
     const r = assertRefused(`static import (${format})`, body, format, extra);
     assert.match(r.stderr, /static import/);
@@ -376,7 +362,7 @@ test('fail-closed: a static import is refused for classic-script/CommonJS format
 
 test('fail-closed: a relative import is refused in every format (a kit is one file)', () => {
   const body = "import { helper } from './helper.js';\nexport const A = helper;\n";
-  for (const format of ['esm', 'cjs', 'bare']) {
+  for (const format of ['esm', 'cjs']) {
     const r = assertRefused(`relative import (${format})`, body, format);
     assert.match(r.stderr, /relative import/);
   }
@@ -384,7 +370,7 @@ test('fail-closed: a relative import is refused in every format (a kit is one fi
 
 test('fail-closed: import.meta is refused for classic-script/CommonJS formats', () => {
   const body = 'export const A = 1;\nexport const HERE = import.meta.url;\n';
-  for (const format of ['cjs', 'bare', 'global']) {
+  for (const format of ['cjs', 'global']) {
     const extra = format === 'global' ? ['--name', 'G'] : [];
     const r = assertRefused(`import.meta (${format})`, body, format, extra);
     assert.match(r.stderr, /import\.meta/);
@@ -398,7 +384,7 @@ test('fail-closed: import.meta is refused for classic-script/CommonJS formats', 
 test('fail-closed: dynamic import() is NOT refused (legal in every emitted format)', () => {
   const dir = freshDir();
   const bin = makeKitBin(dir, "export const load = () => import('node:crypto');\n");
-  for (const [format, extra] of [['cjs', []], ['bare', []], ['global', ['--name', 'G']]]) {
+  for (const [format, extra] of [['cjs', []], ['global', ['--name', 'G']]]) {
     const out = `dyn.${format}.js`;
     const r = runKit(bin, ['--format', format, '--out', out, ...extra], dir);
     assert.equal(r.status, 0, `${format}: ${r.stderr}`);
@@ -440,10 +426,6 @@ test('control: a well-formed kit still generates its FULL surface in every forma
   assert.equal(runKit(bin, ['--format', 'esm', '--out', 'c.esm.js'], dir).status, 0);
   const esm = readFileSync(join(dir, 'c.esm.js'), 'utf8');
   for (const n of all) assert.ok(esm.includes(n), `esm keeps ${n}`);
-
-  assert.equal(runKit(bin, ['--format', 'bare', '--out', 'c.bare.js'], dir).status, 0);
-  assert.equal(syntaxCheck(join(dir, 'c.bare.js')).status, 0);
-  assert.ok(!/^export\s/m.test(readFileSync(join(dir, 'c.bare.js'), 'utf8')));
 
   const g = runKit(bin, ['--format', 'global', '--name', 'Ctl', '--out', 'c.global.js'], dir);
   assert.equal(g.status, 0, g.stderr);
@@ -980,24 +962,6 @@ test('esm format: a static import in a shaken kit fails closed', () => {
   const dir = freshDir();
   const bin = makeKitBin(dir, body);
   assert.equal(runKit(bin, ['--format', 'esm', '--out', 'full.mjs'], dir).status, 0);
-});
-
-test('bare format: --pick narrows the body (there is no surface to narrow)', () => {
-  const dir = freshDir();
-  const bin = makeKitBin(dir, SHAKE_KIT);
-  const r = runKit(bin, ['--format', 'bare', '--pick', 'reachable', '--out', 'shaken.bare.js'], dir);
-  assert.equal(r.status, 0, r.stderr);
-  const file = join(dir, 'shaken.bare.js');
-  const out = readFileSync(file, 'utf8');
-  assert.equal(syntaxCheck(file).status, 0, 'shaken bare output must parse as a classic script');
-  assert.match(r.stdout, /tree-shaken/);
-  assert.ok(!/^export\s/m.test(out), 'no export keywords may survive');
-  assert.ok(!out.includes('module.exports') && !/^globalThis\.[A-Za-z_$][A-Za-z0-9_$]* = \{$/m.test(out));
-  assert.ok(out.includes('function reachable(') && out.includes('function timesSmall('));
-  assert.ok(!out.includes('bigHelper'), 'the unreachable subsystem is dropped from the bundle');
-  // The declarations stay bundle-scoped under their own names, as bare always
-  // emits them — a pick list there is a statement about what the app calls.
-  assert.equal(new Function(`${out}\nreturn reachable(21);`)(), 42);
 });
 
 // ------------------------------------------ adversarial-audit regressions
