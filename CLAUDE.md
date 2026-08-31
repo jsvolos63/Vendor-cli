@@ -199,6 +199,43 @@ sanitizer-policy machinery match control characters and known multi-space
 indents in emitted output, so both rules fire on the subject matter rather
 than on mistakes.
 
+## Release (`.github/workflows/release.yml`)
+
+The family's **third** reusable workflow, alongside `family-ci.yml` and
+`kit-pin-bump.yml`: tag `v<version>` from `package.json` and open a GitHub
+release, once per new version, on main. Callers keep only their triggers, the
+`contents: write` grant (a called workflow cannot elevate its own token) and a
+`title` input.
+
+Seven repos hand-copied this and **all seven drifted**, in a clean ladder:
+
+| repo(s) | what its copy had |
+| --- | --- |
+| the four kits | the bare version — plain `push`, nothing else |
+| Weather | + `workflow_dispatch` backfill |
+| vendor-cli | + `concurrency`, + `persist-credentials: false` |
+| JFS-Sports | + **gate on CI success**, + validated-SHA pinning, + `set -euo pipefail`, + create-race handling |
+
+The one that matters is JFS-Sports': its comment records that "a plain push
+trigger tagged and published a release for a red main". **Six of the seven
+could still do that** — including this repo. The reusable workflow is the
+union, so consolidating propagates that fix to every consumer at once.
+
+Two details worth not undoing:
+
+- **The CI gate reads the caller's event.** A called workflow inherits the
+  triggering event, so `github.event.workflow_run.conclusion` works here even
+  though the `workflow_run` trigger is declared in the caller. The caller's
+  `workflows:` list must match its CI workflow's `name:` exactly — which is
+  `Test` in the kits, `Tests` in JFS-Sports and `CI` in the apps, so it cannot
+  be defaulted.
+- **The existence check is advisory, not a lock.** The concurrency group
+  serialises one repo's runs, but a tag can still arrive between the check and
+  the create, so a failed `gh release create` re-checks and treats "it exists
+  now" as success. The goal is that the tag exists, not that this run made it.
+
+Edits land in every consumer's next release — treat them like kit API changes.
+
 ## Kit extraction policy (the bar for kit #6)
 
 The family is **five kits** today — news-kit, pwa-kit, netlify-kit,

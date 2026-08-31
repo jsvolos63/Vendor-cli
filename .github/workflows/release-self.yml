@@ -1,0 +1,25 @@
+# This repo's own release, through the family reusable workflow it hosts
+# (referenced locally with `./` so a PR editing that workflow validates
+# against its own copy, the same way test.yml calls family-ci).
+#
+# Gated on the Test workflow going green: a plain push trigger can tag and
+# publish a release for a red main, which is what this consolidation fixed
+# across the family. workflow_dispatch backfills a version whose push fired
+# no workflows — a bump PR auto-merged with the default GITHUB_TOKEN does not.
+
+name: Release
+
+on:
+  workflow_run:
+    workflows: [Test]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # a called workflow cannot elevate its own token
+
+jobs:
+  release:
+    uses: ./.github/workflows/release.yml
+    with:
+      title: '@jfs/vendor-cli'
