@@ -229,6 +229,12 @@ Two details worth not undoing:
   `workflows:` list must match its CI workflow's `name:` exactly — which is
   `Test` in the kits, `Tests` in JFS-Sports and `CI` in the apps, so it cannot
   be defaulted.
+- **The branch guard is doubled on purpose.** `workflow_run` fires for a CI
+  run on ANY branch, so a caller needs `branches: [main]` on its trigger — and
+  the reusable workflow ALSO checks `workflow_run.head_branch` against the
+  repository's default branch, because a caller that forgets would otherwise
+  tag a feature-branch commit and publish a release from unmerged work. Manual
+  dispatch is exempt: that ref is chosen deliberately.
 - **The existence check is advisory, not a lock.** The concurrency group
   serialises one repo's runs, but a tag can still arrive between the check and
   the create, so a failed `gh release create` re-checks and treats "it exists

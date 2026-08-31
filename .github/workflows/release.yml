@@ -61,9 +61,16 @@ jobs:
     # purpose — that is the backfill path for a version that shipped before
     # this workflow existed, or whose push fired no workflows (a bump PR
     # auto-merged with the default GITHUB_TOKEN does not).
+    # Defence in depth. Callers should ALSO carry `branches: [main]` on their
+    # workflow_run trigger, but workflow_run fires for a CI run on ANY branch,
+    # so a caller that forgets it would otherwise tag a feature branch's commit
+    # and publish a release from unmerged work. Refuse that here too.
+    # A manual dispatch is exempt: the ref is chosen deliberately, and
+    # backfilling a tag from a non-default ref is a legitimate use.
     if: >-
       github.event_name == 'workflow_dispatch'
-      || github.event.workflow_run.conclusion == 'success'
+      || (github.event.workflow_run.conclusion == 'success'
+          && github.event.workflow_run.head_branch == github.event.repository.default_branch)
     steps:
       - uses: actions/checkout@v5
         with:
