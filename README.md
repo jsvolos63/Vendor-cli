@@ -273,6 +273,52 @@ A full surface (no picks, or picks covering every export) is **not** shaken:
 the body is emitted verbatim, byte-identical to what this CLI produced
 before tree-shaking existed.
 
+## The buildless-module-graph gate
+
+An app that ships `<script type="module">` with no build step has no
+compile-time check on its own import graph: the browser resolves it, and one
+bad specifier — or one `import { x }` naming an export the source no longer
+has — makes the browser instantiate **nothing**. Blank page, no partial
+render, and the service worker keeps serving the broken shell from cache.
+ESLint never resolves a specifier and vitest turns a missing named import into
+`undefined`, so both stay green.
+
+`@jfs/vendor-cli/module-graph` links the graph with V8's own resolver
+(`vm.SourceTextModule`, stopped before `Evaluate()` — no DOM, no module body
+runs) in a child process, since `--experimental-vm-modules` must be set at
+process start.
+
+```js
+import { linkGraphs, findOrphans, linkProbe } from '@jfs/vendor-cli/module-graph';
+
+const { ok, error, modules } = linkGraphs({ entries: ['js/app.js'], cwd: ROOT });
+assert.equal(ok, true, error);            // (a) specifiers  (b) named exports
+
+assert.deepEqual(                          // (c) nothing on disk is unreachable
+  findOrphans({ root: ROOT, dirs: ['js'], reached: modules, exclude: ['js/vendor'] }),
+  []
+);
+
+// Keep these two. Without them a linker that returned ok:true for everything
+// would satisfy every assertion above.
+assert.equal(linkProbe({ 'entry.js': "import './nope.js';" }).ok, false);
+assert.equal(linkProbe({
+  'entry.js': "import { missing } from './d.js'; export { missing };",
+  'd.js': 'export const present = 1;'
+}).ok, false);
+```
+
+| export | what it does |
+| --- | --- |
+| `linkGraph(entry, {cwd})` | link one entry → `{ok, modules, error, stack}` |
+| `linkGraphs({entries, cwd, followDynamic})` | link several, union the result; `followDynamic` also links every `import('./x.js')` target to a fixpoint (off by default — it loosens orphan checks and tightens stray checks, so it is the caller's call) |
+| `listModuleFiles({root, dirs, exclude, extensions})` | every module file on disk, minus excluded files **or** directories |
+| `findOrphans({root, dirs, reached, exclude})` | on disk but unreachable — repo-relative, POSIX-separated |
+| `outsideModules({root, within, reached})` | reached but outside the given dirs — strays, or the exact shared set a service worker must also precache |
+| `dynamicImportTargets(file)` | relative `import()` literals in one file |
+| `linkProbe(files, {entry})` | link a throwaway graph from a `{name: source}` map |
+| `LINKER_PATH` | the child script, if you must spawn it yourself |
+
 ## Tests
 
 `npm test` drives a fixture kit (`test/fixture-kit/`) through a bin shim the
