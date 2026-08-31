@@ -1,53 +1,110 @@
-name: Release
+# The family's reusable release workflow: tag `v<version>` from package.json
+# and open a GitHub release, once per new version, on main.
+#
+# Seven repos hand-copied this and all seven drifted. The four kits carried the
+# bare version; Weather added the backfill dispatch; this repo added a
+# concurrency group and persist-credentials:false; JFS-Sports added the one
+# that matters most — a gate on CI success, after "a plain push trigger tagged
+# and published a release for a red main." Six of the seven could still do
+# that. This is the union, in one place.
+#
+# The CALLER owns the triggers and must grant `contents: write` (a called
+# workflow cannot elevate its own token):
+#
+#   name: Release
+#   on:
+#     workflow_run:
+#       workflows: [Test]        # must match the CI workflow's `name:`
+#       types: [completed]
+#     workflow_dispatch:
+#   permissions:
+#     contents: write
+#   jobs:
+#     release:
+#       uses: jsvolos63/vendor-cli/.github/workflows/release.yml@main
+#       with:
+#         title: '@jfs/fetch-kit'
+#
+# Edits here land in every consumer's next release — treat them like kit API
+# changes.
 
-# Auto-tag a GitHub release whenever package.json's version lands on main
-# with a new value. Consumers pin this CLI by full commit SHA (via each
-# kit's dependencies); the releases give those SHAs stable, human-readable
-# version names. Every other kit has carried this workflow since its first
-# release — this repo shipped seventeen versions with none, so the family's
-# "releases tag by version" premise silently didn't hold for the one repo
-# whose version every kit pin names. workflow_dispatch backfills the
-# current version (a version-bump PR auto-merged with the default
-# GITHUB_TOKEN fires no push workflows, so a tag can be skipped).
+name: Release (reusable)
 
 on:
-  push:
-    branches: [main]
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      title:
+        description: >-
+          Release title prefix. The tag is appended, so '@jfs/fetch-kit'
+          yields '@jfs/fetch-kit v0.2.1'.
+        required: true
+        type: string
+      version-file:
+        description: JSON file whose `version` field names the release.
+        required: false
+        default: package.json
+        type: string
 
-permissions:
-  contents: write
-
-# Back-to-back pushes to main are the normal case here (auto-merged bump
-# PRs), and two concurrent runs both pass the release-view existence check
-# before racing into `gh release create` — one of them red-fails. Queue
-# them instead; a superseded run still exits cleanly on "already exists".
+# Back-to-back merges to main are the normal case (auto-merged bump PRs), and
+# two concurrent runs can both pass the existence check before racing into
+# `gh release create` — one of them then red-fails. Queue instead. Never
+# cancel in progress: a cancelled run is a version that silently never got
+# tagged.
 concurrency:
-  group: release
+  group: jfs-release-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    # Only tag a commit CI went green on. A manual dispatch skips the gate on
+    # purpose — that is the backfill path for a version that shipped before
+    # this workflow existed, or whose push fired no workflows (a bump PR
+    # auto-merged with the default GITHUB_TOKEN does not).
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.event.workflow_run.conclusion == 'success'
     steps:
       - uses: actions/checkout@v5
         with:
-          # The later steps only read package.json; don't leave a
-          # contents:write credential sitting in .git/config for them.
+          # On workflow_run the default checkout is the branch head at trigger
+          # time — pin to the commit the green CI run actually validated, so
+          # the tag cannot land on a newer, unvalidated push.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          # Only package.json is read after this; don't leave a contents:write
+          # credential sitting in .git/config for the later steps.
           persist-credentials: false
 
-      - name: Create release when the version is new
+      - name: Create the release when the version is new
         env:
           GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          TITLE: ${{ inputs.title }}
+          VERSION_FILE: ${{ inputs.version-file }}
         run: |
-          VERSION=$(node -p "require('./package.json').version")
+          set -euo pipefail
+          VERSION=$(node -p "require('./$VERSION_FILE').version")
           TAG="v$VERSION"
+
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release $TAG already exists — nothing to do"
-          else
-            gh release create "$TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
-              --title "@jfs/vendor-cli $TAG" \
-              --generate-notes
+            exit 0
+          fi
+
+          # The check above is advisory, not a lock: the concurrency group
+          # serialises this repo's own runs, but a tag can still arrive from
+          # elsewhere between the check and the create. Treat "it exists now"
+          # as success — the goal is that the tag exists, not that this run is
+          # the one that made it. Anything else is a real failure.
+          if ! gh release create "$TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --target "$TARGET_SHA" \
+                --title "$TITLE $TAG" \
+                --generate-notes; then
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "Release $TAG was created concurrently — nothing to do"
+              exit 0
+            fi
+            echo "::error::Failed to create release $TAG"
+            exit 1
           fi
