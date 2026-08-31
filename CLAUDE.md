@@ -172,6 +172,33 @@ Two properties to keep when editing:
   outside/stray check — so it is the caller's decision, not a silent default.
   Only market-monitor needs it today.
 
+## Lint
+
+`npm run lint` (ESLint flat config, `eslint.config.mjs`); CI runs it before
+the suite. This was the LAST code in the family to get a linter and the one
+with the most leverage: every vendored copy in every consumer repo is this
+package's output, and the generator's worst historical failure mode is exit 0
+plus a plausible file plus a `ReferenceError` at load in the consumer —
+which `vendor:check` cannot see, because regeneration repeats the bug.
+
+Two findings, both fixed: `preserve-caught-error` on the two places that
+catch an API failure and throw a composed message without attaching
+`{ cause }`. Both are the git-then-API fallback paths in pin resolution
+(`resolveHeadSha`, `verifyKitPins`), so the error a user actually sees when
+BOTH transports fail now carries the original stack rather than only its
+message text.
+
+`test/fixture-kit/**` is ignored, and must stay ignored: those files are
+INPUTS to the generator, deliberately odd — a top-level `$`, semicolon-less
+declarations, policy marker regions — precisely so the generator's refusals
+can be tested. Linting them would report the fixtures' whole purpose as
+errors.
+
+`no-control-regex` and `no-regex-spaces` are off: the lexer and the
+sanitizer-policy machinery match control characters and known multi-space
+indents in emitted output, so both rules fire on the subject matter rather
+than on mistakes.
+
 ## Kit extraction policy (the bar for kit #6)
 
 The family is **five kits** today — news-kit, pwa-kit, netlify-kit,
