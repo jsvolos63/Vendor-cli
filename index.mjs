@@ -1423,7 +1423,8 @@ export async function _fetchHeadSha(repo, { run = runGit } = {}) {
     // just read "HTTP 401" and send the reader off to the API docs.
     throw new Error(
       `${repo}: could not resolve HEAD — git ls-remote failed (${viaGit.error}); ` +
-        `GitHub API fallback failed (${apiErr?.message || apiErr})`
+        `GitHub API fallback failed (${apiErr?.message || apiErr})`,
+      { cause: apiErr }
     );
   }
 }
@@ -1658,7 +1659,8 @@ export async function _commitExists(repo, sha, { run = runGit } = {}) {
     // a non-zero exit; it must never be read as "the pin is fine".
     throw new Error(
       `${repo}@${sha.slice(0, 7)}: could not verify pin — git fetch failed (${viaGit.error}); ` +
-        `GitHub API fallback failed (${apiErr?.message || apiErr})`
+        `GitHub API fallback failed (${apiErr?.message || apiErr})`,
+      { cause: apiErr }
     );
   }
 }

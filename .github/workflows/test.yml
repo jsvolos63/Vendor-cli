@@ -18,7 +18,9 @@ jobs:
       # esbuild (the narrowing bundler, exact-pinned) must be installed for
       # the tree-shaking tests; the suite imports index.mjs directly.
       install-command: npm install
-      run: npm test
+      run: |
+        npm run lint
+        npm test
       # family/ ships in the package (the canonical CLAUDE.md block), so its
       # edits need a version bump like any shipped-module change.
       version-guard-paths: index.mjs bin family

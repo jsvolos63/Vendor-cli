@@ -1,6 +1,6 @@
 {
   "name": "@jfs/vendor-cli",
-  "version": "0.21.0",
+  "version": "0.21.1",
   "description": "Shared dev CLI for the @jfs kit family — vendoring generator (esm/global/cjs, surface derived from the kit's own exports) plus the consolidated kit-pin bumper, kit-pin existence pre-flight, version stamper, CLAUDE.md family-conventions synchronizer, and the buildless-module-graph gate the consumers used to each hand-roll.",
   "type": "module",
   "main": "index.mjs",
@@ -22,7 +22,8 @@
     "module-graph"
   ],
   "scripts": {
-    "test": "node --test test/test.mjs test/tooling.test.mjs test/claude-md-sync.test.mjs test/sanitizer-policy-sync.test.mjs test/module-graph.test.mjs"
+    "test": "node --test test/test.mjs test/tooling.test.mjs test/claude-md-sync.test.mjs test/sanitizer-policy-sync.test.mjs test/module-graph.test.mjs",
+    "lint": "eslint ."
   },
   "repository": {
     "type": "git",
@@ -35,5 +36,10 @@
   "sideEffects": false,
   "dependencies": {
     "esbuild": "0.25.10"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.9.1",
+    "globals": "^17.11.0"
   }
 }
