@@ -1,11 +1,12 @@
 {
   "name": "@jfs/vendor-cli",
-  "version": "0.20.0",
-  "description": "Shared dev CLI for the @jfs kit family — vendoring generator (esm/global/bare/cjs, surface derived from the kit's own exports) plus the consolidated kit-pin bumper, kit-pin existence pre-flight, and version stamper the consumers used to each hand-roll.",
+  "version": "0.21.0",
+  "description": "Shared dev CLI for the @jfs kit family — vendoring generator (esm/global/cjs, surface derived from the kit's own exports) plus the consolidated kit-pin bumper, kit-pin existence pre-flight, version stamper, CLAUDE.md family-conventions synchronizer, and the buildless-module-graph gate the consumers used to each hand-roll.",
   "type": "module",
   "main": "index.mjs",
   "exports": {
-    ".": "./index.mjs"
+    ".": "./index.mjs",
+    "./module-graph": "./module-graph/index.mjs"
   },
   "bin": {
     "jfs-bump-kit-pins": "bin/bump-kit-pins.mjs",
@@ -17,10 +18,11 @@
   "files": [
     "index.mjs",
     "bin",
-    "family"
+    "family",
+    "module-graph"
   ],
   "scripts": {
-    "test": "node --test test/test.mjs test/tooling.test.mjs test/claude-md-sync.test.mjs test/sanitizer-policy-sync.test.mjs"
+    "test": "node --test test/test.mjs test/tooling.test.mjs test/claude-md-sync.test.mjs test/sanitizer-policy-sync.test.mjs test/module-graph.test.mjs"
   },
   "repository": {
     "type": "git",

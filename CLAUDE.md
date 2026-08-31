@@ -127,6 +127,51 @@ Determinism holds because esbuild is pinned exactly and invoked with fixed
 options in a fixed relative layout; `vendor:check` still diffs
 regeneration against the committed copy.
 
+## The buildless-module-graph gate (`@jfs/vendor-cli/module-graph`)
+
+Five apps in the family ship `<script type="module">` with **no build step**,
+so the BROWSER resolves the import graph. If one specifier resolves to nothing
+— or one `import { x }` names an export its source no longer has — the browser
+instantiates NOTHING: blank page, no partial render, and the service worker
+re-serves the same broken shell from cache. Nothing in an ordinary CI run sees
+it. ESLint parses each module in isolation and never resolves a specifier;
+vitest transforms ESM through esbuild, so a missing named import arrives as
+`undefined` rather than a link error. JFS-Sports measured exactly that: a
+renamed export left `eslint`, `node --check`, `node build.js` and the whole
+vitest suite green.
+
+`module-graph/link-module-graph.mjs` links a graph with V8's own resolver
+(`vm.SourceTextModule`, stopped before `Evaluate()` — no DOM, no module body
+runs, no new dependency) as a CHILD PROCESS, because
+`--experimental-vm-modules` has to be set at process start and neither
+`node --test` nor vitest sets it. `module-graph/index.mjs` is the parent-side
+API: `linkGraph` / `linkGraphs` (multi-entry, optional dynamic-import
+fixpoint), `listModuleFiles`, `findOrphans`, `outsideModules`, and `linkProbe`.
+
+**Why it lives here and not in a kit.** It is DEV tooling — every repo already
+carries this package as a devDependency, and the family's own extraction bar
+says to prefer growing something existing over minting kit #6. It ships under a
+subpath export, so no consumer's `import { … } from '@jfs/vendor-cli'` changes.
+
+It was extracted from three hand-copied consumer copies. JFS-Sports' and
+market-monitor's were byte-identical; Surf-Tracker's had drifted nine lines
+behind and never received the `initializeImportMeta` hardening the other two
+carry — forward-drift that no reconciliation ever walked back, which is the
+half of the extraction bar that isn't "a third consumer".
+
+Two properties to keep when editing:
+
+- **`linkProbe` is not a convenience.** A linker that reported `ok: true` for
+  everything would satisfy every assertion in all five consumer suites at once,
+  so each consumer keeps two meta-tests proving it still fails on an
+  unresolvable specifier and on a missing named export. `linkProbe` is what
+  makes those two lines each instead of thirty.
+- **`followDynamic` stays off by default.** `import('./x.js')` is invisible to
+  a static link, so a lazily-imported subgraph is its own entry. Following it
+  can only ADD reached modules — which LOOSENS an orphan check and TIGHTENS an
+  outside/stray check — so it is the caller's decision, not a silent default.
+  Only market-monitor needs it today.
+
 ## Kit extraction policy (the bar for kit #6)
 
 The family is **five kits** today — news-kit, pwa-kit, netlify-kit,
