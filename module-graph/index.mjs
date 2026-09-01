@@ -43,7 +43,9 @@ export const LINKER_PATH = path.join(
 /**
  * Link ONE entry point's graph.
  * @param {string} entry absolute path, or relative to `cwd`
- * @param {{cwd?: string}} [options]
+ * @param {{cwd?: string, timeoutMs?: number}} [options] `timeoutMs` bounds the
+ *   linker child process (default 120000); a child that never exits would
+ *   otherwise hang the consumer's CI job to its own timeout.
  * @returns {{ok: boolean, modules?: string[], error?: string, stack?: string|null}}
  *   `modules` is every absolute file path in the graph, entry included.
  */

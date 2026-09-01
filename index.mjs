@@ -1256,15 +1256,16 @@ export function runVendorCli(kitDir, argv = process.argv.slice(2)) {
     // apps — while checking only the full copies that were already verbatim.
     // The narrowed copy's policy values flow from this same source, so one
     // check here covers both shapes.
+    const kitSourcePath = join(kitDir, 'index.js');
     if (source.includes(POLICY_MARKER_TEXT)) {
-      const { regions, drifts } = syncPolicyText(source, sanitizerPolicy(), `${kitDir}/index.js`, vendorFail);
+      const { regions, drifts } = syncPolicyText(source, sanitizerPolicy(), kitSourcePath, vendorFail);
       if (regions === 0) {
         // The entry guard above matched the bare marker prefix, but the sync
         // recognized no region — a misspelled region name (a digit, an
         // uppercase letter) would otherwise pass straight through and
         // silently disable the gate. Same refusal sanitizerPolicySync makes.
         vendorFail(
-          `${kitDir}/index.js carries \`${POLICY_MARKER_TEXT}\` text but no marker the policy sync ` +
+          `${kitSourcePath} carries \`${POLICY_MARKER_TEXT}\` text but no marker the policy sync ` +
             'recognizes — fix the marker pair in the kit source; nothing was written.'
         );
       }
