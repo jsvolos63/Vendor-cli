@@ -182,7 +182,10 @@ jobs:
 
       - name: Open a pull request if anything changed
         id: cpr
-        uses: peter-evans/create-pull-request@v7
+        # Pinned by SHA, not tag: this runs in every family repo with
+        # contents + pull-requests write, and `v7` is a movable tag on a
+        # third-party account. Bump the SHA deliberately.
+        uses: peter-evans/create-pull-request@84ae59a2cdc2258d6fa0732dd66352dddae2a412 # v7.0.9
         with:
           branch: auto/kit-pin-bump
           commit-message: "Bump @jfs kit pins to current HEADs; re-vendor"

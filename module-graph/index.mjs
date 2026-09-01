@@ -55,7 +55,14 @@ export function linkGraph(entry, options = {}) {
         stdout = execFileSync(
             process.execPath,
             ['--experimental-vm-modules', '--no-warnings', LINKER_PATH, abs],
-            { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
+            {
+                cwd,
+                encoding: 'utf8',
+                stdio: ['ignore', 'pipe', 'pipe'],
+                // A child that never exits would otherwise hang the consumer's CI
+                // job to its own timeout-minutes with nothing in the log.
+                timeout: options.timeoutMs ?? 120_000
+            }
         );
     } catch (e) {
         // The linker reports its own failures as ok:false on stdout, so getting
@@ -182,7 +189,14 @@ export function listModuleFiles(options = {}) {
     };
     for (const dir of options.dirs || []) {
         const abs = path.resolve(root, dir);
-        if (fs.existsSync(abs)) walk(abs);
+        // A missing directory is refused, not skipped: an orphan check over a
+        // renamed or mistyped `dirs` entry would otherwise pass vacuously —
+        // the same "reports ok for everything" failure linkProbe guards
+        // against on the link side.
+        if (!fs.existsSync(abs)) {
+            throw new Error(`listModuleFiles: no such directory ${abs} — an orphan check over a missing directory would silently pass`);
+        }
+        walk(abs);
     }
     return out.sort();
 }

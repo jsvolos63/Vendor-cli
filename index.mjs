@@ -942,43 +942,38 @@ function treeShakeKitSource(source, rootExports, rootLocals = []) {
 
   // ---- bundle --------------------------------------------------------------
   const { buildSync } = requireEsbuild(fail);
-  const entryNames = [...rootExports];
   const dir = mkdtempSync(join(tmpdir(), 'jfs-vendor-shake-'));
   let out;
   try {
     writeFileSync(join(dir, 'package.json'), '{"name":"kit","type":"module","sideEffects":false}\n');
-    const bundle = (kitText, roots) => {
-      writeFileSync(join(dir, 'kit.js'), kitText);
-      writeFileSync(join(dir, 'entry.js'), `export { ${roots.join(', ')} } from './kit.js';\n`);
-      let result;
-      try {
-        result = buildSync({
-          entryPoints: ['entry.js'],
-          absWorkingDir: dir,
-          bundle: true,
-          format: 'esm',
-          treeShaking: true,
-          minify: false,
-          target: 'esnext',
-          charset: 'utf8',
-          legalComments: 'none',
-          write: false,
-          // Bare specifiers (a kit's dynamic `import('x')`) stay verbatim —
-          // matching the full-surface copy — instead of being resolved by
-          // walking node_modules up from the temp dir, where /tmp is a
-          // world-writable ancestor: a planted /tmp/node_modules/x would be
-          // INLINED into a file consumers commit and ship. Relative paths
-          // (./kit.js) still bundle.
-          packages: 'external',
-        });
-      } catch (err) {
-        const detail = err && err.errors ? err.errors.map((e) => e.text).join('; ') : String(err && err.message);
-        fail(`esbuild could not bundle the narrowed kit: ${detail}. Nothing was written.`);
-      }
-      return result.outputFiles[0].text;
-    };
-
-    out = bundle(source, entryNames);
+    writeFileSync(join(dir, 'kit.js'), source);
+    writeFileSync(join(dir, 'entry.js'), `export { ${[...rootExports].join(', ')} } from './kit.js';\n`);
+    let result;
+    try {
+      result = buildSync({
+        entryPoints: ['entry.js'],
+        absWorkingDir: dir,
+        bundle: true,
+        format: 'esm',
+        treeShaking: true,
+        minify: false,
+        target: 'esnext',
+        charset: 'utf8',
+        legalComments: 'none',
+        write: false,
+        // Bare specifiers (a kit's dynamic `import('x')`) stay verbatim —
+        // matching the full-surface copy — instead of being resolved by
+        // walking node_modules up from the temp dir, where /tmp is a
+        // world-writable ancestor: a planted /tmp/node_modules/x would be
+        // INLINED into a file consumers commit and ship. Relative paths
+        // (./kit.js) still bundle.
+        packages: 'external',
+      });
+    } catch (err) {
+      const detail = err && err.errors ? err.errors.map((e) => e.text).join('; ') : String(err && err.message);
+      fail(`esbuild could not bundle the narrowed kit: ${detail}. Nothing was written.`);
+    }
+    out = result.outputFiles[0].text;
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1052,7 +1047,7 @@ function requireEsbuild(fail) {
 // Decide whether this generation shakes, and do it. Returns the body the
 // formats below emit. The pass is format-agnostic — it slices top-level
 // declarations out of the kit source, which every format then wraps its own
-// way — so all four get it. Unshaken (verbatim source) whenever:
+// way — so all three get it. Unshaken (verbatim source) whenever:
 //   * there is no narrowed surface (no --pick / no per-global picks),
 //   * the picks cover the whole surface — today's bytes, unchanged, so
 //     existing full-surface vendored copies don't move, or
@@ -1124,7 +1119,7 @@ function strippedBody(esm, fail = vendorFail) {
 }
 
 // Emit the generated file for one format. Pure string-in/string-out: the
-// four formats stay a switch, but behind a seam that takes everything it
+// three formats stay a switch, but behind a seam that takes everything it
 // needs as parameters.
 function emitVendoredOutput(format, source, { exposed, globals, narrowed, shaken }, pkg, repo) {
   const header = (extra) => vendorHeader(pkg, repo, extra);
@@ -1185,6 +1180,10 @@ function emitVendoredOutput(format, source, { exposed, globals, narrowed, shaken
         strippedBody(source) +
         `\nmodule.exports = {\n${surfaceMap}\n};\n`
       );
+    default:
+      // validateOpts refuses an unknown format long before this; fail closed
+      // anyway rather than returning undefined into the write path.
+      return vendorFail(`unsupported --format "${format}"`);
   }
 }
 
@@ -1245,31 +1244,33 @@ export function runVendorCli(kitDir, argv = process.argv.slice(2)) {
       pkg,
       repo
     );
-    // Sanitizer-policy gate, at the choke point: any emitted copy carrying a
+    // Sanitizer-policy gate, at the choke point: a kit SOURCE carrying a
     // policy marker is validated against the canonical
-    // family/sanitizer-policy.json before it is written or checked. In
-    // practice that is every FULL-surface copy of a kit with regions — full
-    // copies are verbatim, markers included — so a pin to a kit commit whose
-    // regions drifted (one that never passed the kit's own policy:check) is
-    // refused here rather than vendored. A NARROWED copy is bundler output
-    // and carries no markers (0.20.0 retired the graft that used to preserve
-    // them); its policy values flow from the same gated source, so this
-    // gate correctly no-ops on it.
-    if (expected.includes(POLICY_MARKER_TEXT)) {
-      const { regions, drifts } = syncPolicyText(expected, sanitizerPolicy(), opts.out, vendorFail);
+    // family/sanitizer-policy.json before anything is written or checked, so
+    // a pin to a kit commit whose regions drifted (one that never passed the
+    // kit's own policy:check) is refused here rather than vendored. It gates
+    // on the source, not on the emitted copy, because a NARROWED copy is
+    // bundler output with its markers stripped (0.20.0 retired the graft that
+    // used to preserve them): gating on emitted bytes silently skipped every
+    // --pick generation — which is the browser-shipped sanitizer in three
+    // apps — while checking only the full copies that were already verbatim.
+    // The narrowed copy's policy values flow from this same source, so one
+    // check here covers both shapes.
+    if (source.includes(POLICY_MARKER_TEXT)) {
+      const { regions, drifts } = syncPolicyText(source, sanitizerPolicy(), `${kitDir}/index.js`, vendorFail);
       if (regions === 0) {
         // The entry guard above matched the bare marker prefix, but the sync
         // recognized no region — a misspelled region name (a digit, an
         // uppercase letter) would otherwise pass straight through and
         // silently disable the gate. Same refusal sanitizerPolicySync makes.
         vendorFail(
-          `the emitted copy carries \`${POLICY_MARKER_TEXT}\` text but no marker the policy sync ` +
+          `${kitDir}/index.js carries \`${POLICY_MARKER_TEXT}\` text but no marker the policy sync ` +
             'recognizes — fix the marker pair in the kit source; nothing was written.'
         );
       }
       if (drifts.length) {
         vendorFail(
-          `the emitted copy's sanitizer-policy region(s) ${drifts.map((d) => `'${d.region}'`).join(', ')} ` +
+          `the kit's sanitizer-policy region(s) ${drifts.map((d) => `'${d.region}'`).join(', ')} ` +
             `disagree with the canonical family/sanitizer-policy.json — the pinned ${pkg.name} source is ` +
             'out of sync with the family policy. Sync the kit (`jfs-sanitizer-policy-sync index.js`), land ' +
             'that, and re-pin; nothing was written.'
