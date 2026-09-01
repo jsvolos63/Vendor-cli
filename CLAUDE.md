@@ -280,20 +280,25 @@ regenerates them with `jfs-sanitizer-policy-sync` (start-marker params pick
 the kit's casing/quoting); the kits' CI runs the `--check` mode and fails on
 drift. Edit the JSON here, bump the version, and re-pin + re-sync the kits.
 
-Since 0.17.0 the gate also runs **inside the vendoring generator**: any
-emitted copy carrying a policy marker is validated against the canonical
-JSON before it is written or checked, so a pin to a kit commit whose
-regions drifted is refused rather than vendored. In practice that is every
-FULL-surface copy (verbatim, markers included); since 0.20.0 a NARROWED
-copy carries no markers at all — the graft that used to preserve them was
-retired, its reprinted policy values flow from the gated source, and the
+Since 0.17.0 the gate also runs **inside the vendoring generator**: a kit
+SOURCE carrying a policy marker is validated against the canonical JSON
+before anything is written or checked, so a pin to a kit commit whose
+regions drifted is refused rather than vendored. It gates on the source,
+not on the emitted copy, and that distinction shipped as a real hole: from
+0.20.0 to 0.21.1 the check keyed off the EMITTED bytes, and since 0.20.0 a
+NARROWED copy carries no markers at all — the graft that used to preserve
+them was retired, its reprinted policy values flow from the source, and the
 generator strips the marker comment lines so a reprint can never read as a
-canonical region. Because every consumer's `vendor:check` regenerates
-through this CLI, the full-surface gate re-runs on every consumer CI run
-for free — which is why the consumer-side `policy:check` scripts were
-retired (the kit-side `policy:check` in news-kit's own CI remains the
-load-bearing source gate). Don't re-add per-consumer policy:check wiring;
-the choke points cover it.
+canonical region — so every `--pick` generation skipped the gate while the
+full-surface copies, already verbatim, were the only ones checked. That is
+backwards from where the risk is: the narrowed ESM copies are news-kit's
+browser-shipped sanitizers in Art-Gallery-, market-monitor and John's News.
+`test/test.mjs`'s policy-gate case now drives the narrowed shapes too.
+Because every consumer's `vendor:check` regenerates through this CLI, the
+gate re-runs on every consumer CI run for free — which is why the
+consumer-side `policy:check` scripts were retired (the kit-side
+`policy:check` in news-kit's own CI remains the load-bearing source gate).
+Don't re-add per-consumer policy:check wiring; the choke points cover it.
 
 <!-- jfs-family-conventions:start — managed by jfs-claude-md-sync; edit family/family-conventions.md in @jfs/vendor-cli -->
 

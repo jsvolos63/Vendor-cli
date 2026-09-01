@@ -643,10 +643,17 @@ test('policy gate: a kit whose regions drifted from canonical policy is refused 
   const drifted = synced.replace('/g;', '/gi;');
   assert.notEqual(drifted, synced, 'the tamper must land');
   writeFileSync(join(kitDir, 'index.js'), drifted);
+  // The narrowed shapes are the ones that matter most — a --pick copy is the
+  // browser-shipped sanitizer in three apps — and were the ones the gate used
+  // to skip, because it keyed off the emitted copy and 0.20.0 strips every
+  // marker from a narrowed body.
   for (const args of [
     ['--format', 'esm', '--out', 'a.js'],
     ['--format', 'global', '--name', 'G', '--out', 'b.js'],
     ['--format', 'cjs', '--out', 'c.cjs'],
+    ['--format', 'esm', '--pick', 'strip', '--out', 'd.js'],
+    ['--format', 'global', '--global', 'G:strip', '--out', 'e.js'],
+    ['--format', 'cjs', '--pick', 'strip', '--out', 'f.cjs'],
   ]) {
     const r = runKit(bin, args, dir);
     assert.notEqual(r.status, 0, `${args.join(' ')} must refuse a drifted policy region`);

@@ -179,6 +179,20 @@ test('listModuleFiles walks recursively and honours file AND directory excludes'
     }
 });
 
+test('listModuleFiles refuses a directory that does not exist', () => {
+    // A renamed or mistyped `dirs` entry must fail the gate, not turn the
+    // orphan check into a vacuous pass.
+    const dir = scratch({ 'js/app.js': '' });
+    try {
+        assert.throws(
+            () => listModuleFiles({ root: dir, dirs: ['src'] }),
+            /no such directory/
+        );
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test('findOrphans names the file nothing imports', () => {
     const dir = scratch({
         'js/app.js': "import './used.js';\n",
