@@ -34,9 +34,12 @@ on:
   workflow_call:
     inputs:
       node-version:
-        description: Node.js version to set up
+        description: >-
+          Node.js version to set up. 22 (Node 20 reached end of life in
+          April 2026, and kit-pin-bump.yml has defaulted to 22 all along —
+          the two workflows used to disagree).
         type: string
-        default: '20'
+        default: '22'
       python-version:
         description: Python version to set up ('' skips Python)
         type: string

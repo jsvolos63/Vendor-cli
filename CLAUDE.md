@@ -70,6 +70,15 @@ jobs:
         npm test
 ```
 
+A **kit** caller (no `vendor:sync`, no `version:stamp` — its semver tracks
+`index.js` + `bin`) must also pass `vendor-sync-command: npm install` (so
+`package-lock.json` follows the bumped pin) and `version-bump-command: ''`.
+Left at the defaults the run dies on `Missing script: "vendor:sync"`, which
+pwa-kit, netlify-kit and fetch-kit did on every scheduled run for two weeks
+while nothing watched: their vendor-cli pins sat at 0.18.1 against 0.21.3,
+and because each kit's vendor shim resolves the CLI from INSIDE the kit,
+every consumer vendored those three kits through the stale generator.
+
 Same rules as family-ci: edits land in every consumer's next scheduled bump
 at once — treat them like kit API changes.
 

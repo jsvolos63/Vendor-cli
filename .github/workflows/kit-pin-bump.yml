@@ -35,6 +35,17 @@
 #           npm run check
 #           npm test
 #
+# A KIT caller (a repo with no vendor:sync and no version:stamp — its semver
+# tracks index.js + bin) must ALSO pass:
+#
+#         vendor-sync-command: npm install   # keep package-lock in step with the pin
+#         version-bump-command: ''
+#
+# Left at the defaults, the run dies on `Missing script: "vendor:sync"` —
+# which three kits did every Monday for two weeks before anyone looked, so
+# their vendor-cli pins sat three minors behind while every consumer vendored
+# those kits through the stale CLI resolved from inside them.
+#
 # The caller MUST grant `contents: write` + `pull-requests: write` — a
 # called workflow can never elevate beyond what the caller passes. The
 # default github.token is used throughout (same as family-ci.yml), so no
