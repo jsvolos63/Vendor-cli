@@ -107,7 +107,7 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: inputs.python-version != ''
         with:
           python-version: ${{ inputs.python-version }}
