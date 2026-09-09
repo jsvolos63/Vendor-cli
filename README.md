@@ -1,7 +1,7 @@
 # @jfs/vendor-cli
 
 Shared **dev CLI** for the `@jfs/*` kit family (`news-kit`, `pwa-kit`,
-`netlify-kit`, `fetch-kit`). It owns three jobs that used to be
+`netlify-kit`, `fetch-kit`). It owns five jobs that used to be
 byte-identical copies scattered across the kits and their consumers:
 
 1. **Vendoring** (`runVendorCli`, via each kit's `jfs-<kit>-vendor` bin) —
@@ -12,6 +12,9 @@ byte-identical copies scattered across the kits and their consumers:
    pre-flight that every pinned SHA actually exists on the remote.
 4. **Version stamping** (`versionStamp`, `jfs-version-stamp` bin) — stamp the
    version into a consumer's shell files.
+5. **CLAUDE.md conventions sync** (`jfs-claude-md-sync` bin) — rewrite the
+   marked family-conventions block in a repo's CLAUDE.md from the canonical
+   `family/family-conventions.md`; `--check` is what family CI runs.
 
 The family's consumers are buildless static sites: `node_modules` is not
 deployed, so each consumer commits a generated copy of every kit it uses and

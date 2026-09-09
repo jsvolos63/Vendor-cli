@@ -13,6 +13,7 @@ on:
   workflow_run:
     workflows: [Test]
     types: [completed]
+    branches: [main]   # the caller-side half of the doubled guard release.yml asks for
   workflow_dispatch:
 
 permissions:
