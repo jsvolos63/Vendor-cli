@@ -35,7 +35,7 @@
   "license": "MIT",
   "sideEffects": false,
   "dependencies": {
-    "esbuild": "0.25.10"
+    "esbuild": "0.28.2"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
