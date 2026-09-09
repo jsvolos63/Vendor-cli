@@ -1,0 +1,94 @@
+# Dependabot merge — the @jfs family's reusable auto-merge (workflow_call).
+#
+# Dependabot's PRs DO trigger pull_request CI (unlike a session's or a bot's
+# GITHUB_TOKEN push), but that run holds a read-only token, so nothing in it
+# can merge. Before this workflow the PRs simply sat: three of them were a
+# week old across two repos when the family review found them, one carrying
+# the fix for a HIGH prod-audit failure that had CI red on main.
+#
+# The caller triggers on its CI workflow completing and hands the event
+# here; this job merges the PR when the run is green, the PR is Dependabot's
+# own (same repo, dependabot[bot] author) and every bump it carries is minor
+# or patch. A MAJOR bump is left open for a session or a human — that is a
+# behaviour change to read, not a lockfile refresh.
+#
+#   name: Dependabot merge
+#   on:
+#     workflow_run:
+#       workflows: [CI]        # MUST match the CI workflow's `name:` exactly
+#       types: [completed]
+#   permissions:
+#     contents: write
+#     pull-requests: write
+#   jobs:
+#     merge:
+#       uses: jsvolos63/vendor-cli/.github/workflows/dependabot-merge.yml@main
+#
+# The merge is made with GITHUB_TOKEN, so — exactly like the kit-pin bump —
+# it fires no push workflows on main: the PR's own CI run is the only
+# validation the change gets, which is why this gates on it.
+name: Dependabot merge (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      allow-major:
+        description: Merge major bumps too (default false — leave them open)
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_run'
+      && github.event.workflow_run.event == 'pull_request'
+      && github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.actor.login == 'dependabot[bot]'
+      && github.event.workflow_run.head_repository.full_name == github.repository
+    steps:
+      - name: Merge the green Dependabot PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          ALLOW_MAJOR: ${{ inputs.allow-major }}
+        run: |
+          set -euo pipefail
+          pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$HEAD_BRANCH" --state open \
+                --json number,author,headRefOid,body,title --jq '.[0]')
+          if [ -z "$pr" ] || [ "$pr" = "null" ]; then
+            echo "No open PR for $HEAD_BRANCH — nothing to merge"; exit 0
+          fi
+          author=$(jq -r '.author.login' <<<"$pr")
+          number=$(jq -r '.number' <<<"$pr")
+          head=$(jq -r '.headRefOid' <<<"$pr")
+          if [ "$author" != "dependabot" ] && [ "$author" != "app/dependabot" ] && [ "$author" != "dependabot[bot]" ]; then
+            echo "PR #$number is by $author, not Dependabot — leaving it"; exit 0
+          fi
+          if [ "$head" != "$HEAD_SHA" ]; then
+            echo "PR #$number moved past the green run ($HEAD_SHA -> $head) — waiting for CI on the new head"; exit 0
+          fi
+          # Dependabot writes "Bumps X from A to B" (single) or "Updates `X`
+          # from A to B" (grouped) into the body; a major bump is one whose
+          # first number changes. Anything unreadable counts as major.
+          text=$(jq -r '.title + "\n" + .body' <<<"$pr")
+          major=0; seen=0
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            seen=1
+            from=${line% to *}; from=${from##* from }; to=${line##* to }
+            fm=${from%%.*}; tm=${to%%.*}
+            case "$fm$tm" in *[!0-9]*) major=1;; esac
+            [ "$fm" = "$tm" ] || major=1
+          done < <(grep -oE '(Bumps|Updates|bumps|updates) [^ ]+ from [0-9][^ ]* to [0-9][^ ]*' <<<"$text" | sed 's/`//g' || true)
+          if [ "$seen" = 0 ]; then major=1; fi
+          if [ "$major" = 1 ] && [ "$ALLOW_MAJOR" != "true" ]; then
+            echo "PR #$number carries a major bump (or one this parser cannot read) — left open for a review"; exit 0
+          fi
+          gh pr merge --squash --delete-branch --repo "$GITHUB_REPOSITORY" "$number"
+          echo "Merged Dependabot PR #$number"

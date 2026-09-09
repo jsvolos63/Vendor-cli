@@ -210,8 +210,8 @@ than on mistakes.
 
 ## Release (`.github/workflows/release.yml`)
 
-The family's **third** reusable workflow, alongside `family-ci.yml` and
-`kit-pin-bump.yml`: tag `v<version>` from `package.json` and open a GitHub
+The third reusable workflow, alongside `family-ci.yml` and
+`kit-pin-bump.yml` (and `dependabot-merge.yml`, below): tag `v<version>` from `package.json` and open a GitHub
 release, once per new version, on main. Callers keep only their triggers, the
 `contents: write` grant (a called workflow cannot elevate its own token) and a
 `title` input.
@@ -250,6 +250,28 @@ Two details worth not undoing:
   now" as success. The goal is that the tag exists, not that this run made it.
 
 Edits land in every consumer's next release — treat them like kit API changes.
+
+## Dependabot merge (`.github/workflows/dependabot-merge.yml`)
+
+The family's **fourth** reusable workflow. Dependabot's PRs trigger
+`pull_request` CI on their own (a bot's push does, a `GITHUB_TOKEN` push does
+not) but that run's token is read-only, so nothing could merge them: the
+family review found three sitting a week old across two repos, one of them
+the fix for a HIGH prod-audit failure that had CI red on main. Each repo now
+triggers this on its CI workflow completing (`workflow_run`, the same
+name-must-match rule as `release.yml`); it merges when the run is green, the
+PR is Dependabot's own, and every bump it carries is minor or patch. A MAJOR
+bump, or a body the parser cannot read, is left open. Every npm repo pairs it
+with a `.github/dependabot.yml` — weekly npm with minor and patch grouped,
+monthly `github-actions` — and the `@jfs/*` git pins stay the kit-pin bump's.
+
+**Action pinning policy**, stated here because the review found it applied
+inconsistently: first-party `actions/*` are referenced by major tag (they
+are maintained by the platform the runner belongs to, and a SHA there buys
+nothing the tag does not), and every other action is pinned by full SHA
+with the version in a trailing comment — `peter-evans/create-pull-request`
+in `kit-pin-bump.yml` is the model. The monthly `github-actions` Dependabot
+entry is what keeps both shapes fresh.
 
 ## Kit extraction policy (the bar for kit #6)
 
@@ -382,6 +404,30 @@ repo and shipped as a real defect.
 5. Webfonts are either self-hosted (subset, preloaded, `font-display: swap`)
    or absent — a font-family the page doesn't load must not be named first
    in a stack.
+
+### Service-worker updates
+
+A new build is never applied under the reader mid-session: no reload, no
+swap of the controlling worker while a page is open. The worker registers,
+the page shows a "new version" pill, and the new build takes over on a
+gesture (the pill) or on the next launch. Two mechanisms satisfy that and
+each app picks ONE: a worker that WAITS (no `skipWaiting()` in install; the
+pill posts `SKIP_WAITING` and reloads on `controllerchange`) or a worker that
+activates on install but never `clients.claim()`s (the pill just reloads).
+Never mix them — a pill that posts `SKIP_WAITING` at a worker that already
+activated has nothing to wait for and strands on "Updating…", which shipped
+once.
+
+### Dependencies
+
+Every npm repo carries `.github/dependabot.yml` (weekly npm, minor and patch
+grouped into one PR; monthly `github-actions`) and calls the family's
+`dependabot-merge.yml` reusable workflow, which squash-merges a Dependabot PR
+once the repo's CI is green on it and every bump in it is minor or patch. A
+MAJOR bump is left open for a session or a human. Dependabot never touches
+the `@jfs/*` git pins; the weekly kit-pin bump owns those. First-party
+`actions/*` are referenced by major tag; every other action is pinned by
+full SHA.
 
 <!-- jfs-family-conventions:end -->
 
