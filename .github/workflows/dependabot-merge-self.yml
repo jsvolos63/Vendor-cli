@@ -1,0 +1,16 @@
+# This repo's own Dependabot merge, through the reusable workflow it hosts
+# (referenced locally with `./`, like test.yml and release-self.yml).
+name: Dependabot merge
+
+on:
+  workflow_run:
+    workflows: [Test]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    uses: ./.github/workflows/dependabot-merge.yml

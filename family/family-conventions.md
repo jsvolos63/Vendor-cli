@@ -69,3 +69,27 @@ repo and shipped as a real defect.
 5. Webfonts are either self-hosted (subset, preloaded, `font-display: swap`)
    or absent — a font-family the page doesn't load must not be named first
    in a stack.
+
+### Service-worker updates
+
+A new build is never applied under the reader mid-session: no reload, no
+swap of the controlling worker while a page is open. The worker registers,
+the page shows a "new version" pill, and the new build takes over on a
+gesture (the pill) or on the next launch. Two mechanisms satisfy that and
+each app picks ONE: a worker that WAITS (no `skipWaiting()` in install; the
+pill posts `SKIP_WAITING` and reloads on `controllerchange`) or a worker that
+activates on install but never `clients.claim()`s (the pill just reloads).
+Never mix them — a pill that posts `SKIP_WAITING` at a worker that already
+activated has nothing to wait for and strands on "Updating…", which shipped
+once.
+
+### Dependencies
+
+Every npm repo carries `.github/dependabot.yml` (weekly npm, minor and patch
+grouped into one PR; monthly `github-actions`) and calls the family's
+`dependabot-merge.yml` reusable workflow, which squash-merges a Dependabot PR
+once the repo's CI is green on it and every bump in it is minor or patch. A
+MAJOR bump is left open for a session or a human. Dependabot never touches
+the `@jfs/*` git pins; the weekly kit-pin bump owns those. First-party
+`actions/*` are referenced by major tag; every other action is pinned by
+full SHA.
