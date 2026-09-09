@@ -185,8 +185,12 @@ jobs:
       # PRs opened with the default GITHUB_TOKEN never trigger pull_request
       # workflows, so the repo's CI can't validate this PR before merge. Run
       # the same checks here instead — the merge step below is only reached
-      # if they pass (and the merge to main triggers the full CI run as a
-      # backstop).
+      # if they pass. There is NO backstop after that: a merge made with
+      # GITHUB_TOKEN fires no push workflows either, so the merged commit
+      # gets no CI run on main (BearsMockDraft measured it: neither its
+      # pin-bump merge nor its data-refresh merge produced one). This step
+      # is the only validation the bump ever gets, which is why it is
+      # required rather than optional.
       - name: Run the repo's CI checks against the bumped tree
         if: steps.diff.outputs.changed == 'true' && inputs.check-command != ''
         run: ${{ inputs.check-command }}
@@ -209,9 +213,9 @@ jobs:
             from the bumped vendor-cli, and the app version bumped per this
             repo's caller inputs; the repo's CI checks ran green inside the
             bump workflow before this PR was opened. (PRs opened with the default
-            GITHUB_TOKEN never trigger pull_request CI, so validation runs
-            pre-merge instead, and the merge to main triggers the full CI
-            run as a backstop.)
+            GITHUB_TOKEN never trigger pull_request CI, and neither does the
+            merge it makes, so that pre-merge run is the only validation
+            this change gets.)
 
             ${{ inputs.pr-body-extra }}
 
