@@ -45,7 +45,8 @@ and nothing ran it — when the canonical text gained the Look & feel
 section, six consumers sat red on family CI's conventions check until a
 session re-synced them by hand. The re-install in the default matters:
 syncing from a stale pinned copy could regress the block, which is worse
-than skipping.
+than skipping. It is a BACKSTOP, not the delivery — see "The canonical
+family-conventions text" below for why the sync cannot wait for Monday.
 
 The important behavior change vs. the old copies: a blocked auto-merge of a
 validated bump **fails the run** instead of emitting an invisible
@@ -298,6 +299,23 @@ the bottom of every repo's CLAUDE.md (including this one). Edit it here,
 bump the version, and consumers pick it up via `jfs-claude-md-sync` — family
 CI fails any repo whose block has drifted. The block is deliberately short:
 only conventions that are truly family-wide belong in it.
+
+**Family CI checks the block against vendor-cli MAIN, not against the
+consumer's pin.** `family-ci.yml` clones this repo's main into
+`.jfs-family/vendor-cli` and runs `claude-md-sync --check` from there, so
+the moment an edit to the canonical text merges here, every consumer's
+next CI run — a Dependabot PR's, a session's dispatch, anything — fails
+its conventions check, and it stays red until that consumer's CLAUDE.md
+is re-synced. The weekly pin bump does carry the re-sync, but a repo
+cannot wait for Monday with CI red: the Dependabot merge workflow, for
+one, merges nothing while it is. This has now happened twice (the Look &
+feel section, then the Service-worker-updates and Dependencies sections:
+thirteen repos red at once). So the change to the canonical text and
+the re-sync of every consumer are ONE piece of work, in the same session:
+merge the vendor-cli change, then in each consumer run
+`node <vendor-cli checkout>/bin/claude-md-sync.mjs` from the repo root
+(it syncs the CWD's CLAUDE.md), open the PR, dispatch CI, merge. Docs
+only, so no consumer version bump.
 
 ## The canonical sanitizer policy
 
