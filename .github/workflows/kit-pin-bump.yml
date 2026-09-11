@@ -145,7 +145,7 @@ jobs:
         # command is the ONLY validation a bump gets before it merges.
         shell: bash
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           # The install steps below run npm lifecycle scripts from kit commits
           # that were resolved seconds ago and reviewed by nobody. Don't leave

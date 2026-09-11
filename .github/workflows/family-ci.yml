@@ -98,11 +98,11 @@ jobs:
       # main's — everyone else runs the family tooling from a main checkout.
       JFS_VENDOR_CLI_DIR: ${{ github.repository == 'jsvolos63/vendor-cli' && '.' || '.jfs-family/vendor-cli' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         if: (inputs.verify-kit-pins || inputs.claude-md-check) && github.repository != 'jsvolos63/vendor-cli'
         with:
           repository: jsvolos63/vendor-cli
@@ -190,7 +190,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
