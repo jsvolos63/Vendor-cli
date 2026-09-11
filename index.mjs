@@ -735,8 +735,8 @@ function endsOperand(src, mask, idx, floor) {
 }
 
 // Split the source into ordered top-level statements. Returns the statement
-// spans only; the text BETWEEN them (comments, blank lines) is attributed by
-// buildShakeChunks below.
+// spans only; the text BETWEEN them (comments, blank lines) is esbuild's to
+// reprint, apart from the file-top preamble read off by the pass below.
 function sliceTopLevel(src, mask, depth, fail) {
   const n = src.length;
   const stmts = [];
@@ -854,23 +854,15 @@ function declaredNames(src, mask, depth, stmt, fail) {
   return names;
 }
 
-// Comment attribution. A gap between two declarations splits at its FIRST
-// blank line: comments sitting directly under a declaration are ITS trailing
-// comments (this is what carries a `@jfs-sanitizer-policy:…:end` marker along
-// with the constant it closes), everything after the blank line documents the
-// declaration that follows. The gap at the top of the file splits at its LAST
-// blank line instead — everything above that is the kit's preamble, which
-// documents the file rather than any one declaration and is always kept.
+// The kit's file-top preamble is everything above the LAST blank line of the
+// gap before the first declaration: it documents the file rather than any one
+// declaration, so it is kept whatever the picks reach (esbuild's bundle drops
+// it, so it is re-attached by hand afterwards).
 // CRLF-tolerant: `/\n[ \t]*\n/` never matches a `\r\n\r\n` gap, so a kit with
-// Windows line endings attached EVERY gap to the following declaration — the
-// file-top preamble included, which is then dropped by any pick that doesn't
-// keep the first declaration.
+// Windows line endings had no preamble at all — the file-top comment rode
+// along with the first declaration and vanished with any pick that did not
+// keep it.
 const BLANK_LINE_RE = /\r?\n[ \t]*\r?\n/;
-
-function splitAtFirstBlank(gap) {
-  const m = BLANK_LINE_RE.exec(gap);
-  return m ? [gap.slice(0, m.index), gap.slice(m.index)] : ['', gap];
-}
 
 function splitAtLastBlank(gap) {
   const re = new RegExp(BLANK_LINE_RE.source, 'g');
@@ -883,39 +875,21 @@ function splitAtLastBlank(gap) {
   return idx === -1 ? ['', gap] : [gap.slice(0, idx), gap.slice(idx)];
 }
 
-// Turn the statement spans into shakeable chunks: each carries the text that
-// will be emitted (its attached comments plus the statement itself), what it
-// declares, and whether it holds a sanitizer-policy marker. (Reachability is
-// esbuild's job now — chunks no longer track what they reference.)
-function buildShakeChunks(src, mask, depth, stmts, fail) {
-  const heads = [];
-  const tails = [];
-  let preamble = '';
-  for (let n = 0; n <= stmts.length; n++) {
-    const from = n === 0 ? 0 : stmts[n - 1].end;
-    const to = n === stmts.length ? src.length : stmts[n].start;
-    const gap = src.slice(from, to);
-    const [before, after] = n === 0 ? splitAtLastBlank(gap) : splitAtFirstBlank(gap);
-    if (n === 0) preamble = before.trim();
-    else tails[n - 1] = before;
-    if (n < stmts.length) heads[n] = after;
-    else if (after.trim()) {
-      // Prose after the LAST declaration has no following statement to
-      // document, so it rides with the one above it rather than being dropped.
-      tails[stmts.length - 1] = `${tails[stmts.length - 1] || ''}${after}`;
-    }
-  }
-
-  const chunks = stmts.map((stmt, n) => {
-    const text = `${heads[n] || ''}${src.slice(stmt.start, stmt.end)}${tails[n] || ''}`;
-    return {
-      text: text.trim(),
-      kind: stmt.kind,
-      declares: declaredNames(src, mask, depth, stmt, fail),
-    };
-  });
-  if (!chunks.length) fail('nothing to emit after chunking — refusing to shake.');
-  return { preamble, chunks };
+// Read the preamble, and ACCOUNT for every statement span on the way past.
+// This pass used to build a chunk per statement — its emitted text, its kind,
+// the names it declares — for the hand-written shaker. Reachability is
+// esbuild's job now and nothing read any of that, so what survives is the two
+// things the caller still owes: the preamble, and `declaredNames`' refusal on
+// a declarator shape the scanner cannot enumerate, which must fire before a
+// single byte is emitted.
+function readPreambleAndAccount(src, mask, depth, stmts, fail) {
+  const topGap = src.slice(0, stmts.length ? stmts[0].start : src.length);
+  const [preamble] = splitAtLastBlank(topGap);
+  for (const stmt of stmts) declaredNames(src, mask, depth, stmt, fail);
+  // Belt and braces: `sliceTopLevel` already refuses an empty file, so this
+  // is the accounting assertion rather than a reachable path.
+  if (!stmts.length) fail('nothing to emit after accounting — refusing to shake.');
+  return preamble.trim();
 }
 
 // Narrow the kit body to what the picked exports reach, via esbuild.
@@ -931,14 +905,14 @@ function buildShakeChunks(src, mask, depth, stmts, fail) {
 // sanitizer-policy regions included: they are ordinary code here, guarded at
 // the source by the kit's own policy:check rather than preserved byte-exact
 // in narrowed output (see the POLICY note in the section header above).
-// The lex/slice/chunk passes still run first purely for their fail-closed
+// The lex/slice/account passes still run first purely for their fail-closed
 // refusals: a statement shape they cannot account for must refuse loudly
 // before anything is emitted, exactly as it does on the strippedBody path.
 function treeShakeKitSource(source, rootExports, rootLocals = []) {
   const fail = vendorFail;
   const { mask, depth } = lexKitSource(source, fail);
   const stmts = sliceTopLevel(source, mask, depth, fail);
-  const { preamble } = buildShakeChunks(source, mask, depth, stmts, fail);
+  const preamble = readPreambleAndAccount(source, mask, depth, stmts, fail);
 
   // ---- bundle --------------------------------------------------------------
   const { buildSync } = requireEsbuild(fail);
@@ -1390,16 +1364,55 @@ function gitHeadSha(repo, run = runGit) {
   return { sha };
 }
 
-async function apiHeadSha(repo) {
+// The REST fallback both pin lookups share. Ambient credentials in this family
+// are scoped to one transport or the other — a git-only credential 401s here,
+// an api.github.com token cannot drive ls-remote — which is why neither
+// transport alone is enough and this one is only ever reached second.
+function githubApiGet(path, userAgent) {
   const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '';
-  const res = await fetch(`https://api.github.com/repos/${repo}/commits/HEAD`, {
+  return fetch(`https://api.github.com/${path}`, {
     headers: {
       accept: 'application/vnd.github.sha',
-      'user-agent': 'kit-pin-bump',
+      'user-agent': userAgent,
       ...(token ? { authorization: `Bearer ${token}` } : {}),
     },
     signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS),
   });
+}
+
+// The git-first / API-second shape both pin lookups below are: validate the
+// repo name at the boundary, ask git, and fall back to the REST API only when
+// git could not ANSWER (as opposed to answering "no" — which `tryGit` reports
+// as a value, so a definitive negative never spends an API call).
+//
+// `tryGit` returns `{ value }` when git answered and `{ error }` when it could
+// not. A failure on both transports is composed into ONE line naming each, so
+// the log doesn't just read "HTTP 401" and send the reader off to the API
+// docs, and the API error rides along as `cause` so its stack survives.
+async function resolveViaGitThenApi({ repo, boundaryVerb, subject, action, gitLabel, tryGit, tryApi }) {
+  // Assert the shape once, up front: `repo` reaches both a subprocess argv and
+  // a URL, and neither transport should ever see an unvalidated name.
+  if (!REPO_RE.test(repo)) {
+    throw new Error(`refusing to ${boundaryVerb} unexpected repo name "${String(repo).slice(0, 60)}"`);
+  }
+  const viaGit = tryGit();
+  if ('value' in viaGit) return viaGit.value;
+  try {
+    return await tryApi();
+  } catch (apiErr) {
+    // `subject` is a thunk, not a string: the commit check spells itself
+    // `repo@sha7`, and building that eagerly would read `sha` ahead of the
+    // repo-name boundary check above.
+    throw new Error(
+      `${subject()}: ${action} — ${gitLabel} failed (${viaGit.error}); ` +
+        `GitHub API fallback failed (${apiErr?.message || apiErr})`,
+      { cause: apiErr }
+    );
+  }
+}
+
+async function apiHeadSha(repo) {
+  const res = await githubApiGet(`repos/${repo}/commits/HEAD`, 'kit-pin-bump');
   if (!res.ok) throw new Error(`${repo}: GitHub API returned HTTP ${res.status}`);
   const sha = (await res.text()).trim();
   if (!SHA_RE.test(sha)) {
@@ -1411,24 +1424,18 @@ async function apiHeadSha(repo) {
 // Exported for tests only: `run` stands in for runGit so the git path can be
 // exercised (both branches) without a network.
 export async function _fetchHeadSha(repo, { run = runGit } = {}) {
-  // Assert the shape once, up front: `repo` reaches both a subprocess argv and
-  // a URL, and neither transport should ever see an unvalidated name.
-  if (!REPO_RE.test(repo)) {
-    throw new Error(`refusing to resolve unexpected repo name "${String(repo).slice(0, 60)}"`);
-  }
-  const viaGit = gitHeadSha(repo, run);
-  if (viaGit.sha) return viaGit.sha;
-  try {
-    return await apiHeadSha(repo);
-  } catch (apiErr) {
-    // Both transports failed. Name each failure in one line so the log doesn't
-    // just read "HTTP 401" and send the reader off to the API docs.
-    throw new Error(
-      `${repo}: could not resolve HEAD — git ls-remote failed (${viaGit.error}); ` +
-        `GitHub API fallback failed (${apiErr?.message || apiErr})`,
-      { cause: apiErr }
-    );
-  }
+  return resolveViaGitThenApi({
+    repo,
+    boundaryVerb: 'resolve',
+    subject: () => repo,
+    action: 'could not resolve HEAD',
+    gitLabel: 'git ls-remote',
+    tryGit: () => {
+      const res = gitHeadSha(repo, run);
+      return res.sha ? { value: res.sha } : { error: res.error };
+    },
+    tryApi: () => apiHeadSha(repo),
+  });
 }
 
 const fetchHeadSha = (repo) => _fetchHeadSha(repo);
@@ -1630,15 +1637,7 @@ function gitCommitExists(repo, sha, run = runGit) {
 }
 
 async function apiCommitExists(repo, sha) {
-  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '';
-  const res = await fetch(`https://api.github.com/repos/${repo}/commits/${sha}`, {
-    headers: {
-      accept: 'application/vnd.github.sha',
-      'user-agent': 'kit-pin-check',
-      ...(token ? { authorization: `Bearer ${token}` } : {}),
-    },
-    signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS),
-  });
+  const res = await githubApiGet(`repos/${repo}/commits/${sha}`, 'kit-pin-check');
   if (res.status === 200) return true;
   // 404 (unknown repo/commit) and 422 (malformed sha) both mean "not a real
   // pin"; anything else (403 rate-limit, 5xx) is inconclusive, not "missing".
@@ -1648,23 +1647,24 @@ async function apiCommitExists(repo, sha) {
 
 // Exported for tests only: `run` stands in for runGit so both branches can be
 // exercised without a network.
+//
+// Inconclusive on BOTH transports -> the shared helper throws. verifyKitPins
+// turns that into a non-zero exit; it must never be read as "the pin is fine".
 export async function _commitExists(repo, sha, { run = runGit } = {}) {
-  if (!REPO_RE.test(repo)) {
-    throw new Error(`refusing to check unexpected repo name "${String(repo).slice(0, 60)}"`);
-  }
-  const viaGit = gitCommitExists(repo, sha, run);
-  if (viaGit.result !== undefined) return viaGit.result;
-  try {
-    return await apiCommitExists(repo, sha);
-  } catch (apiErr) {
-    // Inconclusive on BOTH transports -> throw. verifyKitPins turns this into
-    // a non-zero exit; it must never be read as "the pin is fine".
-    throw new Error(
-      `${repo}@${sha.slice(0, 7)}: could not verify pin — git fetch failed (${viaGit.error}); ` +
-        `GitHub API fallback failed (${apiErr?.message || apiErr})`,
-      { cause: apiErr }
-    );
-  }
+  return resolveViaGitThenApi({
+    repo,
+    boundaryVerb: 'check',
+    subject: () => `${repo}@${sha.slice(0, 7)}`,
+    action: 'could not verify pin',
+    gitLabel: 'git fetch',
+    tryGit: () => {
+      // `result` is git's definitive yes OR no; only a missing one means git
+      // could not answer, and `false` must stay a value rather than a miss.
+      const res = gitCommitExists(repo, sha, run);
+      return res.result !== undefined ? { value: res.result } : { error: res.error };
+    },
+    tryApi: () => apiCommitExists(repo, sha),
+  });
 }
 
 const commitExists = (repo, sha) => _commitExists(repo, sha);
