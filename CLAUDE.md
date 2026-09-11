@@ -108,13 +108,24 @@ repeats the bug. An adversarial audit found six such bugs in one release
 
 What survives of the old pass, and why:
 
-- `lexKitSource` + `sliceTopLevel` + the chunking still run — the surface
-  derivation and the full-surface `export`-strip (`strippedBody`) need to
-  tell code from comments and template literals, and the shake path keeps
-  them purely for their refusals. Those refusals (non-declaration top-level
-  statement, missing `;` before a fresh statement, `}` followed by `/`,
-  destructuring in a later declarator) are LOUD failures, the acceptable
-  kind — none of them can silently drop code anymore.
+- `lexKitSource` + `sliceTopLevel` still run — the surface derivation and the
+  full-surface `export`-strip (`strippedBody`) need to tell code from comments
+  and template literals, and the shake path keeps them purely for their
+  refusals. Those refusals (non-declaration top-level statement, missing `;`
+  before a fresh statement, `}` followed by `/`, destructuring in a later
+  declarator) are LOUD failures, the acceptable kind — none of them can
+  silently drop code anymore.
+- **The chunker is down to a preamble reader** (0.21.6,
+  `readPreambleAndAccount`). It used to build a chunk per statement — attached
+  comments, kind, declared names — for the hand-written shaker; once esbuild
+  reprinted the surviving declarations, the only caller destructured
+  `{ preamble }` and every other field went unread, comment attribution
+  (`splitAtFirstBlank`) included. What is left is the file-top preamble
+  (esbuild's bundle drops it, so it is re-attached by hand) and the walk over
+  every statement that makes `declaredNames` fire its destructuring refusal
+  before a byte is emitted. Removing the rest changed no consumer's vendored
+  bytes: all 33 committed copies across the eight consumers regenerate
+  identically.
 - **Policy regions are ordinary code in narrowed builds** (0.20.0). Through
   0.19.x a placeholder/graft/analysis apparatus (~200 lines) kept
   `@jfs-sanitizer-policy:` regions byte-exact inside narrowed output, for
