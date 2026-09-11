@@ -54,9 +54,16 @@ concurrency:
   group: jfs-release-${{ github.repository }}
   cancel-in-progress: false
 
+# Cap the token here as well as in the caller: a called workflow inherits the
+# caller's grant, and the other three reusable workflows all declare their own
+# ceiling. `gh release create` needs exactly contents: write.
+permissions:
+  contents: write
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Only tag a commit CI went green on. A manual dispatch skips the gate on
     # purpose — that is the backfill path for a version that shipped before
     # this workflow existed, or whose push fired no workflows (a bump PR

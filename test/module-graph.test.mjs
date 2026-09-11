@@ -179,6 +179,21 @@ test('listModuleFiles walks recursively and honours file AND directory excludes'
     }
 });
 
+test('listModuleFiles follows symlinked files and directories', () => {
+    // A Dirent answers false to both isFile() and isDirectory() for a symlink,
+    // so a walk that trusted it dropped linked modules from the orphan check.
+    const dir = scratch({ 'js/app.js': '', 'shared/util.js': '' });
+    try {
+        fs.symlinkSync(path.join(dir, 'shared'), path.join(dir, 'js/shared'), 'dir');
+        fs.symlinkSync(path.join(dir, 'shared/util.js'), path.join(dir, 'js/linked.js'), 'file');
+        const files = listModuleFiles({ root: dir, dirs: ['js'] })
+            .map((p) => path.relative(dir, p).split(path.sep).join('/'));
+        assert.deepEqual(files, ['js/app.js', 'js/linked.js', 'js/shared/util.js']);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test('listModuleFiles refuses a directory that does not exist', () => {
     // A renamed or mistyped `dirs` entry must fail the gate, not turn the
     // orphan check into a vacuous pass.

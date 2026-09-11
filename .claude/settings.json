@@ -3,8 +3,11 @@
     "defaultMode": "acceptEdits",
     "deny": [
       "Bash(sudo:*)",
-      "Bash(git push --force *)",
-      "Bash(git push -f *)"
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push * --force*)",
+      "Bash(git push * -f*)",
+      "Bash(git push * +*)"
     ],
     "allow": [
       "Bash(git status:*)",
@@ -77,7 +80,6 @@
       "Bash(readlink:*)",
       "Bash(which:*)",
       "Bash(command:*)",
-      "Bash(env:*)",
       "Bash(pwd)",
       "Bash(cd:*)",
       "Bash(test:*)",

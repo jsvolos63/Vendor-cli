@@ -185,8 +185,13 @@ export function listModuleFiles(options = {}) {
         for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
             const full = path.join(dir, e.name);
             if (isUnder(full, exclude)) continue;
-            if (e.isDirectory()) walk(full);
-            else if (e.isFile() && exts.includes(path.extname(e.name))) out.push(full);
+            // stat, not the Dirent: a Dirent answers false to both isFile()
+            // and isDirectory() for a symlink, so a linked module or
+            // directory would silently drop out of the orphan check — the
+            // same vacuous pass the missing-directory throw below refuses.
+            const st = fs.statSync(full);
+            if (st.isDirectory()) walk(full);
+            else if (st.isFile() && exts.includes(path.extname(e.name))) out.push(full);
         }
     };
     for (const dir of options.dirs || []) {

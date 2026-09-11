@@ -87,6 +87,12 @@ jobs:
   checks:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    defaults:
+      run:
+        # `bash -eo pipefail` for every step, including the caller's `run`
+        # block. The implicit shell is `bash -e` without pipefail, so a check
+        # written as `npm test | tee log` reported green when npm test failed.
+        shell: bash
     env:
       # vendor-cli's own CI validates against the PR's canonical text, not
       # main's — everyone else runs the family tooling from a main checkout.
@@ -118,8 +124,9 @@ jobs:
         if: inputs.verify-kit-pins
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          node --input-type=module -e "const { verifyKitPins } = await import(process.cwd() + '/' + process.env.JFS_VENDOR_CLI_DIR + '/index.mjs'); const n = await verifyKitPins(); console.log('kit-pin-check: all ' + n + ' kit pin(s) resolve.');"
+        # The same gate consumers get as the `jfs-check-kit-pins` bin — one
+        # spelling, not an inline re-implementation of it.
+        run: node "$JFS_VENDOR_CLI_DIR/bin/check-kit-pins.mjs"
 
       - name: Install dependencies
         if: inputs.install-command != ''
@@ -169,9 +176,9 @@ jobs:
       # authenticated git/API calls (e.g. JFS-Sports fetching its ws-data
       # branch) — the checkout above deliberately strips remote credentials,
       # and `github.token` is not interpolatable in a caller's `with:` block,
-      # so this is the one place it can reach the run commands. Scope stays
-      # whatever the caller's `permissions:` grants (contents: read
-      # family-wide).
+      # so this is the one place it can reach the run commands. Its scope is
+      # capped at `contents: read` by this workflow's own `permissions:`
+      # block, whatever the caller grants.
       - name: Run checks
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -193,6 +200,10 @@ jobs:
           GUARD_PATHS: ${{ inputs.version-guard-paths }}
         run: |
           BASE="origin/${GITHUB_BASE_REF}"
+          # GUARD_PATHS is a space-separated list, so the unquoted expansion is
+          # deliberate — but `set -f` keeps it a word split only, not a glob
+          # against the workspace.
+          set -f
           if git diff --quiet "$BASE...HEAD" -- $GUARD_PATHS; then
             echo "guarded paths unchanged - no bump required"
             exit 0

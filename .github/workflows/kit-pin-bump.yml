@@ -127,12 +127,31 @@ permissions:
   contents: write
   pull-requests: write
 
+# Two runs (a schedule and a dispatch) racing on the same `auto/kit-pin-bump`
+# branch would each open/update the PR and fight over the merge; queue them.
+concurrency:
+  group: jfs-kit-pin-bump-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   bump:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    defaults:
+      run:
+        # An explicit `shell: bash` runs every step as `bash -eo pipefail`;
+        # the implicit default is `bash -e` only, so a failing left-hand side
+        # of a pipe inside a caller's check-command was swallowed — and that
+        # command is the ONLY validation a bump gets before it merges.
+        shell: bash
     steps:
       - uses: actions/checkout@v5
+        with:
+          # The install steps below run npm lifecycle scripts from kit commits
+          # that were resolved seconds ago and reviewed by nobody. Don't leave
+          # the contents+pull-requests write token in .git/config for them;
+          # create-pull-request pushes with the token it is handed explicitly.
+          persist-credentials: false
 
       - uses: actions/setup-node@v5
         with:
@@ -202,6 +221,7 @@ jobs:
         # third-party account. Bump the SHA deliberately.
         uses: peter-evans/create-pull-request@84ae59a2cdc2258d6fa0732dd66352dddae2a412 # v7.0.9
         with:
+          token: ${{ github.token }}
           branch: auto/kit-pin-bump
           commit-message: "Bump @jfs kit pins to current HEADs; re-vendor"
           title: "Bump @jfs kit pins to current HEADs"
