@@ -15,6 +15,12 @@ jobs:
   family-ci:
     uses: ./.github/workflows/family-ci.yml
     with:
+      # Dogfoods the input this repo ships. It resolves to the same 22 the
+      # default would have given, so CI's Node is unchanged — but the new code
+      # path is now exercised by this repo's own run, which (via `uses: ./…`)
+      # is the edited copy. A PR that breaks the file path, the precedence, or
+      # the expression fails HERE rather than in thirteen consumers' next run.
+      node-version-file: .nvmrc
       # esbuild (the narrowing bundler, exact-pinned) must be installed for
       # the tree-shaking tests; the suite imports index.mjs directly.
       install-command: npm install
