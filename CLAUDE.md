@@ -38,7 +38,7 @@ in-workflow because default-token PRs never trigger pull_request CI),
 `install-command` (default `npm ci`), `vendor-sync-command`,
 `claude-md-sync-command` and `version-bump-command` ('' skips any),
 `node-version` (default 22), `auto-merge` (default true), `soft-fail`
-(default false), `pr-body-extra`.
+(default false), `release-title` ('' skips), `pr-body-extra`.
 
 The `claude-md-sync-command` step (default: `npm install` then
 `npx --no-install jfs-claude-md-sync`) is how the canonical
@@ -52,6 +52,27 @@ session re-synced them by hand. The re-install in the default matters:
 syncing from a stale pinned copy could regress the block, which is worse
 than skipping. It is a BACKSTOP, not the delivery — see "The canonical
 family-conventions text" below for why the sync cannot wait for Monday.
+
+**The bump tags the version it lands, because nothing else can.** The merge
+this workflow makes is a default-`GITHUB_TOKEN` merge, and a `GITHUB_TOKEN`
+push fires no workflows — the same fact that forces the check step to run the
+repo's CI itself, one layer up. So the merged commit gets no CI run on main,
+no `workflow_run` reaches the repo's Release workflow, and `release.yml`,
+gated on exactly that run, never fires. Measured on 2026-09-22: **fifteen
+versions had landed on main untagged**, every one of them a Monday pin bump —
+Weather 6, Art-Gallery- 3, John's News 2, market-monitor 2, Surf-Tracker 2.
+A second `gh release create` here would have been a second set of rules about
+what may be tagged, so the `release` job CALLS `release.yml` instead (nested
+`workflow_call`), handing it the squash commit `gh pr merge` just made. Three
+things hold it together: the caller opts in with `release-title` (a repo with
+no Release workflow must not be tagged out of a `package.json` that does not
+name its app version — BearsMockDraft's carries no `version` field at all, its
+app version being `js/version.js`); the sha comes from
+`gh pr view --json mergeCommit`, not from "the head of main now", which would
+race whatever merged next; and `release.yml` still refuses a version whose tag
+exists, so a kit caller — which bumps no version — simply no-ops. With
+`auto-merge: false` nothing is skipped that matters: a human's merge fires CI
+and the ordinary gated path tags it.
 
 The important behavior change vs. the old copies: a blocked auto-merge of a
 validated bump **fails the run** instead of emitting an invisible
@@ -247,7 +268,7 @@ trigger tagged and published a release for a red main". **Six of the seven
 could still do that** — including this repo. The reusable workflow is the
 union, so consolidating propagates that fix to every consumer at once.
 
-Two details worth not undoing:
+Four details worth not undoing:
 
 - **The CI gate reads the caller's event.** A called workflow inherits the
   triggering event, so `github.event.workflow_run.conclusion` works here even
@@ -261,6 +282,16 @@ Two details worth not undoing:
   repository's default branch, because a caller that forgets would otherwise
   tag a feature-branch commit and publish a release from unmerged work. Manual
   dispatch is exempt: that ref is chosen deliberately.
+- **`ref` is the third path in, and it is not a trigger.** A sibling
+  automation that has just merged a version bump calls this workflow with
+  `ref:` set to that commit, and the CI gate steps aside — because the merge
+  it made is precisely the one that announced nothing for the gate to read
+  (see "Kit pin bump" above). Nobody else can reach it: a called workflow runs
+  against the CALLER's repository with the caller's token, so the only ref a
+  caller can hand over is one of its own. `ref` also wins over
+  `workflow_run.head_sha` for the checkout and the tag target, for the reason
+  that pinning exists at all — the tag lands on the commit that was validated,
+  never on a newer one.
 - **The existence check is advisory, not a lock.** The concurrency group
   serialises one repo's runs, but a tag can still arrive between the check and
   the create, so a failed `gh release create` re-checks and treats "it exists

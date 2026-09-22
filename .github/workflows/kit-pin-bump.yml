@@ -35,6 +35,19 @@
 #           npm run check
 #           npm test
 #
+# A caller whose repo has a Release workflow ALSO passes the title that
+# workflow uses:
+#
+#         release-title: 'Weather Maps'
+#
+# and the version this bump lands gets tagged. Without it the bump merges and
+# the tag never happens: the merge is made with the default GITHUB_TOKEN, which
+# fires no push workflows, so the repo's CI never runs on the merged commit and
+# release.yml — gated on that CI run — never fires. Measured on 2026-09-22:
+# fifteen versions had landed on main untagged that way, every one of them a
+# Monday pin bump (Weather 6, Art-Gallery- 3, John's News 2, market-monitor 2,
+# Surf-Tracker 2).
+#
 # A KIT caller (a repo with no vendor:sync and no version:stamp — its semver
 # tracks index.js + bin) must ALSO pass:
 #
@@ -117,6 +130,15 @@ on:
           a stuck bump should be loud, not a warning nobody reads.
         type: boolean
         default: false
+      release-title:
+        description: >-
+          Release title prefix for the version this bump lands — the same
+          string the repo's own Release workflow passes as `title`, so a tag
+          reads the same however it was made. '' skips the release job, which
+          is right for a repo with no Release workflow. Harmless when the
+          version did not move: release.yml exits 0 on a tag that exists.
+        type: string
+        default: ''
       pr-body-extra:
         description: Extra Markdown appended to the PR body (e.g. manual
           re-vendor instructions for copy-in consumers)
@@ -137,6 +159,11 @@ jobs:
   bump:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      # The commit the squash-merge put on the default branch, and the only
+      # thing the release job below needs from this one. Empty whenever no
+      # merge happened (no pin moved, auto-merge off, the merge was blocked).
+      merge-sha: ${{ steps.merge.outputs.merge-sha }}
     defaults:
       run:
         # An explicit `shell: bash` runs every step as `bash -eo pipefail`;
@@ -261,6 +288,7 @@ jobs:
       # exactly how pins silently drift, so it must be a red run, not a
       # warning (soft-fail: true restores the old behavior).
       - name: Merge the validated pin-bump PR
+        id: merge
         if: inputs.auto-merge && (steps.cpr.outputs.pull-request-operation == 'created' || steps.cpr.outputs.pull-request-operation == 'updated')
         env:
           GH_TOKEN: ${{ github.token }}
@@ -269,9 +297,58 @@ jobs:
         run: |
           if gh pr merge --squash --delete-branch "$PR_URL"; then
             echo "Pin-bump PR merged: $PR_URL"
+            # Name the squash commit for the release job. `gh pr view` says
+            # exactly which commit landed, where "the head of the default
+            # branch now" would race whatever merged next — and GitHub fills
+            # mergeCommit a moment after the merge returns, so read it more
+            # than once before giving up.
+            SHA=''
+            for _ in 1 2 3; do
+              CANDIDATE=$(gh pr view "$PR_URL" --json mergeCommit --jq '.mergeCommit.oid // ""' || echo '')
+              if [ ${#CANDIDATE} -eq 40 ] && [ -z "${CANDIDATE//[0-9a-f]/}" ]; then
+                SHA="$CANDIDATE"
+                break
+              fi
+              sleep 3
+            done
+            if [ -n "$SHA" ]; then
+              echo "merge-sha=$SHA" >> "$GITHUB_OUTPUT"
+              echo "Merged as $SHA"
+            else
+              # Loud, but not fatal: the bump itself landed, and failing the
+              # run here would report the merge as broken when only the tag is.
+              echo "::error::Merged $PR_URL but could not read its squash commit, so this version will not be tagged. Dispatch the repo's Release workflow to tag it."
+            fi
           elif [ "$SOFT_FAIL" = "true" ]; then
             echo "::warning::Auto-merge failed (branch protection or conflict) — review and merge manually: $PR_URL"
           else
             echo "::error::Auto-merge of the validated pin-bump PR failed (branch protection, a conflict, or a permissions gap). The bump is stuck at $PR_URL — merge it manually or fix the blocker. Left unmerged, this repo's kit pins silently drift from the family."
             exit 1
           fi
+
+  # Tag the version this bump just merged.
+  #
+  # The merge above is made with the default GITHUB_TOKEN, and a GITHUB_TOKEN
+  # push fires no workflows — the same fact the check step exists for, one
+  # layer up. So the merged commit gets no CI run on the default branch, no
+  # `workflow_run` reaches the repo's Release workflow, and the version this
+  # workflow bumped is never tagged. That is not hypothetical: fifteen versions
+  # across five repos had landed untagged, every one of them a Monday pin bump.
+  #
+  # So call release.yml here rather than waiting for a trigger that cannot
+  # come, naming the exact commit that landed. It is the SAME workflow the repo
+  # releases through normally — a second spelling of `gh release create` in
+  # this file would be a second set of rules about what may be tagged — and it
+  # still refuses to tag a version whose tag exists, so a kit caller (no
+  # version bump) simply no-ops.
+  #
+  # Skipped when the caller names no title, when nothing merged, and when
+  # auto-merge is off: there the human's own merge fires CI, and the ordinary
+  # CI-gated path tags it.
+  release:
+    needs: bump
+    if: inputs.release-title != '' && needs.bump.outputs.merge-sha != ''
+    uses: jsvolos63/vendor-cli/.github/workflows/release.yml@main
+    with:
+      title: ${{ inputs.release-title }}
+      ref: ${{ needs.bump.outputs.merge-sha }}
