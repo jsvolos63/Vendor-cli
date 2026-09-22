@@ -94,6 +94,24 @@ on:
         description: Check CLAUDE.md carries the current family-conventions block
         type: boolean
         default: true
+      maintenance-check:
+        description: >-
+          Check MAINTENANCE.md carries the current family-maintenance block.
+
+          OPT-IN, default false, for the same reason node-version-file is: this
+          gate is checked against vendor-cli MAIN rather than the caller's pin,
+          so the moment the canonical text changes here every consumer that
+          opted in goes red until it re-syncs. A repo turns it on in the same
+          PR that adds its MAINTENANCE.md, and a new repo joining the family is
+          never instantly red for a file it has not written yet.
+
+          jfs-maintenance-sync refuses to CREATE MAINTENANCE.md — the file is
+          half canonical and half repo-specific, and one holding only the family
+          block would pass this gate while documenting nothing — so turning this
+          on without writing the repo-specific half fails with that message
+          rather than stamping a hollow file as compliant.
+        type: boolean
+        default: false
       run:
         description: Newline-separated check commands, run in order (fail-fast)
         type: string
@@ -131,7 +149,7 @@ jobs:
           persist-credentials: false
 
       - uses: actions/checkout@v5
-        if: (inputs.verify-kit-pins || inputs.claude-md-check) && github.repository != 'jsvolos63/vendor-cli'
+        if: (inputs.verify-kit-pins || inputs.claude-md-check || inputs.maintenance-check) && github.repository != 'jsvolos63/vendor-cli'
         with:
           repository: jsvolos63/vendor-cli
           path: .jfs-family/vendor-cli
@@ -173,6 +191,20 @@ jobs:
       - name: Check CLAUDE.md family conventions are in sync
         if: inputs.claude-md-check
         run: node "$JFS_VENDOR_CLI_DIR/bin/claude-md-sync.mjs" --check
+
+      - name: Check MAINTENANCE.md family maintenance protocol is in sync
+        if: inputs.maintenance-check
+        run: node "$JFS_VENDOR_CLI_DIR/bin/maintenance-sync.mjs" --check
+
+      # The other half of the same gate. The sync check above proves the
+      # CANONICAL block is current; this proves the REPO-SPECIFIC half is still
+      # true of the repo — that every `npm run` it names is a real script, every
+      # workflow and path it names exists, and every cron it quotes is the cron
+      # that actually fires. A maintenance doc is trusted, so a stale claim in
+      # one is worse than a gap: a session follows it instead of looking.
+      - name: Check MAINTENANCE.md still describes this repo
+        if: inputs.maintenance-check
+        run: node "$JFS_VENDOR_CLI_DIR/tools/maintenance-doc-check.mjs"
 
       # vendor:check must be vendor:sync with `--check` appended per stage —
       # the two are hand-duplicated command chains in every consumer's

@@ -21,6 +21,10 @@ jobs:
       # is the edited copy. A PR that breaks the file path, the precedence, or
       # the expression fails HERE rather than in thirteen consumers' next run.
       node-version-file: .nvmrc
+      # Dogfoods the other input this repo ships: both maintenance gates run
+      # here against this repo's own MAINTENANCE.md and its own tooling, so a
+      # PR that breaks either fails HERE rather than in the consumers.
+      maintenance-check: true
       # esbuild (the narrowing bundler, exact-pinned) must be installed for
       # the tree-shaking tests; the suite imports index.mjs directly.
       install-command: npm install
@@ -29,4 +33,4 @@ jobs:
         npm test
       # family/ ships in the package (the canonical CLAUDE.md block), so its
       # edits need a version bump like any shipped-module change.
-      version-guard-paths: index.mjs bin family
+      version-guard-paths: index.mjs bin family tools

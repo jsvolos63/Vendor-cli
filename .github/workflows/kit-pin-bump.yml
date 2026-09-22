@@ -212,6 +212,22 @@ jobs:
       # required rather than optional.
       - name: Run the repo's CI checks against the bumped tree
         if: steps.diff.outputs.changed == 'true' && inputs.check-command != ''
+        env:
+          # Same export, for the same reason, as family-ci.yml puts on its own
+          # `run` step: the checkout above is persist-credentials: false, so a
+          # check that has to reach GitHub itself — fetching a private orphan
+          # data branch is the family's case — has no credential unless this
+          # workflow hands it one, and `github.token` is not interpolatable in
+          # a caller's `with:` block, so the caller cannot supply it either.
+          #
+          # This was missing here while family-ci had it, so the SAME
+          # check-command passed in CI and failed in the bump. It cost
+          # JFS-Sports four consecutive silent weekly bumps: `ws:data:fetch`
+          # died on `fatal: could not read Username for 'https://github.com'`
+          # 16 seconds in, before the PR step, so the repo's kit pins sat
+          # behind every sibling's while its workflow page said only
+          # "failure". Keep the two workflows' check steps in step.
+          GITHUB_TOKEN: ${{ github.token }}
         run: ${{ inputs.check-command }}
 
       - name: Open a pull request if anything changed

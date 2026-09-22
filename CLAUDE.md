@@ -3,11 +3,13 @@
 Shared dev CLI for the `@jfs` kit family — the vendoring generator
 (esm/global/cjs, surface derived from the kit's own exports) plus the
 consolidated kit-pin bumper (`jfs-bump-kit-pins`), kit-pin existence
-pre-flight, version stamper (`jfs-version-stamp`), and CLAUDE.md
-family-conventions synchronizer (`jfs-claude-md-sync`) the consumers used
-to each hand-roll. Every consuming repo's `vendor:sync` / `vendor:check` /
-`version:stamp` script runs a bin from here, so a breaking change lands in
-every app's CI at once.
+pre-flight, version stamper (`jfs-version-stamp`), and the two canonical-text
+synchronizers (`jfs-claude-md-sync` for CLAUDE.md's family conventions,
+`jfs-maintenance-sync` for MAINTENANCE.md's family maintenance protocol) the
+consumers used to each hand-roll. It also hosts the family's own monitoring —
+see "Who watches the watchers" below. Every consuming repo's `vendor:sync` /
+`vendor:check` / `version:stamp` script runs a bin from here, so a breaking
+change lands in every app's CI at once.
 
 ## Family CI (`.github/workflows/family-ci.yml`)
 
@@ -287,6 +289,111 @@ nothing the tag does not), and every other action is pinned by full SHA
 with the version in a trailing comment — `peter-evans/create-pull-request`
 in `kit-pin-bump.yml` is the model. The monthly `github-actions` Dependabot
 entry is what keeps both shapes fresh.
+
+## The canonical family-maintenance text, and the two gates on it
+
+`family/maintenance.md` is the second canonical text, beside
+`family/family-conventions.md`, and it works the same way: every repo's
+`MAINTENANCE.md` carries it verbatim between `<!-- jfs-family-maintenance:start
+… -->` / `:end` markers, rewritten wholesale by `jfs-maintenance-sync`. It holds
+what is true of EVERY repo — what the four reusable workflows land and the three
+gaps they leave, the four cadences, the major-bump triage and its classes of
+proof, "Green CI is not delivered", and what a maintenance session must not do.
+The repo-specific half — that repo's own automation inventory, its upstreams,
+its invariants, its diagnosis ladder, its deferred majors and its run log — is
+hand-written above the block.
+
+`claudeMdSync` and `maintenanceSync` are one `syncMarkedBlock` pass with
+different arguments, so the marker handling and the mangled-marker refusal
+cannot drift between them. `test/maintenance-sync.test.mjs` pins one property
+the CLAUDE.md twin does not need: **the two marker pairs must never be a
+substring of one another**, or one sync would find the other's block and eat it.
+
+**`jfs-maintenance-sync` refuses to CREATE `MAINTENANCE.md`**, where its twin
+happily appends to a CLAUDE.md that lacks a block. The file is half canonical
+and half repo-specific, and one holding only the family block would satisfy the
+gate while documenting nothing — the hollow pass the protocol's own "do not let
+a check pass quietly" rule forbids. Write the repo-specific half first.
+
+Two family-CI steps enforce it, both behind ONE opt-in input,
+`maintenance-check`:
+
+- `bin/maintenance-sync.mjs --check` — the canonical block is current.
+- `tools/maintenance-doc-check.mjs` — the repo-specific half is still TRUE of
+  the repo: every `npm run` it names is a real script, every workflow and path
+  it names exists, every cron it quotes is the cron that actually fires. A
+  maintenance doc is trusted, so a stale claim in one is worse than a gap — a
+  session follows it instead of looking. Deliberate mentions of things that do
+  NOT exist (recording an absence is one of the most useful things such a doc
+  does) go in a `<!-- maintenance-check:allow` block, and **an entry with no
+  reason after `#` is itself a finding**. Inline code outside fenced blocks is
+  not scanned for paths, on purpose: docs name modules, globs and identifiers
+  that are not files, and a check with false positives gets disabled.
+
+`maintenance-check` defaults **false**, unlike `claude-md-check`'s true, for the
+reason spelled out under "The canonical family-conventions text" below: these
+gates run against vendor-cli MAIN rather than the consumer's pin, so the moment
+the canonical text changes here, every opted-in consumer goes red until it
+re-syncs. A repo opts in in the same PR that adds its `MAINTENANCE.md`, and a
+repo joining the family is never instantly red for a file it has not written.
+The same rule applies to editing `family/maintenance.md`: the edit and the
+re-sync of every consumer are ONE piece of work, in the same session.
+
+## Who watches the watchers (`tools/family-liveness.mjs`)
+
+The four reusable workflows keep fourteen repos maintained with the owner away,
+which makes a silent failure IN them the highest-severity failure mode in the
+family — and nothing watched them. A scheduled run that fails produces no
+issue, no comment and no message anyone reads.
+
+Measured on 2026-09-22: the weekly kit-pin bump had failed on **every**
+scheduled run for four to five weeks in four repos, from two unrelated causes,
+in silence.
+
+- **pwa-kit, fetch-kit, Netlify-kit** each resolved the pins, re-vendored,
+  committed and PUSHED `auto/kit-pin-bump` — then could not open a pull request
+  (`GitHub Actions is not permitted to create or approve pull requests`, a
+  per-repo setting under Settings → Actions → General). Correct work delivered
+  nowhere, three times over. Their `@jfs/vendor-cli` pins sat at 0.21.3 against
+  0.21.6, and because each kit's vendor shim resolves the CLI from INSIDE the
+  kit, every consumer re-vendoring those kits ran a stale generator.
+- **JFS-Sports** died 16 seconds in, before the PR step: its check-command
+  starts with the `fetch-data.mjs` scripts, which git-fetch a private orphan
+  branch, and `kit-pin-bump.yml` did not export `GITHUB_TOKEN` to its check step
+  while `family-ci.yml` did — so the SAME command passed in CI and failed in the
+  bump. Fixed here; the env block is on both workflows' check steps now, and
+  the comment on each says to keep them in step.
+
+The section above this one already records this class happening once before
+(three kits dying on `Missing script: "vendor:sync"` for two weeks) and being
+fixed at the source. It recurred anyway, by a different mechanism, because **a
+fix is not a monitor.** So `tools/family-liveness.mjs` asks the protocol's four
+weekly questions mechanically across every repo: did each repo's last
+*scheduled* run of each workflow succeed (per workflow, not per repo — a repo
+whose CI is green while one cron has failed for a month reads healthy otherwise);
+is any `auto/*` branch stranded with no PR; is any `@jfs/*` pin more than one
+commit behind its kit's default branch; is any bot PR older than a week.
+
+`.github/workflows/family-liveness.yml` runs it Mondays 08:10 UTC —
+deliberately ~90 minutes after the 06:41 bump, so it observes THIS week's run —
+and opens ONE rolling issue here when something needs a session. One issue in
+the hub rather than a notification in thirteen repos: per-repo notifications
+would need an `issues: write` grant in each, and the notifier's own failure
+would be silent. The run itself also goes red, because a green run with an
+issue attached is the same invisible signal again.
+
+Three properties not to undo:
+
+- **It needs a PAT** (`FAMILY_READ_TOKEN`; read on contents, actions,
+  pull-requests). A repo-scoped `GITHUB_TOKEN` cannot see its siblings.
+- **No `npm ci`.** The script is dependency-free so a broken lockfile or a
+  failed install can never blind the monitor — the same reasoning as
+  Surf-Tracker's health check, written after a 54-day silent content outage.
+- **Exit 2 is COULD NOT CHECK, and outranks a clean result.** No token,
+  insufficient scope, or an API failure exits 2, never 0, and a partial look
+  never reports the family healthy on the strength of the repos it did read.
+  `test/family-liveness.test.mjs` pins that, because an unconfigured monitor
+  reporting success is the one failure mode that makes it worse than nothing.
 
 ## Kit extraction policy (the bar for kit #6)
 

@@ -37,7 +37,7 @@ const rules = {
 export default [
   js.configs.recommended,
   {
-    files: ['index.mjs', 'bin/**/*.mjs', 'module-graph/**/*.mjs', 'test/**/*.mjs'],
+    files: ['index.mjs', 'bin/**/*.mjs', 'module-graph/**/*.mjs', 'tools/**/*.mjs', 'test/**/*.mjs'],
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: 'module',
