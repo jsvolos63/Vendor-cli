@@ -25,6 +25,16 @@
 #       with:
 #         title: '@jfs/fetch-kit'
 #
+# A THIRD path is not a trigger at all: a sibling automation that has just
+# MERGED a version bump calls this workflow directly, with `ref:` set to the
+# commit it merged. That covers the case no trigger here can see — a merge made
+# with the default GITHUB_TOKEN fires no push workflows, so the repo's CI never
+# runs on the merged commit, so no `workflow_run` ever arrives and the version
+# is never tagged. kit-pin-bump.yml (this repo) does exactly that. Measured on
+# 2026-09-22 across the family: fifteen versions had landed on main untagged
+# that way, and every single one was a Monday `Bump @jfs kit pins` merge —
+# Weather 6, Art-Gallery- 3, John's News 2, market-monitor 2, Surf-Tracker 2.
+#
 # Edits here land in every consumer's next release — treat them like kit API
 # changes.
 
@@ -43,6 +53,16 @@ on:
         description: JSON file whose `version` field names the release.
         required: false
         default: package.json
+        type: string
+      ref:
+        description: >-
+          The exact commit to read the version from and to tag. Set by a
+          sibling automation that has just merged a validated commit whose
+          push could announce nothing (kit-pin-bump.yml); '' leaves the two
+          ordinary paths — the commit the green CI run validated, or the ref
+          a manual dispatch chose.
+        required: false
+        default: ''
         type: string
 
 # Back-to-back merges to main are the normal case (auto-merged bump PRs), and
@@ -79,8 +99,17 @@ jobs:
     # branch is literally named `main` would satisfy that test alone — then
     # get a release tagged from its own package.json. So the run's head
     # repository must be this repository too.
+    #
+    # An explicit `ref` skips the CI gate for the dispatch's reason, and is the
+    # automatic half of that backfill: the caller has named ONE commit, which
+    # it merged only after running the repo's own checks against it — precisely
+    # because the merge it made announced nothing for the gate to read. Nobody
+    # else can reach this path: a called workflow runs against the CALLER's
+    # repository with the caller's token, so the only ref a caller can hand us
+    # is one of its own.
     if: >-
-      github.event_name == 'workflow_dispatch'
+      inputs.ref != ''
+      || github.event_name == 'workflow_dispatch'
       || (github.event.workflow_run.conclusion == 'success'
           && github.event.workflow_run.head_branch == github.event.repository.default_branch
           && github.event.workflow_run.head_repository.full_name == github.repository)
@@ -89,8 +118,11 @@ jobs:
         with:
           # On workflow_run the default checkout is the branch head at trigger
           # time — pin to the commit the green CI run actually validated, so
-          # the tag cannot land on a newer, unvalidated push.
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          # the tag cannot land on a newer, unvalidated push. A caller-supplied
+          # `ref` wins over both for the same reason: it names the one commit
+          # that was merged, where "the head of main now" would race whatever
+          # merged next.
+          ref: ${{ inputs.ref || github.event.workflow_run.head_sha || github.sha }}
           # Only package.json is read after this; don't leave a contents:write
           # credential sitting in .git/config for the later steps.
           persist-credentials: false
@@ -98,7 +130,7 @@ jobs:
       - name: Create the release when the version is new
         env:
           GH_TOKEN: ${{ github.token }}
-          TARGET_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          TARGET_SHA: ${{ inputs.ref || github.event.workflow_run.head_sha || github.sha }}
           TITLE: ${{ inputs.title }}
           VERSION_FILE: ${{ inputs.version-file }}
         run: |
