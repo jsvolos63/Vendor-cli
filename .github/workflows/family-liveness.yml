@@ -1,0 +1,98 @@
+# Family automation liveness — the one job that watches the other jobs.
+#
+# The family's four reusable workflows keep fourteen repos maintained with the
+# owner away. Nothing watched THEM. A scheduled run that fails produces no
+# issue, no comment and no message anyone reads, and on 2026-09-22 the weekly
+# kit-pin bump was found to have failed on every scheduled run for four to five
+# weeks in four repos, from two unrelated causes, in silence — three of them
+# having pushed a correct bump to a branch no pull request was ever opened for.
+#
+# This runs `tools/family-liveness.mjs` across every repo and opens ONE issue
+# HERE when something needs a session. One issue in the hub, not a notification
+# in thirteen repos: a notification per repo would need an `issues: write` grant
+# in each of them, and the failure of the notifier would itself be silent.
+#
+# Runs Mondays 08:10 UTC — deliberately ~90 minutes after the 06:41 kit-pin
+# bump, so it observes THIS week's bump rather than last week's.
+#
+# NO `npm ci`. The script is dependency-free for exactly this reason: a broken
+# lockfile or a failed install must never be able to blind the monitor. Same
+# principle as Surf-Tracker's health check, which was written after a 54-day
+# silent content outage.
+name: Family liveness
+
+on:
+  schedule:
+    - cron: '10 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: family-liveness
+  cancel-in-progress: false
+
+jobs:
+  liveness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Check every repo's automation
+        id: check
+        env:
+          # A repo-scoped GITHUB_TOKEN cannot see its siblings, so this is the
+          # one job in the family that needs a PAT (read: contents, actions,
+          # pull-requests on the owner). Without it the script exits 2 and the
+          # step below fails the run — an unconfigured monitor must never read
+          # as a healthy family.
+          FAMILY_READ_TOKEN: ${{ secrets.FAMILY_READ_TOKEN }}
+        run: |
+          set +e
+          node tools/family-liveness.mjs --markdown > report.md
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          cat report.md
+
+      - name: Open or update the liveness issue
+        if: steps.check.outputs.status == '1' || steps.check.outputs.status == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUS: ${{ steps.check.outputs.status }}
+        run: |
+          set -euo pipefail
+          title="Family automation liveness: attention needed"
+          # One rolling issue, not one per week: a new issue every Monday would
+          # train everyone to close them unread, which is the failure this whole
+          # job exists to prevent.
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          {
+            if [ "$STATUS" = "2" ]; then
+              echo "> **The check could not complete.** This is not a clean bill of health —"
+              echo "> see \`FAMILY_READ_TOKEN\` under the job's env."
+              echo
+            fi
+            cat report.md
+          } > body.md
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file body.md
+          else
+            gh issue create --title "$title" --body-file body.md
+          fi
+
+      # The run itself must be red, not merely commented on: a green run with an
+      # issue attached is the same invisible signal all over again.
+      - name: Fail the run when something needs attention
+        if: steps.check.outputs.status != '0'
+        run: |
+          echo "family-liveness exited ${{ steps.check.outputs.status }} (1 = needs attention, 2 = could not check)."
+          exit 1

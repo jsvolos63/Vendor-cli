@@ -1940,49 +1940,95 @@ const FAMILY_START =
   '<!-- jfs-family-conventions:start — managed by jfs-claude-md-sync; edit family/family-conventions.md in @jfs/vendor-cli -->';
 const FAMILY_END = '<!-- jfs-family-conventions:end -->';
 
-export function familyConventionsBlock() {
-  const body = readFileSync(
-    new URL('./family/family-conventions.md', import.meta.url),
-    'utf8'
-  ).trim();
-  return `${FAMILY_START}\n\n${body}\n\n${FAMILY_END}`;
+const MAINT_START =
+  '<!-- jfs-family-maintenance:start — managed by jfs-maintenance-sync; edit family/maintenance.md in @jfs/vendor-cli -->';
+const MAINT_END = '<!-- jfs-family-maintenance:end -->';
+
+function canonicalBlock(name, startMarker, endMarker) {
+  const body = readFileSync(new URL(`./family/${name}`, import.meta.url), 'utf8').trim();
+  return `${startMarker}\n\n${body}\n\n${endMarker}`;
 }
 
-export function claudeMdSync(rootDir = process.cwd(), argv = []) {
-  const check = argv.includes('--check');
+export function familyConventionsBlock() {
+  return canonicalBlock('family-conventions.md', FAMILY_START, FAMILY_END);
+}
+
+export function familyMaintenanceBlock() {
+  return canonicalBlock('maintenance.md', MAINT_START, MAINT_END);
+}
+
+// One block-replacement pass, shared by both synchronizers. The two differ
+// only in which file they own, which canonical text fills it, and whether an
+// ABSENT target file is one the tool may create — see `createIfAbsent`.
+function syncMarkedBlock({ tool, rootDir, file, block, start, end, what, createIfAbsent }, isCheck) {
   const fail = (msg) => {
-    console.error(`claude-md-sync: ${msg}`);
+    console.error(`${tool}: ${msg}`);
     process.exit(1);
   };
-  const target = resolve(rootDir, 'CLAUDE.md');
+  const target = resolve(rootDir, file);
   let src;
   try {
     src = readFileSync(target, 'utf8');
   } catch (e) {
-    return fail(`cannot read CLAUDE.md: ${e.message}`);
+    // A file this tool may not create is a deliberate refusal, not a bug: a
+    // MAINTENANCE.md holding only the family block would pass the gate while
+    // saying nothing about the repo, which is the hollow-pass failure the
+    // protocol itself forbids.
+    if (!createIfAbsent && e.code === 'ENOENT') {
+      return fail(
+        `no ${file} — it carries a repo-specific maintenance plan as well as the family ` +
+        'block, so this tool will not create a hollow one. Write the repo-specific half first, then re-run.'
+      );
+    }
+    return fail(`cannot read ${file}: ${e.message}`);
   }
-  const block = familyConventionsBlock();
-  const start = src.indexOf(FAMILY_START);
-  const end = src.indexOf(FAMILY_END);
+  const from = src.indexOf(start);
+  const to = src.indexOf(end);
   let next;
-  if (start === -1 && end === -1) {
+  if (from === -1 && to === -1) {
     // No block yet: append it (sync) — a repo adopting the family flow.
-    if (check) return fail('CLAUDE.md has no family-conventions block — run `jfs-claude-md-sync` and commit the result.');
+    if (isCheck) return fail(`${file} has no ${what} block — run \`${tool}\` and commit the result.`);
     next = src.replace(/\s*$/, '') + '\n\n' + block + '\n';
-  } else if (start === -1 || end === -1 || end < start) {
+  } else if (from === -1 || to === -1 || to < from) {
     // Half a block (or end-before-start) means a hand edit mangled a marker;
     // rewriting around it would duplicate or eat prose, so stop either way.
-    return fail('family-conventions markers are mangled (missing or out-of-order) — restore both markers, then re-run `jfs-claude-md-sync`.');
+    return fail(`${what} markers are mangled (missing or out-of-order) — restore both markers, then re-run \`${tool}\`.`);
   } else {
-    next = src.slice(0, start) + block + src.slice(end + FAMILY_END.length);
+    next = src.slice(0, from) + block + src.slice(to + end.length);
   }
   if (next === src) {
-    console.log('claude-md-sync: CLAUDE.md family conventions in sync.');
+    console.log(`${tool}: ${file} ${what} in sync.`);
     return;
   }
-  if (check) return fail('CLAUDE.md family-conventions block is out of date — run `jfs-claude-md-sync` and commit the result.');
+  if (isCheck) return fail(`${file} ${what} block is out of date — run \`${tool}\` and commit the result.`);
   writeFileSync(target, next);
-  console.log('claude-md-sync: updated the CLAUDE.md family-conventions block.');
+  console.log(`${tool}: updated the ${file} ${what} block.`);
+}
+
+export function claudeMdSync(rootDir = process.cwd(), argv = []) {
+  syncMarkedBlock({
+    tool: 'claude-md-sync',
+    rootDir,
+    file: 'CLAUDE.md',
+    block: familyConventionsBlock(),
+    start: FAMILY_START,
+    end: FAMILY_END,
+    what: 'family-conventions',
+    createIfAbsent: true,
+  }, argv.includes('--check'));
+}
+
+export function maintenanceSync(rootDir = process.cwd(), argv = []) {
+  syncMarkedBlock({
+    tool: 'maintenance-sync',
+    rootDir,
+    file: 'MAINTENANCE.md',
+    block: familyMaintenanceBlock(),
+    start: MAINT_START,
+    end: MAINT_END,
+    what: 'family-maintenance',
+    createIfAbsent: false,
+  }, argv.includes('--check'));
 }
 
 // ---------------------------------------------------------------------------
