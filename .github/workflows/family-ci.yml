@@ -163,7 +163,7 @@ jobs:
           node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
           node-version-file: ${{ inputs.node-version-file }}
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: inputs.python-version != ''
         with:
           python-version: ${{ inputs.python-version }}
