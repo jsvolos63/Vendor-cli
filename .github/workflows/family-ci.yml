@@ -155,7 +155,7 @@ jobs:
           path: .jfs-family/vendor-cli
           persist-credentials: false
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           # setup-node prefers a non-empty `node-version` OVER `node-version-file`,
           # so when the caller names a file, `node-version` must go in empty or
