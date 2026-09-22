@@ -31,6 +31,9 @@ jobs:
       run: |
         npm run lint
         npm test
-      # family/ ships in the package (the canonical CLAUDE.md block), so its
-      # edits need a version bump like any shipped-module change.
-      version-guard-paths: index.mjs bin family tools
+      # Every entry of package.json's `files` — everything a consumer's pin
+      # delivers (the canonical texts, the monitor and doc-check tools, the
+      # module-graph linker four consumer suites import) — so a change to any
+      # of it needs a version bump like any shipped-module change.
+      # test/workflows.test.mjs holds this list to `files`.
+      version-guard-paths: index.mjs bin family tools module-graph
