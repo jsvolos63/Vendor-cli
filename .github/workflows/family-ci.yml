@@ -16,6 +16,10 @@
 #           npm run vendor:check
 #           npm test
 #
+# A repo that already pins Node for its deploy can pass `node-version-file:
+# .nvmrc` instead of `node-version:`, so one file governs CI and the deploy
+# both. It is opt-in — see that input's description.
+#
 # One place to bump an action, tighten a gate, or add a family-wide check.
 # Treat edits here like kit API changes: they land in every repo's next CI
 # run at once. This repo's own test.yml references the workflow locally
@@ -37,9 +41,28 @@ on:
         description: >-
           Node.js version to set up. 22 (Node 20 reached end of life in
           April 2026, and kit-pin-bump.yml has defaulted to 22 all along —
-          the two workflows used to disagree).
+          the two workflows used to disagree). Ignored when
+          node-version-file is set.
         type: string
         default: '22'
+      node-version-file:
+        description: >-
+          Path to a .nvmrc / .node-version in the CALLING repo. When set, that
+          file decides the Node version and `node-version` is ignored, so a
+          repo that already pins Node for its deploy (Netlify reads .nvmrc,
+          and the functions runtime follows the build) stops naming the
+          version a second time here — where the two could drift onto
+          different majors and a green CI run would say nothing about the
+          runtime actually serving the app. That had happened: John's News
+          tested on 22 while its deploy ran Netlify's default 24.
+
+          OPT-IN, and deliberately not "use .nvmrc if one exists": a repo with
+          a stale version file would otherwise have its CI silently retargeted
+          by an edit here, and edits here land in every repo's next run at
+          once. Default '' keeps `node-version` authoritative, so this input
+          is a no-op for every caller that does not set it.
+        type: string
+        default: ''
       python-version:
         description: Python version to set up ('' skips Python)
         type: string
@@ -111,7 +134,11 @@ jobs:
 
       - uses: actions/setup-node@v5
         with:
-          node-version: ${{ inputs.node-version }}
+          # setup-node prefers a non-empty `node-version` OVER `node-version-file`,
+          # so when the caller names a file, `node-version` must go in empty or
+          # the file would be read and then silently ignored.
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          node-version-file: ${{ inputs.node-version-file }}
 
       - uses: actions/setup-python@v6
         if: inputs.python-version != ''

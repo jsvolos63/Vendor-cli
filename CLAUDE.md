@@ -17,8 +17,10 @@ instead of hand-copying the checkout/node/install/check skeleton; it carries
 the kit-pin pre-flight (the same `jfs-check-kit-pins` bin consumers can run
 locally — not a second spelling of it), the CLAUDE.md family-conventions check, the
 shipped-dependency audit gate (`prod-audit` — `npm audit --omit=dev
---audit-level=high`), and the kit-style version-bump guard as opt-in
-inputs. Edits to it land in every
+--audit-level=high`), the kit-style version-bump guard, and
+`node-version-file` (point it at a repo's `.nvmrc` so one file governs CI and
+the deploy, instead of the version being named once here and once for the
+deploy where the two can drift) as opt-in inputs. Edits to it land in every
 repo's next CI run at once — treat them like kit API changes. This repo's
 own `test.yml` references it locally (`uses: ./…`) so a PR editing the
 workflow validates against its own copy.
