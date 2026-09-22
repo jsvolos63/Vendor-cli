@@ -61,6 +61,11 @@ on:
           by an edit here, and edits here land in every repo's next run at
           once. Default '' keeps `node-version` authoritative, so this input
           is a no-op for every caller that does not set it.
+
+          The file must EXIST: setup-node throws rather than falling back, so
+          a repo that opts in and later renames or deletes the file gets a
+          failed job, not a silently different Node. That is the right way
+          round, and worth knowing before you opt in.
         type: string
         default: ''
       python-version:
