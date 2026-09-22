@@ -74,10 +74,20 @@ export function splitDoc(src) {
 }
 
 export function parseAllowlist(src) {
-  const at = src.indexOf(ALLOW_OPEN);
-  if (at === -1) return { allow: new Set(), bad: [] };
+  // The marker must OPEN A LINE. A doc that explains this convention mentions
+  // the marker in prose — inside backticks, mid-sentence — and matching that
+  // made the parser swallow the rest of the file as entries and report sixty
+  // phantom findings. Caught by running this against the first doc to document
+  // the allowlist; a check with false positives gets disabled, so the anchor
+  // is load-bearing rather than tidy.
+  const m = /^<!-- maintenance-check:allow/m.exec(src);
+  if (!m) return { allow: new Set(), bad: [], unterminated: false };
+  const at = m.index;
   const end = src.indexOf('-->', at);
-  const body = src.slice(at + ALLOW_OPEN.length, end === -1 ? src.length : end);
+  // An unterminated block is ONE clear finding, not a reinterpretation of every
+  // line below it as an allowlist entry.
+  if (end === -1) return { allow: new Set(), bad: [], unterminated: true };
+  const body = src.slice(at + ALLOW_OPEN.length, end);
   const allow = new Set();
   const bad = [];
   for (const raw of body.split('\n')) {
@@ -93,7 +103,7 @@ export function parseAllowlist(src) {
     }
     allow.add(token);
   }
-  return { allow, bad };
+  return { allow, bad, unterminated: false };
 }
 
 export function fencedBlocks(src) {
@@ -155,7 +165,8 @@ export function checkRepo(dir) {
     findings.push('the canonical family-maintenance block is missing or its markers are mangled — run `jfs-maintenance-sync`');
   }
 
-  const { allow, bad } = parseAllowlist(own);
+  const { allow, bad, unterminated } = parseAllowlist(own);
+  if (unterminated) findings.push('the `<!-- maintenance-check:allow` block is never closed with `-->`');
   for (const t of bad) findings.push(`allowlist entry \`${t}\` has no reason after \`#\` — an unexplained exception is how a check stops protecting anything`);
 
   const claims = findClaims(own);

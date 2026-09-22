@@ -154,7 +154,37 @@ test('the bin exits 1 on findings and 0 on a clean doc', () => {
   assert.match(ok.stdout, /checks out/);
 });
 
-test('parseAllowlist tolerates an unterminated block rather than throwing', () => {
-  const { allow } = parseAllowlist('<!-- maintenance-check:allow\nfoo.yml # because\n');
-  assert.ok(allow.has('foo.yml'));
+test('a doc that EXPLAINS the allowlist convention is not eaten by the parser', () => {
+  // Regression. The marker was matched anywhere in the file, so the first doc
+  // to document the convention — mentioning `<!-- maintenance-check:allow` in
+  // prose, inside backticks, mid-sentence — had the parser take that as the
+  // block opener and swallow the next sixty lines as entries, reporting forty
+  // phantom findings. The marker must OPEN A LINE.
+  const doc = withBlock(
+    '# Maintaining X\n\n' +
+    'Deliberate mentions of absent things go in the `<!-- maintenance-check:allow` block\n' +
+    'with a reason after `#`, or the entry is itself a finding.\n\n' +
+    'Run `npm run check`.\n\n' +
+    '<!-- maintenance-check:allow\n' +
+    '.github/workflows/release.yml  # this repo has none\n' +
+    '-->\n'
+  );
+  const { allow, bad, unterminated } = parseAllowlist(doc);
+  assert.equal(unterminated, false);
+  assert.deepEqual(bad, []);
+  assert.deepEqual([...allow], ['.github/workflows/release.yml']);
+  const res = checkRepo(repo({ doc, scripts: { check: 'echo' } }));
+  assert.deepEqual(res.findings, []);
+});
+
+test('an unterminated allowlist block is ONE finding, not a reading of the whole file', () => {
+  const doc = withBlock('# X\n\n<!-- maintenance-check:allow\nfoo.yml # because\n\n## A later heading\n\nProse that is not an entry.\n');
+  // Through splitDoc, as checkRepo does: the canonical START marker ends in
+  // `-->` of its own, so scanning the whole file would find that and read the
+  // block as closed. The repo-specific half is the right input.
+  const { unterminated } = parseAllowlist(splitDoc(doc).own);
+  assert.equal(unterminated, true);
+  const res = checkRepo(repo({ doc }));
+  assert.equal(res.findings.length, 1);
+  assert.match(res.findings[0], /never closed with/);
 });
