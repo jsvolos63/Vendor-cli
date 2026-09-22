@@ -72,9 +72,21 @@ on:
   workflow_call:
     inputs:
       node-version:
-        description: Node.js version to set up
+        description: Node.js version to set up. Ignored when node-version-file is set.
         type: string
         default: '22'
+      node-version-file:
+        description: >-
+          Path to a .nvmrc / .node-version in the CALLING repo, the same
+          opt-in family-ci.yml has: when set, that file decides the Node the
+          bump runs on and `node-version` is ignored, so a repo whose CI
+          already reads its .nvmrc does not validate its weekly bump on a
+          different Node than its CI and its deploy. Default '' keeps
+          `node-version` authoritative — a no-op for every caller that does
+          not set it. The file must exist; setup-node fails rather than
+          falling back.
+        type: string
+        default: ''
       install-command:
         description: Dependency install command (jfs-bump-kit-pins ships in
           @jfs/vendor-cli, so deps must be installed before it can run)
@@ -182,7 +194,12 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: ${{ inputs.node-version }}
+          # Same precedence trick as family-ci.yml: setup-node prefers a
+          # non-empty `node-version` OVER `node-version-file`, so it goes in
+          # empty whenever a file is named. With no file named this resolves
+          # to exactly `inputs.node-version`, as before.
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          node-version-file: ${{ inputs.node-version-file }}
 
       - name: Install dependencies
         run: ${{ inputs.install-command }}

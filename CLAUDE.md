@@ -37,7 +37,8 @@ lives here. Inputs: `check-command` (required — the repo's CI checks, run
 in-workflow because default-token PRs never trigger pull_request CI),
 `install-command` (default `npm ci`), `vendor-sync-command`,
 `claude-md-sync-command` and `version-bump-command` ('' skips any),
-`node-version` (default 22), `auto-merge` (default true), `soft-fail`
+`node-version` (default 22), `node-version-file` ('' keeps `node-version`;
+the same opt-in family-ci has), `auto-merge` (default true), `soft-fail`
 (default false), `release-title` ('' skips), `pr-body-extra`.
 
 The `claude-md-sync-command` step (default: `npm install` then
