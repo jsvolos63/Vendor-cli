@@ -1,8 +1,8 @@
 # @jfs/vendor-cli
 
 Shared **dev CLI** for the `@jfs/*` kit family (`news-kit`, `pwa-kit`,
-`netlify-kit`, `fetch-kit`). It owns five jobs that used to be
-byte-identical copies scattered across the kits and their consumers:
+`netlify-kit`, `fetch-kit`). It owns eight jobs, each of which used to be
+hand-rolled — often as drifting copies — across the kits and their consumers:
 
 1. **Vendoring** (`runVendorCli`, via each kit's `jfs-<kit>-vendor` bin) —
    generate/`--check` the committed copies buildless consumers ship.
@@ -15,6 +15,19 @@ byte-identical copies scattered across the kits and their consumers:
 5. **CLAUDE.md conventions sync** (`jfs-claude-md-sync` bin) — rewrite the
    marked family-conventions block in a repo's CLAUDE.md from the canonical
    `family/family-conventions.md`; `--check` is what family CI runs.
+6. **MAINTENANCE.md protocol sync** (`jfs-maintenance-sync` bin) — the same
+   for the marked family-maintenance block in a repo's MAINTENANCE.md, from
+   `family/maintenance.md`. It refuses to create the file: the repo-specific
+   half has to be written first.
+7. **Sanitizer-policy sync** (`jfs-sanitizer-policy-sync` bin) — regenerate
+   the `@jfs-sanitizer-policy:` marker regions in a kit's source from the
+   canonical `family/sanitizer-policy.json`; `--check` is the kit-side gate.
+8. **The buildless-module-graph gate** (`@jfs/vendor-cli/module-graph`) —
+   link a browser module graph with V8's own resolver; see below.
+
+It also hosts the family's four reusable workflows under `.github/workflows/`
+(`family-ci.yml`, `kit-pin-bump.yml`, `release.yml`, `dependabot-merge.yml`)
+and the monitor that watches them, `tools/family-liveness.mjs`.
 
 The family's consumers are buildless static sites: `node_modules` is not
 deployed, so each consumer commits a generated copy of every kit it uses and
@@ -329,7 +342,10 @@ same way real kits are driven, covering every format, `--pick`, `--check`
 drift detection, argument validation, and executable-output probes. Each kit
 additionally keeps its own vendor integration test (`test-vendor.mjs`, or
 `test/vendor.test.js` in news-kit) exercising its shim + pin against its
-real surface.
+real surface. `test/workflows.test.mjs` reads the reusable workflows
+themselves — inputs declared and read, every caller's `with:` accepted, step
+and job references resolved, the pinning policy — since one of them,
+`kit-pin-bump.yml`, has no caller in this repo to execute it.
 
 ## Releasing a change
 

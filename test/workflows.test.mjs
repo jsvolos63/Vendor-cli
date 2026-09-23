@@ -20,8 +20,9 @@
 //
 // The last group holds the cross-file invariants MAINTENANCE.md listed as
 // "prose only": the version guard against package.json `files`, the one Node
-// version, the test list against the test files on disk, and CLAUDE.md's
-// kit-pin-bump input list against the inputs the workflow actually declares.
+// version, the test list against the test files on disk, CLAUDE.md's
+// kit-pin-bump input list against the inputs the workflow actually declares,
+// and README's job list against the bins the package ships.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
@@ -364,4 +365,14 @@ test('npm test runs every test file on disk, and names none that is missing', ()
   // The script names its files rather than globbing, so a new file that is
   // not added to it never runs — in CI or anywhere — and nothing says so.
   assert.deepEqual(named, onDisk);
+});
+
+test('README names every bin the package ships', () => {
+  // README's numbered list of what this package owns said "five jobs" for
+  // months after a sixth and seventh bin shipped; a consumer reading it never
+  // learned jfs-sanitizer-policy-sync or jfs-maintenance-sync existed.
+  const readme = read('README.md');
+  for (const bin of Object.keys(PKG.bin)) {
+    assert.ok(readme.includes(`\`${bin}\``), `README.md never names the \`${bin}\` bin`);
+  }
 });
