@@ -37,7 +37,8 @@ lives here. Inputs: `check-command` (required — the repo's CI checks, run
 in-workflow because default-token PRs never trigger pull_request CI),
 `install-command` (default `npm ci`), `vendor-sync-command`,
 `claude-md-sync-command` and `version-bump-command` ('' skips any),
-`node-version` (default 22), `auto-merge` (default true), `soft-fail`
+`node-version` (default 22), `node-version-file` ('' keeps `node-version`;
+the same opt-in family-ci has), `auto-merge` (default true), `soft-fail`
 (default false), `release-title` ('' skips), `pr-body-extra`.
 
 The `claude-md-sync-command` step (default: `npm install` then
@@ -403,7 +404,13 @@ weekly questions mechanically across every repo: did each repo's last
 *scheduled* run of each workflow succeed (per workflow, not per repo — a repo
 whose CI is green while one cron has failed for a month reads healthy otherwise);
 is any `auto/*` branch stranded with no PR; is any `@jfs/*` pin more than one
-commit behind its kit's default branch; is any bot PR older than a week.
+commit behind its kit's default branch; is any bot PR older than a week, or
+red or conflicted at any age. Beside the first question it asks whether the
+newest non-scheduled run of any workflow on each default branch is red —
+the failure a canonical-text edit HERE causes, thirteen consumers red on push
+and PR CI at once, none of it a scheduled run — and whether GitHub has
+disabled a workflow for inactivity, since a disabled cron's last run reads
+green for ever.
 
 `.github/workflows/family-liveness.yml` runs it Mondays 08:10 UTC —
 deliberately ~90 minutes after the 06:41 bump, so it observes THIS week's run —
@@ -413,10 +420,22 @@ would need an `issues: write` grant in each, and the notifier's own failure
 would be silent. The run itself also goes red, because a green run with an
 issue attached is the same invisible signal again.
 
-Three properties not to undo:
+Five properties not to undo:
 
 - **It needs a PAT** (`FAMILY_READ_TOKEN`; read on contents, actions,
   pull-requests). A repo-scoped `GITHUB_TOKEN` cannot see its siblings.
+- **Every call stays inside that scope.** A PR's verdict comes from the
+  workflow runs on its head commit, not from the check-runs endpoint, which a
+  fine-grained token reads only with the Checks permission — a 403 there would
+  have made every repo with an open bot PR could-not-check.
+  `test/family-liveness.test.mjs` stubs that endpoint to 403 to hold it.
+- **It never judges its own workflow.** Its run goes red on every finding and
+  every could-not-check, so reading `family-liveness.yml`'s runs here would
+  latch it: one bad Monday reddens the run, the next Monday reports that red
+  run and reddens its own, and a healthy family never reads healthy again.
+  `judgedWorkflows` drops that one path in this repo only;
+  `test/family-liveness.test.mjs` holds it, with the same red runs on
+  `test.yml` as the control that this repo is still watched.
 - **No `npm ci`.** The script is dependency-free so a broken lockfile or a
   failed install can never blind the monitor — the same reasoning as
   Surf-Tracker's health check, written after a 54-day silent content outage.

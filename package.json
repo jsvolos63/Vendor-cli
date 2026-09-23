@@ -1,7 +1,7 @@
 {
   "name": "@jfs/vendor-cli",
-  "version": "0.21.7",
-  "description": "Shared dev CLI for the @jfs kit family — vendoring generator (esm/global/cjs, surface derived from the kit's own exports) plus the consolidated kit-pin bumper, kit-pin existence pre-flight, version stamper, the CLAUDE.md family-conventions and MAINTENANCE.md family-maintenance synchronizers, and the buildless-module-graph gate the consumers used to each hand-roll.",
+  "version": "0.21.8",
+  "description": "Shared dev CLI for the @jfs kit family — vendoring generator (esm/global/cjs, surface derived from the kit's own exports) plus the consolidated kit-pin bumper, kit-pin existence pre-flight, version stamper, the CLAUDE.md family-conventions, MAINTENANCE.md family-maintenance and sanitizer-policy synchronizers, and the buildless-module-graph gate the consumers used to each hand-roll.",
   "type": "module",
   "main": "index.mjs",
   "exports": {
@@ -24,7 +24,7 @@
     "module-graph"
   ],
   "scripts": {
-    "test": "node --test test/test.mjs test/tooling.test.mjs test/claude-md-sync.test.mjs test/maintenance-sync.test.mjs test/family-liveness.test.mjs test/maintenance-doc-check.test.mjs test/sanitizer-policy-sync.test.mjs test/module-graph.test.mjs",
+    "test": "node --test test/test.mjs test/tooling.test.mjs test/claude-md-sync.test.mjs test/maintenance-sync.test.mjs test/family-liveness.test.mjs test/maintenance-doc-check.test.mjs test/sanitizer-policy-sync.test.mjs test/module-graph.test.mjs test/workflows.test.mjs",
     "lint": "eslint ."
   },
   "repository": {
@@ -32,7 +32,7 @@
     "url": "git+https://github.com/jsvolos63/vendor-cli.git"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "license": "MIT",
   "sideEffects": false,
@@ -42,6 +42,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "eslint": "^10.9.1",
-    "globals": "^17.11.0"
+    "globals": "^17.11.0",
+    "yaml": "^2.9.1"
   }
 }

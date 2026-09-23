@@ -118,11 +118,12 @@ on:
         required: true
       version-guard-paths:
         description: >-
-          Space-separated paths; on pull requests, require a package.json
-          version bump when any of them changed ('' skips the job). The kit
-          convention: consumers pin by commit SHA and releases tag by version,
-          so a shipped-module change without a bump ships two different SHAs
-          under one version label.
+          Space-separated paths; on pull requests and manual dispatches,
+          require a package.json version bump when any of them changed
+          against the base ('' skips the job). The kit convention: consumers
+          pin by commit SHA and releases tag by version, so a shipped-module
+          change without a bump ships two different SHAs under one version
+          label.
         type: string
         default: ''
 
@@ -144,18 +145,18 @@ jobs:
       # main's — everyone else runs the family tooling from a main checkout.
       JFS_VENDOR_CLI_DIR: ${{ github.repository == 'jsvolos63/vendor-cli' && '.' || '.jfs-family/vendor-cli' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         if: (inputs.verify-kit-pins || inputs.claude-md-check || inputs.maintenance-check) && github.repository != 'jsvolos63/vendor-cli'
         with:
           repository: jsvolos63/vendor-cli
           path: .jfs-family/vendor-cli
           persist-credentials: false
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           # setup-node prefers a non-empty `node-version` OVER `node-version-file`,
           # so when the caller names a file, `node-version` must go in empty or
@@ -163,7 +164,7 @@ jobs:
           node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
           node-version-file: ${{ inputs.node-version-file }}
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: inputs.python-version != ''
         with:
           python-version: ${{ inputs.python-version }}
@@ -249,12 +250,23 @@ jobs:
         run: ${{ inputs.run }}
 
   # The kit-style version-bump guard, formerly copy-pasted into eight repos.
+  #
+  # It runs on workflow_dispatch as well as pull_request. The family's
+  # convention for session PRs is "dispatch CI on the branch and merge once
+  # that run is green on the head commit" — and while this job ran on
+  # pull_request alone, that dispatched run never carried it, so a shipped-path
+  # change with no bump could be merged on an entirely green dispatch.
+  #
+  # A dispatch has no base ref, so it compares against the default branch.
+  # The diff is three-dot (from the merge-base), so a branch that merely sits
+  # behind main is never blamed for main's own changes, and a dispatch ON the
+  # default branch diffs to nothing and passes.
   version-bump:
-    if: github.event_name == 'pull_request' && inputs.version-guard-paths != ''
+    if: (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && inputs.version-guard-paths != ''
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -262,8 +274,15 @@ jobs:
       - name: Fail if guarded paths changed without a package.json version bump
         env:
           GUARD_PATHS: ${{ inputs.version-guard-paths }}
+          BASE_BRANCH: ${{ github.base_ref || github.event.repository.default_branch }}
         run: |
-          BASE="origin/${GITHUB_BASE_REF}"
+          BASE="origin/${BASE_BRANCH}"
+          # Fail loudly on a base that is not there, rather than letting the
+          # diff below error into the "changed" branch and fail obscurely.
+          if [ -z "$BASE_BRANCH" ] || ! git rev-parse --verify --quiet "$BASE" >/dev/null; then
+            echo "::error::version-bump: cannot resolve the base '${BASE}' to compare against"
+            exit 1
+          fi
           # GUARD_PATHS is a space-separated list, so the unquoted expansion is
           # deliberate — but `set -f` keeps it a word split only, not a glob
           # against the workspace.

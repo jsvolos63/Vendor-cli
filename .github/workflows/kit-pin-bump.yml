@@ -72,9 +72,21 @@ on:
   workflow_call:
     inputs:
       node-version:
-        description: Node.js version to set up
+        description: Node.js version to set up. Ignored when node-version-file is set.
         type: string
         default: '22'
+      node-version-file:
+        description: >-
+          Path to a .nvmrc / .node-version in the CALLING repo, the same
+          opt-in family-ci.yml has: when set, that file decides the Node the
+          bump runs on and `node-version` is ignored, so a repo whose CI
+          already reads its .nvmrc does not validate its weekly bump on a
+          different Node than its CI and its deploy. Default '' keeps
+          `node-version` authoritative — a no-op for every caller that does
+          not set it. The file must exist; setup-node fails rather than
+          falling back.
+        type: string
+        default: ''
       install-command:
         description: Dependency install command (jfs-bump-kit-pins ships in
           @jfs/vendor-cli, so deps must be installed before it can run)
@@ -172,7 +184,7 @@ jobs:
         # command is the ONLY validation a bump gets before it merges.
         shell: bash
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           # The install steps below run npm lifecycle scripts from kit commits
           # that were resolved seconds ago and reviewed by nobody. Don't leave
@@ -180,9 +192,14 @@ jobs:
           # create-pull-request pushes with the token it is handed explicitly.
           persist-credentials: false
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
-          node-version: ${{ inputs.node-version }}
+          # Same precedence trick as family-ci.yml: setup-node prefers a
+          # non-empty `node-version` OVER `node-version-file`, so it goes in
+          # empty whenever a file is named. With no file named this resolves
+          # to exactly `inputs.node-version`, as before.
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          node-version-file: ${{ inputs.node-version-file }}
 
       - name: Install dependencies
         run: ${{ inputs.install-command }}
@@ -260,9 +277,10 @@ jobs:
       - name: Open a pull request if anything changed
         id: cpr
         # Pinned by SHA, not tag: this runs in every family repo with
-        # contents + pull-requests write, and `v7` is a movable tag on a
-        # third-party account. Bump the SHA deliberately.
-        uses: peter-evans/create-pull-request@84ae59a2cdc2258d6fa0732dd66352dddae2a412 # v7.0.9
+        # contents + pull-requests write, and a version tag (`v8`, `v8.1.1`)
+        # is movable on a third-party account. Bump the SHA deliberately,
+        # with the version it resolves to in the trailing comment.
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           token: ${{ github.token }}
           branch: auto/kit-pin-bump

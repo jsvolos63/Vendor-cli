@@ -8,14 +8,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SCRIPT = join(ROOT, 'tools', 'family-liveness.mjs');
-const { newestScheduledPerWorkflow, parseKitPins, renderMarkdown } = await import(
-  pathToFileURL(SCRIPT)
-);
+const {
+  newestScheduledPerWorkflow, parseKitPins, renderMarkdown, redOnDefaultBranch, pullHealth, isRed, autoBranchNames,
+  workflowInventory, judgedWorkflows,
+} =
+  await import(pathToFileURL(SCRIPT));
 
 const run = (path, name, started, conclusion, status = 'completed') => ({
   path: `.github/workflows/${path}`,
@@ -91,6 +95,19 @@ test('a pin with no resolvable SHA is omitted rather than guessed at', () => {
   assert.deepEqual(parseKitPins({}), {});
 });
 
+test('only branches UNDER auto/ count, though the API matches the bare prefix', () => {
+  assert.deepEqual(
+    autoBranchNames([
+      { ref: 'refs/heads/auto/kit-pin-bump' },
+      { ref: 'refs/heads/auto/refresh-schedule' },
+      { ref: 'refs/heads/automation-notes' },
+      { ref: 'refs/heads/auto' },
+    ]),
+    ['auto/kit-pin-bump', 'auto/refresh-schedule']
+  );
+  assert.deepEqual(autoBranchNames(null), []);
+});
+
 test('the markdown report never presents could-not-check as a clean bill of health', () => {
   const md = renderMarkdown(
     'could-not-check',
@@ -144,4 +161,322 @@ test('--json with no token is machine-readably could-not-check, and still exits 
   });
   assert.equal(res.status, 2);
   assert.deepEqual(JSON.parse(res.stdout), { status: 'could-not-check', reason: 'no token' });
+});
+
+// ---------------------------------------------------------------------------
+// The default branch and the open bot PRs — where a canonical-text edit in
+// THIS repo shows up first. Merging a change to family/family-conventions.md
+// reddens every consumer's next push and PR run at once (it has happened
+// twice, thirteen repos the second time), and none of that is a scheduled run.
+
+const branchRun = (path, event, started, conclusion, status = 'completed') => ({
+  ...run(path, path, started, conclusion, status),
+  event,
+});
+
+test('a red push run on the default branch is reported, and a later green run clears it', () => {
+  const now = Date.parse('2026-09-22T12:00:00Z');
+  const red = redOnDefaultBranch([branchRun('ci.yml', 'push', '2026-09-22T10:00:00Z', 'failure')], now);
+  assert.equal(red.length, 1);
+  assert.equal(red[0].workflow, 'ci.yml');
+  assert.equal(red[0].event, 'push');
+  // A dispatch that went green afterwards is the branch being green NOW.
+  assert.deepEqual(
+    redOnDefaultBranch(
+      [
+        branchRun('ci.yml', 'push', '2026-09-22T10:00:00Z', 'failure'),
+        branchRun('ci.yml', 'workflow_dispatch', '2026-09-22T11:00:00Z', 'success'),
+      ],
+      now
+    ),
+    []
+  );
+});
+
+test('a red dispatch is cleared by a later green SCHEDULED run of the same workflow', () => {
+  // news-kit, measured: a kit-pin-bump dispatch that failed 36 days ago, with
+  // every scheduled run since green. Ignoring scheduled runs here reported it
+  // "red on main" for ever.
+  assert.deepEqual(
+    redOnDefaultBranch([
+      branchRun('kit-pin-bump.yml', 'workflow_dispatch', '2026-08-17T10:00:00Z', 'failure'),
+      branchRun('kit-pin-bump.yml', 'schedule', '2026-09-21T06:41:00Z', 'success'),
+    ]),
+    []
+  );
+});
+
+test('a retired workflow is judged by neither view', () => {
+  // BearsMockDraft, measured: refresh-news.yml's last scheduled run failed and
+  // then the file was deleted; it was reported every week, 98 days on.
+  const existing = new Set(['.github/workflows/ci.yml']);
+  const retired = run('refresh-news.yml', 'Refresh news', '2026-06-16T09:00:00Z', 'failure');
+  assert.equal(newestScheduledPerWorkflow([retired], Date.parse('2026-09-22T12:00:00Z'), existing).length, 0);
+  assert.equal(newestScheduledPerWorkflow([retired], Date.parse('2026-09-22T12:00:00Z')).length, 1);
+  assert.deepEqual(redOnDefaultBranch([{ ...retired, event: 'workflow_dispatch' }], undefined, existing), []);
+});
+
+test('the inventory knows which workflows exist and which GitHub disabled for inactivity', () => {
+  const inv = workflowInventory([
+    { path: '.github/workflows/ci.yml', state: 'active' },
+    { path: '.github/workflows/refresh-schedule.yml', state: 'disabled_inactivity' },
+    { path: 'dynamic/dependabot/dependabot-updates', state: 'active' },
+  ]);
+  assert.deepEqual([...inv.existing].sort(), [
+    '.github/workflows/ci.yml',
+    '.github/workflows/refresh-schedule.yml',
+    'dynamic/dependabot/dependabot-updates',
+  ]);
+  assert.deepEqual(inv.disabled, ['refresh-schedule.yml']);
+  assert.deepEqual(workflowInventory(undefined), { existing: new Set(), disabled: [] });
+});
+
+test('the monitor never judges its own workflow, and nothing else is dropped', () => {
+  // Its run goes red whenever it has a finding; judging that run would latch
+  // the monitor red for ever after its first bad Monday.
+  const paths = ['.github/workflows/test.yml', '.github/workflows/family-liveness.yml'];
+  assert.deepEqual([...judgedWorkflows('vendor-cli', new Set(paths))], ['.github/workflows/test.yml']);
+  assert.deepEqual([...judgedWorkflows('Vendor-cli', new Set(paths))], ['.github/workflows/test.yml']);
+  // Only in the hub: a same-named file anywhere else is that repo's automation.
+  assert.deepEqual([...judgedWorkflows('Weather', new Set(paths))], paths);
+  // A copy, not the inventory itself.
+  const inv = new Set(paths);
+  judgedWorkflows('vendor-cli', inv);
+  assert.equal(inv.size, 2);
+});
+
+test('the default-branch view ignores what it must not judge', () => {
+  const runs = [
+    // question 1's own half, reported there
+    branchRun('kit-pin-bump.yml', 'schedule', '2026-09-22T07:00:00Z', 'failure'),
+    // a fork's PR from a branch that happens to be named main
+    branchRun('ci.yml', 'pull_request', '2026-09-22T07:00:00Z', 'failure'),
+    // Dependabot's own machinery, not the repo's automation
+    { ...branchRun('x', 'dynamic', '2026-09-22T07:00:00Z', 'failure'), path: 'dynamic/dependabot/dependabot-updates' },
+    // skipped and cancelled are by design in the family's callers
+    branchRun('release.yml', 'workflow_run', '2026-09-22T07:00:00Z', 'skipped'),
+    branchRun('deploy.yml', 'push', '2026-09-22T07:00:00Z', 'cancelled'),
+    // an in-progress run neither reports nor masks
+    branchRun('test.yml', 'push', '2026-09-22T08:00:00Z', null, 'in_progress'),
+    branchRun('test.yml', 'push', '2026-09-22T07:00:00Z', 'success'),
+  ];
+  assert.deepEqual(redOnDefaultBranch(runs), []);
+  assert.equal(isRed('timed_out'), true);
+  assert.equal(isRed('startup_failure'), true);
+  assert.equal(isRed('cancelled'), false);
+});
+
+test('an open PR is red when its newest run of any workflow failed, and conflicted only when GitHub says dirty', () => {
+  const headRun = (path, name, started, conclusion, status = 'completed') => ({
+    path: `.github/workflows/${path}`, name, run_started_at: started, status, conclusion,
+  });
+  const runs = [
+    headRun('ci.yml', 'CI', '2026-09-22T10:00:00Z', 'failure'),
+    headRun('ci.yml', 'CI', '2026-09-22T09:00:00Z', 'success'),
+    headRun('dependabot-merge.yml', 'Dependabot merge', '2026-09-22T10:05:00Z', 'skipped'),
+    headRun('other.yml', 'Still running', '2026-09-22T10:06:00Z', null, 'in_progress'),
+  ];
+  assert.deepEqual(pullHealth({ mergeable_state: 'clean' }, runs), { red: ['CI'], conflicted: false });
+  // A later green run of the SAME workflow (a re-run, a dispatch) clears it.
+  assert.deepEqual(
+    pullHealth({ mergeable_state: 'clean' }, [...runs, headRun('ci.yml', 'CI', '2026-09-22T11:00:00Z', 'success')]),
+    { red: [], conflicted: false }
+  );
+  assert.deepEqual(pullHealth({ mergeable_state: 'dirty' }, []), { red: [], conflicted: true });
+  // GitHub computes mergeability lazily; `unknown` is not a conflict.
+  assert.deepEqual(pullHealth({ mergeable_state: 'unknown' }, [headRun('ci.yml', 'CI', '2026-09-22T10:00:00Z', 'success')]), {
+    red: [],
+    conflicted: false,
+  });
+});
+
+test('the report carries the default-branch and bot-PR columns, and tolerates rows without them', () => {
+  const md = renderMarkdown('needs-attention', ['x'], [], [
+    {
+      repo: 'Weather', kind: 'app', scheduled: [], stranded: [], stalePulls: [], stalePins: [],
+      redOnMain: [{ workflow: 'ci.yml', event: 'push', conclusion: 'failure', ageDays: 0 }],
+      badPulls: [{ number: 154, red: ['family-ci / checks'], conflicted: true }],
+    },
+    { repo: 'pwa-kit', kind: 'kit', scheduled: [], stranded: [], stalePulls: [], stalePins: [] },
+  ]);
+  assert.match(md, /red on default branch/);
+  assert.match(md, /ci ✗ failure/);
+  assert.match(md, /#154 red\+conflicted/);
+  assert.match(md, /\| pwa-kit \| _none_ \| — \|/);
+});
+
+// End to end: the real script, its real main(), a stubbed GitHub API. The pure
+// tests above prove what decides; these prove the decisions reach the exit
+// code — and that could-not-check still outranks a finding.
+const STUB = `
+const sha = 'a'.repeat(40);
+const over = JSON.parse(process.env.LIVENESS_STUB || '{}');
+globalThis.fetch = async (url) => {
+  const u = new URL(url);
+  const key = u.pathname + u.search;
+  for (const [prefix, r] of Object.entries(over)) {
+    if (key.startsWith(prefix)) {
+      return new Response(JSON.stringify(r.body ?? {}), { status: r.status ?? 200 });
+    }
+  }
+  const ok = (body) => new Response(JSON.stringify(body), { status: 200 });
+  const p = u.pathname;
+  if (/\\/actions\\/runs$/.test(p)) return ok({ workflow_runs: [] });
+  if (/\\/actions\\/workflows$/.test(p)) {
+    return ok({ workflows: ['ci.yml', 'kit-pin-bump.yml', 'test.yml'].map((f) => ({ path: '.github/workflows/' + f, state: 'active' })) });
+  }
+  if (/\\/git\\/matching-refs\\//.test(p)) return ok([]);
+  if (/\\/pulls$/.test(p)) return ok([]);
+  if (/\\/contents\\/package\\.json$/.test(p)) return new Response('{}', { status: 404 });
+  if (/\\/branches\\//.test(p)) return ok({ commit: { sha } });
+  if (/^\\/repos\\/[^/]+\\/[^/]+$/.test(p)) return ok({ default_branch: 'main' });
+  return new Response('{}', { status: 500 });
+};
+`;
+
+function runStubbed(overrides) {
+  const dir = mkdtempSync(join(tmpdir(), 'liveness-stub-'));
+  try {
+    const stub = join(dir, 'stub.mjs');
+    writeFileSync(stub, STUB);
+    return spawnSync(process.execPath, ['--import', pathToFileURL(stub).href, SCRIPT, '--json'], {
+      encoding: 'utf8',
+      env: { ...process.env, FAMILY_READ_TOKEN: 'stub', GH_TOKEN: '', LIVENESS_STUB: JSON.stringify(overrides) },
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const RED_MAIN = {
+  '/repos/jsvolos63/Weather/actions/runs?branch=main&event=push': {
+    body: { workflow_runs: [{ ...branchRun('ci.yml', 'push', '2026-09-22T10:00:00Z', 'failure') }] },
+  },
+};
+
+test('end to end: a quiet family exits 0', () => {
+  const res = runStubbed({});
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(JSON.parse(res.stdout).status, 'healthy');
+});
+
+test('end to end: a consumer red on its default branch exits 1 and names the workflow', () => {
+  const res = runStubbed(RED_MAIN);
+  assert.equal(res.status, 1, res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.equal(out.status, 'needs-attention');
+  assert.ok(out.findings.some((f) => /^Weather: `ci\.yml` is red on main/.test(f)), out.findings.join('\n'));
+});
+
+test('end to end: a red bot PR exits 1 even when it is a day old', () => {
+  const res = runStubbed({
+    '/repos/jsvolos63/Weather/pulls?': {
+      body: [{
+        number: 154, title: 'Bump jsdom', head: { ref: 'dependabot/npm_and_yarn/jsdom-30', sha: 'b'.repeat(40) },
+        user: { login: 'dependabot[bot]', type: 'Bot' }, created_at: new Date(Date.now() - 86_400_000).toISOString(),
+        html_url: 'https://example.invalid/154',
+      }],
+    },
+    '/repos/jsvolos63/Weather/pulls/154': { body: { mergeable_state: 'clean' } },
+    // The check-runs endpoint needs the Checks permission, which the
+    // documented token scope does not grant: reading it would turn this repo
+    // into could-not-check (exit 2) instead of reporting the red PR.
+    '/repos/jsvolos63/Weather/commits/': { status: 403 },
+    '/repos/jsvolos63/Weather/actions/runs?head_sha=': {
+      body: { workflow_runs: [{ ...branchRun('ci.yml', 'pull_request', '2026-09-22T10:00:00Z', 'failure'), name: 'CI' }] },
+    },
+  });
+  assert.equal(res.status, 1, res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.ok(out.findings.some((f) => /bot PR #154 .* is red \(CI\)/.test(f)), out.findings.join('\n'));
+});
+
+test('end to end: a stranded auto/ branch is found, and a look-alike branch is not', () => {
+  const res = runStubbed({
+    '/repos/jsvolos63/pwa-kit/git/matching-refs/heads/auto': {
+      body: [{ ref: 'refs/heads/auto/kit-pin-bump' }, { ref: 'refs/heads/automation-notes' }],
+    },
+  });
+  assert.equal(res.status, 1, res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.deepEqual(out.findings.filter((f) => f.startsWith('pwa-kit:')).length, 1, out.findings.join('\n'));
+  assert.match(out.findings.find((f) => f.startsWith('pwa-kit:')), /`auto\/kit-pin-bump` has been pushed with no open pull request/);
+});
+
+test('end to end: a workflow GitHub disabled for inactivity is a finding', () => {
+  const res = runStubbed({
+    '/repos/jsvolos63/Zepbound-/actions/workflows': {
+      body: { workflows: [{ path: '.github/workflows/zepbound-reminder.yml', state: 'disabled_inactivity' }] },
+    },
+  });
+  assert.equal(res.status, 1, res.stderr);
+  assert.ok(JSON.parse(res.stdout).findings.some((f) => /^Zepbound-: `zepbound-reminder\.yml` has been DISABLED/.test(f)));
+});
+
+test('end to end: a workflow red on its schedule AND its latest dispatch is reported once', () => {
+  const failed = (event, started) => branchRun('kit-pin-bump.yml', event, started, 'failure');
+  const res = runStubbed({
+    '/repos/jsvolos63/pwa-kit/actions/runs?event=schedule': { body: { workflow_runs: [failed('schedule', '2026-09-21T06:41:00Z')] } },
+    '/repos/jsvolos63/pwa-kit/actions/runs?branch=main&event=workflow_dispatch': {
+      body: { workflow_runs: [failed('workflow_dispatch', '2026-09-22T21:53:00Z')] },
+    },
+  });
+  assert.equal(res.status, 1, res.stderr);
+  const lines = JSON.parse(res.stdout).findings.filter((f) => f.startsWith('pwa-kit:'));
+  assert.equal(lines.length, 1, lines.join('\n'));
+  assert.match(lines[0], /scheduled `kit-pin-bump\.yml`/);
+});
+
+test('end to end: a red dispatch that a later green scheduled run superseded is not reported', () => {
+  // The scheduled list is fetched once and handed to BOTH views; the
+  // default-branch view needs it to know the branch is green NOW.
+  const res = runStubbed({
+    '/repos/jsvolos63/news-kit/actions/runs?event=schedule': {
+      body: { workflow_runs: [branchRun('kit-pin-bump.yml', 'schedule', '2026-09-21T06:41:00Z', 'success')] },
+    },
+    '/repos/jsvolos63/news-kit/actions/runs?branch=main&event=workflow_dispatch': {
+      body: { workflow_runs: [branchRun('kit-pin-bump.yml', 'workflow_dispatch', '2026-08-17T10:00:00Z', 'failure')] },
+    },
+  });
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  assert.equal(JSON.parse(res.stdout).status, 'healthy');
+});
+
+test('end to end: red runs of the monitor itself are not a finding, so it cannot latch itself red', () => {
+  // family-liveness.yml fails its run on every finding and every could-not-check
+  // (run 35789279594 did, before FAMILY_READ_TOKEN existed). A family that is
+  // otherwise healthy must still read healthy.
+  const own = (event, started, path = 'family-liveness.yml') => ({
+    ...branchRun(path, event, started, 'failure'), name: 'Family liveness',
+  });
+  const vendorCli = (path) => ({
+    '/repos/jsvolos63/vendor-cli/actions/workflows': {
+      body: { workflows: ['test.yml', 'family-liveness.yml'].map((f) => ({ path: '.github/workflows/' + f, state: 'active' })) },
+    },
+    '/repos/jsvolos63/vendor-cli/actions/runs?event=schedule': {
+      body: { workflow_runs: [own('schedule', '2026-09-21T08:10:00Z', path)] },
+    },
+    '/repos/jsvolos63/vendor-cli/actions/runs?branch=main&event=workflow_dispatch': {
+      body: { workflow_runs: [own('workflow_dispatch', '2026-09-22T21:53:00Z', path)] },
+    },
+  });
+  const res = runStubbed(vendorCli('family-liveness.yml'));
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  assert.equal(JSON.parse(res.stdout).status, 'healthy');
+  // The control: the same red runs on vendor-cli's CI are still findings.
+  const ctl = runStubbed(vendorCli('test.yml'));
+  assert.equal(ctl.status, 1, ctl.stdout + ctl.stderr);
+  assert.ok(JSON.parse(ctl.stdout).findings.some((f) => /^vendor-cli: scheduled `test\.yml`/.test(f)));
+});
+
+test('end to end: could-not-check on the new endpoints still outranks a finding — exit 2, never 1 or 0', () => {
+  const res = runStubbed({
+    ...RED_MAIN,
+    '/repos/jsvolos63/John-s-News/actions/runs?branch=main&event=push': { status: 500 },
+  });
+  assert.equal(res.status, 2, res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.equal(out.status, 'could-not-check');
+  assert.ok(out.findings.length >= 1, 'the Weather finding should still be reported alongside');
+  assert.ok(out.unchecked.some((u) => u.startsWith('John-s-News:')), out.unchecked.join('\n'));
 });
