@@ -221,6 +221,25 @@ export function workflowInventory(workflows) {
   return { existing, disabled };
 }
 
+// The monitor's OWN workflow. Its run goes red whenever it has anything to
+// report (the last step of family-liveness.yml), so judging it here would
+// latch: a week with a finding reddens the run, the next week reports that red
+// run as a finding and reddens its own run again, and the monitor never reads a
+// healthy family again — not after its first bad Monday, and not after the
+// could-not-check dispatch it made before its token existed (run 35789279594,
+// which the default-branch view would otherwise report on the first run WITH a
+// token). Its own failure is its red run and the rolling issue, not a finding
+// about the family.
+const SELF = { repo: 'vendor-cli', path: '.github/workflows/family-liveness.yml' };
+
+/** The workflow paths the two run views may judge in `repo`: every one that
+ *  still exists, less the monitor's own. */
+export function judgedWorkflows(repo, existing) {
+  const out = new Set(existing);
+  if (String(repo).toLowerCase() === SELF.repo) out.delete(SELF.path);
+  return out;
+}
+
 /** The newest completed run of each repo workflow on the default branch, over
  *  every event it is handed — main() passes the push, dispatch, workflow_run
  *  and scheduled runs — reported only when it is red and not a scheduled run
@@ -402,7 +421,8 @@ async function main() {
         api(`/repos/${OWNER}/${repo}`),
         api(`/repos/${OWNER}/${repo}/actions/workflows?per_page=100`),
       ]);
-      const { existing, disabled } = workflowInventory(wfs.workflows);
+      const { existing: present, disabled } = workflowInventory(wfs.workflows);
+      const existing = judgedWorkflows(repo, present);
       const raw = await repoRuns(repo, meta.default_branch);
       const runs = newestScheduledPerWorkflow(raw.scheduled, NOW, existing);
       const redOnMain = redOnDefaultBranch(raw.onBranch, NOW, existing);

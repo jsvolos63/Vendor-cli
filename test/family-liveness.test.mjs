@@ -17,7 +17,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SCRIPT = join(ROOT, 'tools', 'family-liveness.mjs');
 const {
   newestScheduledPerWorkflow, parseKitPins, renderMarkdown, redOnDefaultBranch, pullHealth, isRed, autoBranchNames,
-  workflowInventory,
+  workflowInventory, judgedWorkflows,
 } =
   await import(pathToFileURL(SCRIPT));
 
@@ -231,6 +231,20 @@ test('the inventory knows which workflows exist and which GitHub disabled for in
   assert.deepEqual(workflowInventory(undefined), { existing: new Set(), disabled: [] });
 });
 
+test('the monitor never judges its own workflow, and nothing else is dropped', () => {
+  // Its run goes red whenever it has a finding; judging that run would latch
+  // the monitor red for ever after its first bad Monday.
+  const paths = ['.github/workflows/test.yml', '.github/workflows/family-liveness.yml'];
+  assert.deepEqual([...judgedWorkflows('vendor-cli', new Set(paths))], ['.github/workflows/test.yml']);
+  assert.deepEqual([...judgedWorkflows('Vendor-cli', new Set(paths))], ['.github/workflows/test.yml']);
+  // Only in the hub: a same-named file anywhere else is that repo's automation.
+  assert.deepEqual([...judgedWorkflows('Weather', new Set(paths))], paths);
+  // A copy, not the inventory itself.
+  const inv = new Set(paths);
+  judgedWorkflows('vendor-cli', inv);
+  assert.equal(inv.size, 2);
+});
+
 test('the default-branch view ignores what it must not judge', () => {
   const runs = [
     // question 1's own half, reported there
@@ -426,6 +440,33 @@ test('end to end: a red dispatch that a later green scheduled run superseded is 
   });
   assert.equal(res.status, 0, res.stdout + res.stderr);
   assert.equal(JSON.parse(res.stdout).status, 'healthy');
+});
+
+test('end to end: red runs of the monitor itself are not a finding, so it cannot latch itself red', () => {
+  // family-liveness.yml fails its run on every finding and every could-not-check
+  // (run 35789279594 did, before FAMILY_READ_TOKEN existed). A family that is
+  // otherwise healthy must still read healthy.
+  const own = (event, started, path = 'family-liveness.yml') => ({
+    ...branchRun(path, event, started, 'failure'), name: 'Family liveness',
+  });
+  const vendorCli = (path) => ({
+    '/repos/jsvolos63/vendor-cli/actions/workflows': {
+      body: { workflows: ['test.yml', 'family-liveness.yml'].map((f) => ({ path: '.github/workflows/' + f, state: 'active' })) },
+    },
+    '/repos/jsvolos63/vendor-cli/actions/runs?event=schedule': {
+      body: { workflow_runs: [own('schedule', '2026-09-21T08:10:00Z', path)] },
+    },
+    '/repos/jsvolos63/vendor-cli/actions/runs?branch=main&event=workflow_dispatch': {
+      body: { workflow_runs: [own('workflow_dispatch', '2026-09-22T21:53:00Z', path)] },
+    },
+  });
+  const res = runStubbed(vendorCli('family-liveness.yml'));
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  assert.equal(JSON.parse(res.stdout).status, 'healthy');
+  // The control: the same red runs on vendor-cli's CI are still findings.
+  const ctl = runStubbed(vendorCli('test.yml'));
+  assert.equal(ctl.status, 1, ctl.stdout + ctl.stderr);
+  assert.ok(JSON.parse(ctl.stdout).findings.some((f) => /^vendor-cli: scheduled `test\.yml`/.test(f)));
 });
 
 test('end to end: could-not-check on the new endpoints still outranks a finding — exit 2, never 1 or 0', () => {

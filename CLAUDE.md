@@ -420,7 +420,7 @@ would need an `issues: write` grant in each, and the notifier's own failure
 would be silent. The run itself also goes red, because a green run with an
 issue attached is the same invisible signal again.
 
-Four properties not to undo:
+Five properties not to undo:
 
 - **It needs a PAT** (`FAMILY_READ_TOKEN`; read on contents, actions,
   pull-requests). A repo-scoped `GITHUB_TOKEN` cannot see its siblings.
@@ -429,6 +429,13 @@ Four properties not to undo:
   fine-grained token reads only with the Checks permission — a 403 there would
   have made every repo with an open bot PR could-not-check.
   `test/family-liveness.test.mjs` stubs that endpoint to 403 to hold it.
+- **It never judges its own workflow.** Its run goes red on every finding and
+  every could-not-check, so reading `family-liveness.yml`'s runs here would
+  latch it: one bad Monday reddens the run, the next Monday reports that red
+  run and reddens its own, and a healthy family never reads healthy again.
+  `judgedWorkflows` drops that one path in this repo only;
+  `test/family-liveness.test.mjs` holds it, with the same red runs on
+  `test.yml` as the control that this repo is still watched.
 - **No `npm ci`.** The script is dependency-free so a broken lockfile or a
   failed install can never blind the monitor — the same reasoning as
   Surf-Tracker's health check, written after a 54-day silent content outage.
