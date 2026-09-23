@@ -35,18 +35,27 @@
 // cadence asks, mechanically, across every repo at once:
 //
 //   1. Did each repo's last SCHEDULED run of each workflow succeed? (Not "is
-//      main green" — a scheduled run fails on its own page.)
+//      main green" — a scheduled run fails on its own page.) And, beside it,
+//      is the newest non-scheduled run of any workflow on the default branch
+//      red? That second half is the failure THIS repo causes: an edit to a
+//      canonical text here reddens every consumer's push and PR CI at once,
+//      and a monitor that read only scheduled runs could not see it.
 //   2. Is there a stranded `auto/*` branch: commits pushed, no pull request?
 //   3. Are the @jfs/* pins actually current against each kit's default branch?
-//   4. Is any bot pull request stale, or is any open one red or conflicted?
+//   4. Is any bot pull request stale, red, or conflicted? (Red is the other
+//      place a canonical-text edit shows first: every open Dependabot PR's
+//      CI fails its conventions check, and a red PR is one
+//      dependabot-merge.yml will never land.)
 //
 // DEPENDENCY-FREE, and the workflow runs it WITHOUT `npm ci`, for the same
 // reason Surf-Tracker's health check is: a broken lockfile or a bad install
-// must never be able to blind the monitor. Node >= 18 for global fetch.
+// must never be able to blind the monitor. It needs only the global fetch
+// (Node >= 18); the workflow runs it on the Node this repo's .nvmrc names.
 //
 // EXIT CODES — the distinction is the point
 // -----------------------------------------
-//   0  healthy: every automation's last scheduled run succeeded, nothing stranded
+//   0  healthy: every automation's last scheduled run succeeded, no default
+//      branch is red, no bot PR is stale, red or conflicted, nothing stranded
 //   1  something needs a session
 //   2  COULD NOT CHECK (no token, insufficient scope, API or network failure)
 //
@@ -103,6 +112,13 @@ const KIT_REPO_BY_PACKAGE = {
 
 const STALE_PR_DAYS = 7;
 
+// The conclusions that mean "this failed". `cancelled` and `skipped` are not
+// in it: a concurrency group cancels superseded runs by design, and the
+// family's workflow_run callers skip on every run that is not theirs to act
+// on (Dependabot merge on a human's PR, Release on a feature branch).
+const RED = new Set(['failure', 'timed_out', 'startup_failure']);
+export const isRed = (conclusion) => RED.has(conclusion);
+
 const argv = process.argv.slice(2);
 const JSON_OUT = argv.includes('--json');
 const MD_OUT = argv.includes('--markdown');
@@ -147,13 +163,19 @@ async function api(path, { allow404 = false } = {}) {
 
 /** The newest SCHEDULED run per workflow. A repo's cron jobs each fail on their
  *  own page, so the per-workflow newest is the only view that finds a job that
- *  has been failing for a month while every other workflow is green. */
-export function newestScheduledPerWorkflow(workflowRuns, now = NOW) {
+ *  has been failing for a month while every other workflow is green.
+ *
+ *  `existing`, when given, is the set of workflow paths the repo still has. A
+ *  retired workflow's last run never ages out of the runs list, so without it
+ *  a cron deleted after one failure is reported every week for ever —
+ *  BearsMockDraft's refresh-news.yml was, 98 days after its file was gone. */
+export function newestScheduledPerWorkflow(workflowRuns, now = NOW, existing = null) {
   const newest = new Map();
   for (const run of workflowRuns || []) {
     // An in-progress run says nothing yet; taking it as the newest would hide
     // the failed run behind it, which is the whole signal.
     if (run.status !== 'completed') continue;
+    if (existing && !existing.has(run.path)) continue;
     const key = run.path || run.name;
     const prev = newest.get(key);
     if (!prev || Date.parse(run.run_started_at) > Date.parse(prev.run_started_at)) newest.set(key, run);
@@ -166,14 +188,117 @@ export function newestScheduledPerWorkflow(workflowRuns, now = NOW) {
   }));
 }
 
-async function scheduledRuns(repo) {
-  const data = await api(`/repos/${OWNER}/${repo}/actions/runs?event=schedule&per_page=100`);
-  return newestScheduledPerWorkflow(data.workflow_runs);
+/** The repo's raw runs, one request per event. The scheduled list feeds
+ *  question 1; all four feed the default-branch view. Asked per EVENT, not as
+ *  one `?branch=` page, because a single page is the newest hundred runs of
+ *  every kind: Zepbound-'s reminder cron alone fills it in about two days, and
+ *  a push run that went red before that would scroll out of view unreported. */
+const BRANCH_EVENTS = ['push', 'workflow_dispatch', 'workflow_run'];
+
+async function repoRuns(repo, branch) {
+  const q = (extra) => api(`/repos/${OWNER}/${repo}/actions/runs?${extra}&per_page=100`);
+  const b = encodeURIComponent(branch);
+  const [schedule, ...onBranch] = await Promise.all([
+    q('event=schedule'),
+    ...BRANCH_EVENTS.map((e) => q(`branch=${b}&event=${e}`)),
+  ]);
+  const scheduled = schedule.workflow_runs || [];
+  return { scheduled, onBranch: [...scheduled, ...onBranch.flatMap((d) => d.workflow_runs || [])] };
+}
+
+/** The repo's workflows as GitHub knows them now: the paths that still exist,
+ *  and the ones GitHub has DISABLED for inactivity. It does that by itself to a
+ *  scheduled workflow after sixty days without repository activity, and a
+ *  disabled cron's last run stays green for ever — it simply stops running,
+ *  which the newest-run view reads as healthy. */
+export function workflowInventory(workflows) {
+  const existing = new Set();
+  const disabled = [];
+  for (const w of workflows || []) {
+    existing.add(w.path);
+    if (w.state === 'disabled_inactivity') disabled.push(String(w.path).replace('.github/workflows/', ''));
+  }
+  return { existing, disabled };
+}
+
+/** The newest completed run of each repo workflow on the default branch, over
+ *  every event it is handed — main() passes the push, dispatch, workflow_run
+ *  and scheduled runs — reported only when it is red and not a scheduled run
+ *  (those are question 1's own half). Taking the newest across events is what lets a later
+ *  green scheduled run clear an older red dispatch — the question is whether
+ *  the branch is red NOW. A pull_request run whose head branch happens to be
+ *  named like the default branch is a fork's, not this branch's. Dependabot's
+ *  and Copilot's dynamic workflows live outside .github/workflows and are not
+ *  the repo's automation. */
+export function redOnDefaultBranch(workflowRuns, now = NOW, existing = null) {
+  const newest = new Map();
+  for (const run of workflowRuns || []) {
+    if (run.status !== 'completed') continue;
+    if (['pull_request', 'pull_request_target'].includes(run.event)) continue;
+    if (!String(run.path || '').startsWith('.github/workflows/')) continue;
+    if (existing && !existing.has(run.path)) continue;
+    const prev = newest.get(run.path);
+    if (!prev || Date.parse(run.run_started_at) > Date.parse(prev.run_started_at)) newest.set(run.path, run);
+  }
+  return [...newest.values()]
+    .filter((r) => r.event !== 'schedule' && isRed(r.conclusion))
+    .map((r) => ({
+      workflow: r.path.replace('.github/workflows/', ''),
+      event: r.event,
+      conclusion: r.conclusion,
+      ageDays: (now - Date.parse(r.run_started_at)) / 86_400_000,
+      url: r.html_url,
+    }));
+}
+
+/** Is an open PR red, or conflicted? `pull` is the single-PR payload (the list
+ *  endpoint carries no mergeability); `headRuns` the workflow runs on its head
+ *  commit. The newest completed run of each workflow decides, so a red run
+ *  that a later run of the same workflow went green over is not reported.
+ *  GitHub computes mergeability lazily and may still answer `unknown` — that
+ *  is reported as nothing, not as a conflict and not as a failure to check.
+ *
+ *  Workflow RUNS, not the check-runs endpoint: a fine-grained token reads check
+ *  runs only with the Checks permission, which the documented scope (contents,
+ *  actions, pull-requests) does not grant. Every family check is an Actions
+ *  workflow, so the runs carry the same verdict under the scope the token has —
+ *  and a 403 here would have turned every repo with an open bot PR into
+ *  could-not-check. */
+export function pullHealth(pull, headRuns) {
+  const newest = new Map();
+  for (const run of headRuns || []) {
+    if (run.status !== 'completed') continue;
+    const key = run.path || run.name;
+    const prev = newest.get(key);
+    if (!prev || Date.parse(run.run_started_at) > Date.parse(prev.run_started_at)) newest.set(key, run);
+  }
+  const red = [...newest.values()].filter((r) => isRed(r.conclusion)).map((r) => r.name || r.path);
+  return { red: [...new Set(red)].sort(), conflicted: pull?.mergeable_state === 'dirty' };
+}
+
+async function botPullHealth(repo, p) {
+  const [detail, runs] = await Promise.all([
+    api(`/repos/${OWNER}/${repo}/pulls/${p.number}`),
+    api(`/repos/${OWNER}/${repo}/actions/runs?head_sha=${p.sha}&per_page=100`),
+  ]);
+  return pullHealth(detail, runs.workflow_runs);
+}
+
+/** The `auto/*` branches among a matching-refs answer. The API matches by
+ *  PREFIX, so `heads/auto` also returns a branch named `automation-x`; the
+ *  filter is what makes the answer mean "under auto/". (The request used to
+ *  carry the slash itself — `heads/auto/` — which GitHub accepts but an
+ *  egress proxy that canonicalizes paths refuses with a 400, and that turned
+ *  every hand-run of this script from a session into could-not-check.) */
+export function autoBranchNames(refs) {
+  return (refs || [])
+    .map((r) => String(r.ref || ''))
+    .filter((ref) => ref.startsWith('refs/heads/auto/'))
+    .map((ref) => ref.replace('refs/heads/', ''));
 }
 
 async function autoBranches(repo) {
-  const refs = await api(`/repos/${OWNER}/${repo}/git/matching-refs/heads/auto/`, { allow404: true });
-  return (refs || []).map((r) => r.ref.replace('refs/heads/', ''));
+  return autoBranchNames(await api(`/repos/${OWNER}/${repo}/git/matching-refs/heads/auto`, { allow404: true }));
 }
 
 async function openPulls(repo) {
@@ -183,6 +308,7 @@ async function openPulls(repo) {
     title: p.title,
     head: p.head?.ref,
     author: p.user?.login,
+    sha: p.head?.sha,
     bot: p.user?.type === 'Bot' || /dependabot|github-actions/i.test(p.user?.login || ''),
     ageDays: days(p.created_at),
     draft: p.draft,
@@ -264,14 +390,22 @@ async function main() {
   }
 
   for (const { repo, kind } of REPOS) {
-    const row = { repo, kind, scheduled: [], stranded: [], stalePulls: [], stalePins: [], unchecked: [] };
+    const row = {
+      repo, kind, scheduled: [], disabled: [], redOnMain: [], stranded: [], stalePulls: [], badPulls: [], stalePins: [],
+      unchecked: [],
+    };
     try {
-      const [runs, branches, pulls, repoPins] = await Promise.all([
-        scheduledRuns(repo),
+      const [branches, pulls, repoPins, meta, wfs] = await Promise.all([
         autoBranches(repo),
         openPulls(repo),
         pins(repo),
+        api(`/repos/${OWNER}/${repo}`),
+        api(`/repos/${OWNER}/${repo}/actions/workflows?per_page=100`),
       ]);
+      const { existing, disabled } = workflowInventory(wfs.workflows);
+      const raw = await repoRuns(repo, meta.default_branch);
+      const runs = newestScheduledPerWorkflow(raw.scheduled, NOW, existing);
+      const redOnMain = redOnDefaultBranch(raw.onBranch, NOW, existing);
 
       row.scheduled = runs;
       for (const r of runs) {
@@ -281,6 +415,25 @@ async function main() {
             `concluded **${r.conclusion}** — ${r.url}`
           );
         }
+      }
+
+      row.disabled = disabled;
+      for (const w of disabled) {
+        findings.push(
+          `${repo}: \`${w}\` has been DISABLED by GitHub for inactivity — it no longer runs at all, ` +
+          'and its last run reads green for ever. Re-enable it on the Actions page.'
+        );
+      }
+
+      // One line per failing workflow: one question 1 already reports red is
+      // not repeated here.
+      const redScheduled = new Set(runs.filter((r) => r.conclusion !== 'success').map((r) => r.workflow));
+      row.redOnMain = redOnMain.filter((r) => !redScheduled.has(r.workflow));
+      for (const r of row.redOnMain) {
+        findings.push(
+          `${repo}: \`${r.workflow}\` is red on ${meta.default_branch} — its newest ${r.event} run ` +
+          `(${r.ageDays.toFixed(0)}d ago) concluded **${r.conclusion}** — ${r.url}`
+        );
       }
 
       // A pushed auto/* branch with no pull request is the automation having
@@ -300,6 +453,20 @@ async function main() {
       row.stalePulls = pulls.filter((p) => p.bot && p.ageDays > STALE_PR_DAYS);
       for (const p of row.stalePulls) {
         findings.push(`${repo}: bot PR #${p.number} "${p.title}" is ${p.ageDays.toFixed(0)}d old — ${p.url}`);
+      }
+
+      // Every open bot PR, whatever its age: a red one is a PR the merge
+      // automation will never land, and a fresh one going red is the first
+      // sign of a canonical-text edit here reddening the family.
+      for (const p of pulls.filter((q) => q.bot)) {
+        const h = await botPullHealth(repo, p);
+        if (!h.red.length && !h.conflicted) continue;
+        row.badPulls.push({ number: p.number, red: h.red, conflicted: h.conflicted });
+        const why = [
+          h.red.length ? `red (${h.red.join(', ')})` : '',
+          h.conflicted ? 'conflicted' : '',
+        ].filter(Boolean).join(' and ');
+        findings.push(`${repo}: bot PR #${p.number} "${p.title}" is ${why} — ${p.url}`);
       }
 
       if (repoPins && Object.keys(heads).length) {
@@ -344,7 +511,9 @@ async function main() {
     console.log(`jfs family liveness — ${REPOS.length} repos, ${status}\n`);
     for (const f of findings) console.log(`  ! ${f.replace(/[`*]/g, '')}`);
     for (const u of unchecked) console.log(`  ? could not check — ${u}`);
-    if (!findings.length && !unchecked.length) console.log('  every scheduled run green, nothing stranded, every pin current.');
+    if (!findings.length && !unchecked.length) {
+      console.log('  every scheduled run green, no default branch red, no bot PR stale/red/conflicted, nothing stranded, every pin current.');
+    }
   }
 
   // Could-not-check outranks a clean result: a partial look must not report the
@@ -366,16 +535,28 @@ export function renderMarkdown(status, findings, unchecked, rows) {
     out.push('');
   }
   if (!findings.length && !unchecked.length) {
-    out.push('Every repo\'s last scheduled run succeeded, no `auto/*` branch is stranded, no bot PR is stale, and every `@jfs/*` pin is current.', '');
+    out.push('Every repo\'s last scheduled run succeeded, no default branch is red, no `auto/*` branch is stranded, no bot PR is stale, red or conflicted, and every `@jfs/*` pin is current.', '');
   }
-  out.push('### Per repo', '', '| repo | scheduled runs | stranded | stale bot PRs | pins behind |', '| --- | --- | --- | --- | --- |');
+  out.push(
+    '### Per repo', '',
+    '| repo | scheduled runs | red on default branch | stranded | stale bot PRs | red / conflicted bot PRs | pins behind |',
+    '| --- | --- | --- | --- | --- | --- | --- |'
+  );
   for (const r of rows) {
     const runs = r.scheduled.length
       ? r.scheduled.map((s) => `${s.workflow.replace(/\.ya?ml$/, '')} ${s.conclusion === 'success' ? '✓' : '✗ ' + s.conclusion}`).join('<br>')
       : '_none_';
+    // Rows built before a column existed (or by a test) may lack its field.
+    const redOnMain = [
+      ...(r.redOnMain || []).map((m) => `${m.workflow.replace(/\.ya?ml$/, '')} ✗ ${m.conclusion}`),
+      ...(r.disabled || []).map((w) => `${w.replace(/\.ya?ml$/, '')} ✗ disabled`),
+    ].join('<br>');
+    const badPulls = (r.badPulls || [])
+      .map((p) => `#${p.number} ${[p.red.length ? 'red' : '', p.conflicted ? 'conflicted' : ''].filter(Boolean).join('+')}`)
+      .join(', ');
     out.push(
-      `| ${r.repo} | ${runs} | ${r.stranded.join(', ') || '—'} | ` +
-      `${r.stalePulls.map((p) => '#' + p.number).join(', ') || '—'} | ` +
+      `| ${r.repo} | ${runs} | ${redOnMain || '—'} | ${r.stranded.join(', ') || '—'} | ` +
+      `${r.stalePulls.map((p) => '#' + p.number).join(', ') || '—'} | ${badPulls || '—'} | ` +
       `${r.stalePins.map((p) => `${p.kit} −${p.behind}`).join(', ') || '—'} |`
     );
   }

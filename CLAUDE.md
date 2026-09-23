@@ -404,7 +404,13 @@ weekly questions mechanically across every repo: did each repo's last
 *scheduled* run of each workflow succeed (per workflow, not per repo — a repo
 whose CI is green while one cron has failed for a month reads healthy otherwise);
 is any `auto/*` branch stranded with no PR; is any `@jfs/*` pin more than one
-commit behind its kit's default branch; is any bot PR older than a week.
+commit behind its kit's default branch; is any bot PR older than a week, or
+red or conflicted at any age. Beside the first question it asks whether the
+newest non-scheduled run of any workflow on each default branch is red —
+the failure a canonical-text edit HERE causes, thirteen consumers red on push
+and PR CI at once, none of it a scheduled run — and whether GitHub has
+disabled a workflow for inactivity, since a disabled cron's last run reads
+green for ever.
 
 `.github/workflows/family-liveness.yml` runs it Mondays 08:10 UTC —
 deliberately ~90 minutes after the 06:41 bump, so it observes THIS week's run —
@@ -414,10 +420,15 @@ would need an `issues: write` grant in each, and the notifier's own failure
 would be silent. The run itself also goes red, because a green run with an
 issue attached is the same invisible signal again.
 
-Three properties not to undo:
+Four properties not to undo:
 
 - **It needs a PAT** (`FAMILY_READ_TOKEN`; read on contents, actions,
   pull-requests). A repo-scoped `GITHUB_TOKEN` cannot see its siblings.
+- **Every call stays inside that scope.** A PR's verdict comes from the
+  workflow runs on its head commit, not from the check-runs endpoint, which a
+  fine-grained token reads only with the Checks permission — a 403 there would
+  have made every repo with an open bot PR could-not-check.
+  `test/family-liveness.test.mjs` stubs that endpoint to 403 to hold it.
 - **No `npm ci`.** The script is dependency-free so a broken lockfile or a
   failed install can never blind the monitor — the same reasoning as
   Surf-Tracker's health check, written after a 54-day silent content outage.
