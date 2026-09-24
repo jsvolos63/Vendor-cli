@@ -734,6 +734,38 @@ for (const status of [404, 403]) {
   });
 }
 
+test('end to end: a bot PR whose verdict cannot be read is could-not-check, and costs no other finding', () => {
+  // Before the hold rule the stale findings were pushed ahead of the verdict
+  // reads, so one PR's 5xx cost only its red/conflicted half. Triage needs the
+  // verdicts first; a failed read must still not drop the stale finding, the
+  // other PRs' verdicts, or a recorded hold.
+  const pulls = [
+    botPull(256, 'Bump @extractus/article-extractor from 8.1.0 to 9.0.1', 20),
+    botPull(273, 'Bump @netlify/blobs from 8.2.0 to 11.1.0', 3),
+    botPull(280, 'Bump undici', 2, ['hold']),
+  ];
+  const res = runStubbed({
+    [`${SURF}/pulls?`]: { body: pulls },
+    [`${SURF}/pulls/256`]: { status: 500 },
+    [`${SURF}/pulls/`]: { body: { mergeable_state: 'dirty' } },
+    [`${SURF}/actions/runs?head_sha=`]: { body: { workflow_runs: [] } },
+    [SURF_DOC]: maintenanceDocBody('Held: #280, until undici 8 ships the fix.'),
+  });
+  assert.equal(res.status, 2, res.stdout + res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.equal(out.status, 'could-not-check');
+  assert.deepEqual(
+    out.unchecked.filter((u) => u.startsWith('Surf-Tracker:')).map((u) => u.replace(/: \/repos.*/, '')),
+    ['Surf-Tracker: bot PR #256']
+  );
+  const surf = out.findings.filter((f) => f.startsWith('Surf-Tracker:')).map((f) => f.replace(/ — https.*/, ''));
+  assert.deepEqual(surf, [
+    'Surf-Tracker: bot PR #256 "Bump @extractus/article-extractor from 8.1.0 to 9.0.1" is 20d old',
+    'Surf-Tracker: bot PR #273 "Bump @netlify/blobs from 8.2.0 to 11.1.0" is conflicted',
+  ]);
+  assert.deepEqual(out.held.map((h) => [h.number, h.conflicted]), [[280, true]]);
+});
+
 test('end to end: a person\'s PR with the label is exactly as before — no read, no hold, no finding', () => {
   const user = { login: 'jsvolos63', type: 'User' };
   const labelled = runStubbed(surfHolds({ user, doc: null }));

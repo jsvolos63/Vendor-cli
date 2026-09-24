@@ -382,7 +382,10 @@ export function recordsPull(doc, number) {
 }
 
 /** Sort a repo's open PRs into what question 4 reports and what it lists as
- *  held. `health` maps a bot PR's number to pullHealth()'s verdict. `doc` is
+ *  held. `health` maps a bot PR's number to pullHealth()'s verdict; a PR
+ *  missing from it is one whose verdict could not be read (main() reports that
+ *  as could-not-check), so it is still judged stale by age and held by record,
+ *  just not red or conflicted on a verdict nobody saw. `doc` is
  *  the repo's MAINTENANCE.md, or null when it was not read — because no bot PR
  *  carries the label, or because it could not be read, which main() reports as
  *  could-not-check. Until the record has been read AND names the PR, the label
@@ -568,7 +571,20 @@ async function main() {
       // included — their state is shown beside them in the Held list.
       const bots = pulls.filter((q) => q.bot);
       const health = new Map();
-      for (const p of bots) health.set(p.number, await botPullHealth(repo, p));
+      for (const p of bots) {
+        // A verdict that cannot be read is recorded against that PR, and the
+        // repo is still judged: every other question here needs only the list
+        // payload, and a read failure must not take a stale PR's finding, a
+        // hold, or the pins below out of the report. (Before the hold rule the
+        // stale findings were pushed ahead of these reads, so one PR's 5xx
+        // could only cost the red/conflicted half.)
+        try {
+          health.set(p.number, await botPullHealth(repo, p));
+        } catch (e) {
+          if (!(e instanceof CouldNotCheck)) throw e;
+          row.unchecked.push(`bot PR #${p.number}: ${e.message}`);
+        }
+      }
 
       // MAINTENANCE.md is read only when a bot PR carries the hold label, and
       // once per repo. Its failure is recorded against this repo and the rest
@@ -710,8 +726,8 @@ export function renderMarkdown(status, findings, unchecked, rows) {
     out.push(
       '### Held (recorded in MAINTENANCE.md)', '',
       `Bot PRs carrying the \`${HOLD_LABEL}\` label that their repo's MAINTENANCE.md records by number — the ` +
-      'decision, its reason and what would lift it are written there. Not findings; listed so that a hold never ' +
-      'drops out of sight.',
+      'decision, its reason and what would lift it are written there. Not findings, so on their own they neither ' +
+      'redden the run nor comment on the issue; listed in every report so that one which does never omits them.',
       ''
     );
     for (const h of held) out.push(`- ${heldLine(h)}`);
