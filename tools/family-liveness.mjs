@@ -47,6 +47,22 @@
 //      CI fails its conventions check, and a red PR is one
 //      dependabot-merge.yml will never land.)
 //
+// A BOT PR HELD ON PURPOSE is not a finding for question 4 — but only on two
+// conditions at once, and never on a label alone. Some bot PRs are left open
+// deliberately: a major the protocol's triage said to hold, with the decision
+// and the condition that would lift it recorded in the repo's MAINTENANCE.md
+// (Surf-Tracker's @extractus/article-extractor 9.x, red BY DESIGN because
+// the gate test written for it fails on 9.0.1, is the model). Reported every
+// Monday for ever, such a PR keeps this run red with nothing to do, and an
+// alarm that is always on trains everyone to stop reading it. So an open bot
+// PR carrying the label `hold` is listed under "Held" instead of reported,
+// WHEN the repo's MAINTENANCE.md — read on the default branch, only in a repo
+// that has such a PR, once — names it as `#<number>` in its repo-specific
+// half. A `hold` label the file does not back is itself a finding, and the PR
+// is judged as if it carried no label; a MAINTENANCE.md that is missing or
+// unreadable is could-not-check, and mutes nothing either. The label is how a
+// session SAYS a PR is held; the record is what the monitor checks.
+//
 // DEPENDENCY-FREE, and the workflow runs it WITHOUT `npm ci`, for the same
 // reason Surf-Tracker's health check is: a broken lockfile or a bad install
 // must never be able to blind the monitor. It needs only the global fetch
@@ -55,7 +71,8 @@
 // EXIT CODES — the distinction is the point
 // -----------------------------------------
 //   0  healthy: every automation's last scheduled run succeeded, no default
-//      branch is red, no bot PR is stale, red or conflicted, nothing stranded
+//      branch is red, no bot PR is stale, red or conflicted (a HELD one, with
+//      its record, is listed rather than counted), nothing stranded
 //   1  something needs a session
 //   2  COULD NOT CHECK (no token, insufficient scope, API or network failure)
 //
@@ -76,6 +93,11 @@
 // than reporting a comfortable nothing.
 
 import { pathToFileURL } from 'node:url';
+// A sibling tool, not a dependency: the one definition of MAINTENANCE.md's
+// repo-specific half. It imports only `node:` modules, and
+// test/family-liveness.test.mjs holds this script's whole import graph to
+// that, so the no-install property below survives the reuse.
+import { splitDoc } from './maintenance-doc-check.mjs';
 
 const OWNER = 'jsvolos63';
 
@@ -111,6 +133,10 @@ const KIT_REPO_BY_PACKAGE = {
 };
 
 const STALE_PR_DAYS = 7;
+
+// The label a session puts on a bot PR it is holding on purpose. It mutes
+// nothing by itself: see isHeldLabel / recordsPull / triageBotPulls.
+export const HOLD_LABEL = 'hold';
 
 // The conclusions that mean "this failed". `cancelled` and `skipped` are not
 // in it: a concurrency group cancels superseded runs by design, and the
@@ -332,7 +358,76 @@ async function openPulls(repo) {
     ageDays: days(p.created_at),
     draft: p.draft,
     url: p.html_url,
+    // On the list payload already — the hold rule costs no request per PR.
+    labels: (p.labels || []).map((l) => l?.name).filter(Boolean),
   }));
+}
+
+/** Does a PR carry the hold label? GitHub treats label names
+ *  case-insensitively (a repo cannot have both `hold` and `Hold`), so this
+ *  does too. Only the whole name counts: `on hold` and `holding` are other
+ *  labels, and a near-miss simply leaves the PR judged as unlabelled. */
+export function isHeldLabel(labels) {
+  return (labels || []).some((l) => String(typeof l === 'string' ? l : l?.name).toLowerCase() === HOLD_LABEL);
+}
+
+/** Does MAINTENANCE.md record PR `number`? A mention as `#<number>` in the
+ *  REPO-SPECIFIC half — the canonical family block is identical in fourteen
+ *  repos and can record no one repo's decision, so a number in it counts for
+ *  none of them. `#2560` is not `#256`, and `pwa-kit#256` (another repo's
+ *  PR) or `&#256;` (an HTML entity) is not a mention of this repo's #256. */
+export function recordsPull(doc, number) {
+  if (typeof doc !== 'string' || !Number.isSafeInteger(number) || number < 1) return false;
+  return new RegExp(`(?<![\\w&])#${number}(?!\\d)`).test(splitDoc(doc).own);
+}
+
+/** Sort a repo's open PRs into what question 4 reports and what it lists as
+ *  held. `health` maps a bot PR's number to pullHealth()'s verdict; a PR
+ *  missing from it is one whose verdict could not be read (main() reports that
+ *  as could-not-check), so it is still judged stale by age and held by record,
+ *  just not red or conflicted on a verdict nobody saw. `doc` is
+ *  the repo's MAINTENANCE.md, or null when it was not read — because no bot PR
+ *  carries the label, or because it could not be read, which main() reports as
+ *  could-not-check. Until the record has been read AND names the PR, the label
+ *  mutes nothing: the PR is judged exactly as an unlabelled one, and a label
+ *  the record does not back is reported as `unrecorded` on top. A PR opened by
+ *  a person is not question 4's business, label or no label. */
+export function triageBotPulls(pulls, health = new Map(), doc = null) {
+  const out = { stalePulls: [], badPulls: [], held: [], unrecorded: [] };
+  for (const p of pulls || []) {
+    if (!p.bot) continue;
+    const h = health.get(p.number) || { red: [], conflicted: false };
+    if (isHeldLabel(p.labels) && doc !== null) {
+      if (recordsPull(doc, p.number)) {
+        out.held.push({
+          number: p.number, title: p.title, ageDays: p.ageDays, url: p.url, red: h.red, conflicted: h.conflicted,
+        });
+        continue;
+      }
+      out.unrecorded.push(p);
+    }
+    if (p.ageDays > STALE_PR_DAYS) out.stalePulls.push(p);
+    if (h.red.length || h.conflicted) {
+      out.badPulls.push({ number: p.number, title: p.title, url: p.url, red: h.red, conflicted: h.conflicted });
+    }
+  }
+  return out;
+}
+
+/** The repo's MAINTENANCE.md on its default branch, through the contents
+ *  scope the token already has. Read only for a repo with a held bot PR, and
+ *  once. Missing or unreadable is COULD NOT CHECK, never "not recorded" and
+ *  never "recorded": the monitor has learned nothing about the hold. */
+async function maintenanceDoc(repo, branch) {
+  const path = `/repos/${OWNER}/${repo}/contents/MAINTENANCE.md?ref=${encodeURIComponent(branch)}`;
+  const file = await api(path, { allow404: true });
+  if (!file) {
+    throw new CouldNotCheck(`MAINTENANCE.md: not found on ${branch}, so there is no record to check a \`${HOLD_LABEL}\` label against`);
+  }
+  if (typeof file.content !== 'string' || file.encoding !== 'base64') {
+    throw new CouldNotCheck(`MAINTENANCE.md: not readable through the contents API (encoding ${file.encoding ?? 'none'})`);
+  }
+  return Buffer.from(file.content, 'base64').toString('utf8');
 }
 
 async function pins(repo) {
@@ -410,8 +505,8 @@ async function main() {
 
   for (const { repo, kind } of REPOS) {
     const row = {
-      repo, kind, scheduled: [], disabled: [], redOnMain: [], stranded: [], stalePulls: [], badPulls: [], stalePins: [],
-      unchecked: [],
+      repo, kind, scheduled: [], disabled: [], redOnMain: [], stranded: [], stalePulls: [], badPulls: [], held: [],
+      unrecordedHolds: [], stalePins: [], unchecked: [],
     };
     try {
       const [branches, pulls, repoPins, meta, wfs] = await Promise.all([
@@ -470,23 +565,65 @@ async function main() {
         );
       }
 
-      row.stalePulls = pulls.filter((p) => p.bot && p.ageDays > STALE_PR_DAYS);
+      // Every open bot PR, whatever its age: a red one is a PR the merge
+      // automation will never land, and a fresh one going red is the first
+      // sign of a canonical-text edit here reddening the family. Held PRs
+      // included — their state is shown beside them in the Held list.
+      const bots = pulls.filter((q) => q.bot);
+      const health = new Map();
+      for (const p of bots) {
+        // A verdict that cannot be read is recorded against that PR, and the
+        // repo is still judged: every other question here needs only the list
+        // payload, and a read failure must not take a stale PR's finding, a
+        // hold, or the pins below out of the report. (Before the hold rule the
+        // stale findings were pushed ahead of these reads, so one PR's 5xx
+        // could only cost the red/conflicted half.)
+        try {
+          health.set(p.number, await botPullHealth(repo, p));
+        } catch (e) {
+          if (!(e instanceof CouldNotCheck)) throw e;
+          row.unchecked.push(`bot PR #${p.number}: ${e.message}`);
+        }
+      }
+
+      // MAINTENANCE.md is read only when a bot PR carries the hold label, and
+      // once per repo. Its failure is recorded against this repo and the rest
+      // of the repo is still checked; the labelled PRs are then judged as if
+      // unlabelled, since nothing has confirmed the hold.
+      const labelled = bots.filter((p) => isHeldLabel(p.labels));
+      let doc = null;
+      if (labelled.length) {
+        try {
+          doc = await maintenanceDoc(repo, meta.default_branch);
+        } catch (e) {
+          if (!(e instanceof CouldNotCheck)) throw e;
+          row.unchecked.push(`\`${HOLD_LABEL}\` on ${labelled.map((p) => '#' + p.number).join(', ')}: ${e.message}`);
+        }
+      }
+      const triage = triageBotPulls(pulls, health, doc);
+
+      row.stalePulls = triage.stalePulls;
       for (const p of row.stalePulls) {
         findings.push(`${repo}: bot PR #${p.number} "${p.title}" is ${p.ageDays.toFixed(0)}d old — ${p.url}`);
       }
 
-      // Every open bot PR, whatever its age: a red one is a PR the merge
-      // automation will never land, and a fresh one going red is the first
-      // sign of a canonical-text edit here reddening the family.
-      for (const p of pulls.filter((q) => q.bot)) {
-        const h = await botPullHealth(repo, p);
-        if (!h.red.length && !h.conflicted) continue;
-        row.badPulls.push({ number: p.number, red: h.red, conflicted: h.conflicted });
+      row.badPulls = triage.badPulls;
+      for (const p of row.badPulls) {
         const why = [
-          h.red.length ? `red (${h.red.join(', ')})` : '',
-          h.conflicted ? 'conflicted' : '',
+          p.red.length ? `red (${p.red.join(', ')})` : '',
+          p.conflicted ? 'conflicted' : '',
         ].filter(Boolean).join(' and ');
         findings.push(`${repo}: bot PR #${p.number} "${p.title}" is ${why} — ${p.url}`);
+      }
+
+      row.held = triage.held;
+      row.unrecordedHolds = triage.unrecorded.map((p) => p.number);
+      for (const p of triage.unrecorded) {
+        findings.push(
+          `${repo}: bot PR #${p.number} "${p.title}" carries the \`${HOLD_LABEL}\` label but MAINTENANCE.md ` +
+          `does not mention #${p.number} — held without a recorded reason. Record the hold (why, and what ` +
+          `would lift it) in MAINTENANCE.md, or take the label off — ${p.url}`
+        );
       }
 
       if (repoPins && Object.keys(heads).length) {
@@ -521,18 +658,27 @@ async function main() {
     rows.push(row);
   }
 
+  // A held PR is neither a finding nor a could-not-check: the status is
+  // decided without it, so a family whose only open business is recorded
+  // holds reads healthy and exits 0.
   const status = unchecked.length ? 'could-not-check' : findings.length ? 'needs-attention' : 'healthy';
+  const held = heldAcross(rows);
 
   if (JSON_OUT) {
-    console.log(JSON.stringify({ status, findings, unchecked, repos: rows }, null, 2));
+    console.log(JSON.stringify({ status, findings, unchecked, held, repos: rows }, null, 2));
   } else if (MD_OUT) {
     console.log(renderMarkdown(status, findings, unchecked, rows));
   } else {
     console.log(`jfs family liveness — ${REPOS.length} repos, ${status}\n`);
     for (const f of findings) console.log(`  ! ${f.replace(/[`*]/g, '')}`);
     for (const u of unchecked) console.log(`  ? could not check — ${u}`);
+    for (const h of held) console.log(`  ~ held (recorded in MAINTENANCE.md) — ${heldLine(h)}`);
     if (!findings.length && !unchecked.length) {
-      console.log('  every scheduled run green, no default branch red, no bot PR stale/red/conflicted, nothing stranded, every pin current.');
+      console.log(
+        '  every scheduled run green, no default branch red, no bot PR stale/red/conflicted' +
+        (held.length ? ` but the ${held.length} held on purpose` : '') +
+        ', nothing stranded, every pin current.'
+      );
     }
   }
 
@@ -541,7 +687,21 @@ async function main() {
   process.exit(unchecked.length ? 2 : findings.length ? 1 : 0);
 }
 
+/** Every held PR across the report, tagged with its repo. */
+export function heldAcross(rows) {
+  return (rows || []).flatMap((r) => (r.held || []).map((h) => ({ repo: r.repo, ...h })));
+}
+
+function heldLine(h) {
+  const state = [
+    h.red?.length ? `red (${h.red.join(', ')})` : '',
+    h.conflicted ? 'conflicted' : '',
+  ].filter(Boolean).join(' and ');
+  return `${h.repo} #${h.number} "${h.title}" — ${h.ageDays.toFixed(0)}d old${state ? `, ${state}` : ''} — ${h.url}`;
+}
+
 export function renderMarkdown(status, findings, unchecked, rows) {
+  const held = heldAcross(rows);
   const out = [];
   out.push(`## Family automation liveness — ${status}`, '');
   if (findings.length) {
@@ -555,12 +715,28 @@ export function renderMarkdown(status, findings, unchecked, rows) {
     out.push('');
   }
   if (!findings.length && !unchecked.length) {
-    out.push('Every repo\'s last scheduled run succeeded, no default branch is red, no `auto/*` branch is stranded, no bot PR is stale, red or conflicted, and every `@jfs/*` pin is current.', '');
+    out.push(
+      'Every repo\'s last scheduled run succeeded, no default branch is red, no `auto/*` branch is stranded, ' +
+      `no bot PR is stale, red or conflicted${held.length ? ' but the ones held on purpose below' : ''}, ` +
+      'and every `@jfs/*` pin is current.',
+      ''
+    );
+  }
+  if (held.length) {
+    out.push(
+      '### Held (recorded in MAINTENANCE.md)', '',
+      `Bot PRs carrying the \`${HOLD_LABEL}\` label that their repo's MAINTENANCE.md records by number — the ` +
+      'decision, its reason and what would lift it are written there. Not findings, so on their own they neither ' +
+      'redden the run nor comment on the issue; listed in every report so that one which does never omits them.',
+      ''
+    );
+    for (const h of held) out.push(`- ${heldLine(h)}`);
+    out.push('');
   }
   out.push(
     '### Per repo', '',
-    '| repo | scheduled runs | red on default branch | stranded | stale bot PRs | red / conflicted bot PRs | pins behind |',
-    '| --- | --- | --- | --- | --- | --- | --- |'
+    '| repo | scheduled runs | red on default branch | stranded | stale bot PRs | red / conflicted bot PRs | held bot PRs | pins behind |',
+    '| --- | --- | --- | --- | --- | --- | --- | --- |'
   );
   for (const r of rows) {
     const runs = r.scheduled.length
@@ -574,9 +750,13 @@ export function renderMarkdown(status, findings, unchecked, rows) {
     const badPulls = (r.badPulls || [])
       .map((p) => `#${p.number} ${[p.red.length ? 'red' : '', p.conflicted ? 'conflicted' : ''].filter(Boolean).join('+')}`)
       .join(', ');
+    const heldCell = [
+      ...(r.held || []).map((h) => `#${h.number}`),
+      ...(r.unrecordedHolds || []).map((n) => `#${n} ✗ unrecorded`),
+    ].join(', ');
     out.push(
       `| ${r.repo} | ${runs} | ${redOnMain || '—'} | ${r.stranded.join(', ') || '—'} | ` +
-      `${r.stalePulls.map((p) => '#' + p.number).join(', ') || '—'} | ${badPulls || '—'} | ` +
+      `${r.stalePulls.map((p) => '#' + p.number).join(', ') || '—'} | ${badPulls || '—'} | ${heldCell || '—'} | ` +
       `${r.stalePins.map((p) => `${p.kit} −${p.behind}`).join(', ') || '—'} |`
     );
   }

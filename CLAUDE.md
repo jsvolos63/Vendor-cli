@@ -412,6 +412,24 @@ and PR CI at once, none of it a scheduled run — and whether GitHub has
 disabled a workflow for inactivity, since a disabled cron's last run reads
 green for ever.
 
+**A bot PR held on purpose is listed, not reported — on a label AND a
+record.** Some bot PRs stay open by decision: a major the protocol's triage
+said to hold, with the reason and the lifting condition in that repo's
+`MAINTENANCE.md` (Surf-Tracker #256, `@extractus/article-extractor` 9.x, is
+red BY DESIGN because the gate test written for it fails on 9.0.1; #273 is
+`@netlify/blobs` 11). Reported every Monday, such a PR keeps the run red with
+nothing for a session to do, and an alarm that is always on trains everyone to
+stop reading it. So an open bot PR carrying the label `hold` goes to the
+report's "Held (recorded in MAINTENANCE.md)" section and the per-repo table's
+held column instead of the stale and red/conflicted findings — but only when
+the repo's `MAINTENANCE.md`, read on the default branch, names it as
+`#<number>` in its repo-specific half (the synced family block records no one
+repo's decision, so a number there counts for none). The file is read only in a
+repo that has such a PR, once, inside the contents scope the token already has;
+labels ride on the pulls list payload, so there is no new endpoint. A family
+whose only open business is recorded holds exits 0. The label is how a session
+SAYS a PR is held; the record is what the monitor checks.
+
 `.github/workflows/family-liveness.yml` runs it Mondays 08:10 UTC —
 deliberately ~90 minutes after the 06:41 bump, so it observes THIS week's run —
 and opens ONE rolling issue here when something needs a session. One issue in
@@ -420,7 +438,7 @@ would need an `issues: write` grant in each, and the notifier's own failure
 would be silent. The run itself also goes red, because a green run with an
 issue attached is the same invisible signal again.
 
-Five properties not to undo:
+Six properties not to undo:
 
 - **It needs a PAT** (`FAMILY_READ_TOKEN`; read on contents, actions,
   pull-requests). A repo-scoped `GITHUB_TOKEN` cannot see its siblings.
@@ -436,9 +454,24 @@ Five properties not to undo:
   `judgedWorkflows` drops that one path in this repo only;
   `test/family-liveness.test.mjs` holds it, with the same red runs on
   `test.yml` as the control that this repo is still watched.
+- **A label alone never mutes; the recorded reason is checked.** A `hold`
+  label that `MAINTENANCE.md` does not back is itself a finding ("held
+  without a recorded reason"), and the PR is judged exactly as if it carried
+  no label. A missing or unreadable `MAINTENANCE.md` is could-not-check
+  (exit 2), and mutes nothing meanwhile. A person's PR is not question 4's
+  business with or without the label. `triageBotPulls` and `recordsPull`
+  decide it, and `test/family-liveness.test.mjs` holds every branch —
+  recorded, unrecorded, 404, 403, a person's PR, no label — each
+  mutation-checked. Making the label sufficient on its own would give any
+  session a silent mute for exactly the PRs this question exists to surface.
 - **No `npm ci`.** The script is dependency-free so a broken lockfile or a
   failed install can never blind the monitor — the same reasoning as
   Surf-Tracker's health check, written after a 54-day silent content outage.
+  The hold rule made it import one sibling, `tools/maintenance-doc-check.mjs`
+  (for `splitDoc`, the one definition of a MAINTENANCE.md's repo half), and
+  `test/family-liveness.test.mjs` holds the whole import graph to `node:`
+  builtins and files under `tools/`, so the reuse cannot smuggle a dependency
+  in.
 - **Exit 2 is COULD NOT CHECK, and outranks a clean result.** No token,
   insufficient scope, or an API failure exits 2, never 0, and a partial look
   never reports the family healthy on the strength of the repos it did read.
