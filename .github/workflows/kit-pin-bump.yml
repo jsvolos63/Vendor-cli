@@ -64,6 +64,21 @@
 # default github.token is used throughout (same as family-ci.yml), so no
 # secrets need to be forwarded; `secrets: inherit` is unnecessary.
 #
+# TWO JOBS, ON PURPOSE, AND THE SPLIT IS THE SECURITY BOUNDARY. Everything
+# that executes code nobody reviewed — `npm install` of kit commits resolved
+# seconds ago (their lifecycle scripts), the kits' own vendor CLIs in
+# vendor-sync, and the caller's check-command, which imports the freshly
+# vendored copies — runs in `prepare`, whose token is downgraded to
+# `contents: read`. It hands the bumped tree to `bump` as a git patch
+# artifact. `bump` holds the write token and executes NOTHING from the repo:
+# checkout, apply the patch, open the PR, merge. So a compromised kit commit
+# (or a compromised dependency of one) landing in the weekly bump can at
+# worst ship itself in the PR it was always going to ride — it cannot push
+# to the default branch, touch other branches, or approve anything. Before
+# the split (2026-09-26) the single job ran that code with the write token
+# in its environment; the family security audit rated it the family's
+# largest blast radius (FAM-1).
+#
 # One place to fix the flow for every consumer. Treat edits here like kit
 # API changes: they land in every repo's next scheduled bump at once.
 name: Kit pin bump
@@ -168,14 +183,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  bump:
+  # Read-only: every step that runs code resolved seconds ago lives here.
+  prepare:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      # Downgraded from the caller's grant. The bumper's git ls-remote, the
+      # API pre-flight and a check-command that fetches a private data
+      # branch of the same repo all need only read.
+      contents: read
     outputs:
-      # The commit the squash-merge put on the default branch, and the only
-      # thing the release job below needs from this one. Empty whenever no
-      # merge happened (no pin moved, auto-merge off, the merge was blocked).
-      merge-sha: ${{ steps.merge.outputs.merge-sha }}
+      changed: ${{ steps.diff.outputs.changed }}
     defaults:
       run:
         # An explicit `shell: bash` runs every step as `bash -eo pipefail`;
@@ -188,8 +206,7 @@ jobs:
         with:
           # The install steps below run npm lifecycle scripts from kit commits
           # that were resolved seconds ago and reviewed by nobody. Don't leave
-          # the contents+pull-requests write token in .git/config for them;
-          # create-pull-request pushes with the token it is handed explicitly.
+          # even the read token in .git/config for them.
           persist-credentials: false
 
       - uses: actions/setup-node@v7
@@ -206,6 +223,7 @@ jobs:
 
       - name: Bump @jfs kit pins to their current HEADs
         env:
+          # Read-only in this job — enough for the bumper's pin pre-flight.
           GITHUB_TOKEN: ${{ github.token }}
         run: npm run kit-pins:bump
 
@@ -247,7 +265,7 @@ jobs:
 
       # PRs opened with the default GITHUB_TOKEN never trigger pull_request
       # workflows, so the repo's CI can't validate this PR before merge. Run
-      # the same checks here instead — the merge step below is only reached
+      # the same checks here instead — the merge job below is only reached
       # if they pass. There is NO backstop after that: a merge made with
       # GITHUB_TOKEN fires no push workflows either, so the merged commit
       # gets no CI run on main (BearsMockDraft measured it: neither its
@@ -271,10 +289,72 @@ jobs:
           # 16 seconds in, before the PR step, so the repo's kit pins sat
           # behind every sibling's while its workflow page said only
           # "failure". Keep the two workflows' check steps in step.
+          #
+          # In this job the token is READ-ONLY (see the job's permissions):
+          # a fetch still works, and the checks can no longer push anything.
           GITHUB_TOKEN: ${{ github.token }}
         run: ${{ inputs.check-command }}
 
-      - name: Open a pull request if anything changed
+      # Hand the result over as a patch. The write job applies it with
+      # `git apply` — data, not code — so nothing that ran here ever meets
+      # the write token. A pin bump has no business touching the workflows
+      # (and GITHUB_TOKEN could not push one anyway); refuse rather than
+      # discover that at the PR step.
+      - name: Package the bumped tree as a patch
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          git add -A
+          if git diff --cached --name-only | grep -q '^\.github/workflows/'; then
+            echo "::error::The bumped tree changes .github/workflows — a pin bump must never do that. Refusing to hand it to the write job."
+            exit 1
+          fi
+          git diff --cached --binary > "$RUNNER_TEMP/kit-pin-bump.patch"
+          echo "Patch: $(wc -c < "$RUNNER_TEMP/kit-pin-bump.patch") bytes, $(git diff --cached --name-only | wc -l) files"
+
+      - uses: actions/upload-artifact@v7
+        if: steps.diff.outputs.changed == 'true'
+        with:
+          name: kit-pin-bump-${{ github.run_id }}
+          path: ${{ runner.temp }}/kit-pin-bump.patch
+          retention-days: 1
+          if-no-files-found: error
+
+  # Write-scoped: applies the patch, opens the PR, merges. Runs NO code from
+  # the repo or its dependencies — no install, no scripts, no checks.
+  bump:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      # The commit the squash-merge put on the default branch, and the only
+      # thing the release job below needs from this one. Empty whenever no
+      # merge happened (auto-merge off, the merge was blocked).
+      merge-sha: ${{ steps.merge.outputs.merge-sha }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # create-pull-request pushes with the token it is handed explicitly;
+          # nothing else here needs a credential in .git/config.
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: kit-pin-bump-${{ github.run_id }}
+          path: ${{ runner.temp }}
+
+      - name: Apply the bumped tree
+        run: |
+          git apply --index --whitespace=nowarn "$RUNNER_TEMP/kit-pin-bump.patch"
+          git status --short
+
+      - name: Open a pull request
         id: cpr
         # Pinned by SHA, not tag: this runs in every family repo with
         # contents + pull-requests write, and a version tag (`v8`, `v8.1.1`)
@@ -293,10 +373,10 @@ jobs:
             regenerated, the CLAUDE.md family-conventions block re-synced
             from the bumped vendor-cli, and the app version bumped per this
             repo's caller inputs; the repo's CI checks ran green inside the
-            bump workflow before this PR was opened. (PRs opened with the default
-            GITHUB_TOKEN never trigger pull_request CI, and neither does the
-            merge it makes, so that pre-merge run is the only validation
-            this change gets.)
+            bump workflow (in a read-only job) before this PR was opened.
+            (PRs opened with the default GITHUB_TOKEN never trigger
+            pull_request CI, and neither does the merge it makes, so that
+            pre-merge run is the only validation this change gets.)
 
             ${{ inputs.pr-body-extra }}
 

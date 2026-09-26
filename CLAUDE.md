@@ -41,6 +41,29 @@ in-workflow because default-token PRs never trigger pull_request CI),
 the same opt-in family-ci has), `auto-merge` (default true), `soft-fail`
 (default false), `release-title` ('' skips), `pr-body-extra`.
 
+**The bump is two jobs, and the split is a security boundary** (2026-09-26,
+audit finding FAM-1). Everything that executes code nobody reviewed — the
+`npm install` of kit commits resolved seconds ago and their lifecycle
+scripts, the kits' own vendor CLIs in `vendor-sync-command`, and the
+caller's `check-command`, which imports the freshly vendored copies — runs
+in `prepare`, whose token is downgraded to `contents: read`. It hands the
+bumped tree to `bump` as a git patch artifact, and `bump` — the only job
+with `contents: write` + `pull-requests: write` — executes nothing from
+the repo: checkout, `git apply`, open the PR, merge. A compromised kit
+commit landing in the weekly bump can therefore at worst ship itself in
+the PR it was always going to ride; it cannot push to the default branch,
+touch other branches or approve anything. `prepare` also refuses to hand
+over a patch that touches `.github/workflows/`. `test/workflows.test.mjs`
+holds the split (which job runs the `inputs.*` commands, which holds the
+write token, that the write job depends on the read job and applies a
+patch rather than checking out a pushed branch), each half shown to fail
+on a mutated copy. Before the split, one job ran the untrusted commands
+with the write token in its environment. What the split does NOT close:
+the pins are still resolved from each kit's default-branch HEAD with no
+provenance check, and the PR still merges unreviewed — branch protection
+on the five public repos (a settings change) and a bot identity whose PRs
+trigger CI are the next two steps, recorded in the family audit.
+
 The `claude-md-sync-command` step (default: `npm install` then
 `npx --no-install jfs-claude-md-sync`) is how the canonical
 family-conventions text propagates: an edit to

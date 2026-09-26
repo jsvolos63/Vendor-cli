@@ -376,3 +376,34 @@ test('README names every bin the package ships', () => {
     assert.ok(readme.includes(`\`${bin}\``), `README.md never names the \`${bin}\` bin`);
   }
 });
+
+// ------------------------------------------------------------------ the bump's token split
+
+test('kit-pin-bump runs every untrusted command under a read-only token, and the write job runs no code', () => {
+  // The security boundary of the weekly bump (FAM-1 in the 2026-09-26 family
+  // audit): `npm install` of kit commits resolved seconds ago, the kits' own
+  // vendor CLIs and the caller's check-command all execute code nobody
+  // reviewed. They must run in a job whose token is downgraded to
+  // `contents: read`, and the job that holds the write token must execute
+  // nothing but checkout, patch apply, PR open and merge. A single job that
+  // did both is exactly what this workflow was until the split.
+  const w = wf('kit-pin-bump.yml');
+  const jobs = w.jobs;
+  const runsUntrusted = (job) => (job.steps || []).some((s) => typeof s.run === 'string'
+    && /\$\{\{\s*inputs\.(install-command|vendor-sync-command|claude-md-sync-command|version-bump-command|check-command)\s*\}\}|\bnpm\b|\bnpx\b/.test(s.run));
+  const holdsWrite = (job) => Object.values(job.permissions || {}).includes('write')
+    || (job.steps || []).some((s) => /create-pull-request/.test(s.uses || '') || /gh pr merge/.test(s.run || ''));
+  const untrusted = Object.entries(jobs).filter(([, j]) => !j.uses && runsUntrusted(j)).map(([n]) => n);
+  const writers = Object.entries(jobs).filter(([, j]) => !j.uses && holdsWrite(j)).map(([n]) => n);
+  assert.deepEqual(untrusted, ['prepare'], 'the untrusted commands moved out of the read-only job');
+  assert.deepEqual(writers, ['bump'], 'a job other than the write job holds the write token or merges');
+  assert.deepEqual(jobs.prepare.permissions, { contents: 'read' }, 'prepare must be downgraded to contents: read and nothing else');
+  assert.ok(!runsUntrusted(jobs.bump), 'the write job runs an install/npm/inputs command');
+  assert.equal(jobs.bump.needs, 'prepare', 'the write job must depend on the read-only job');
+  // The hand-over is a patch, never a checkout of a branch the untrusted job
+  // pushed: `git apply` treats the bumped tree as data.
+  assert.ok((jobs.bump.steps || []).some((s) => /git apply/.test(s.run || '')), 'the write job must apply the patch with git apply');
+  assert.ok((jobs.prepare.steps || []).some((s) => /upload-artifact@/.test(s.uses || '')), 'prepare must upload the patch artifact');
+  // And the untrusted job never gets to hand over a workflow edit.
+  assert.ok((jobs.prepare.steps || []).some((s) => /\.github\/workflows/.test(s.run || '') && /exit 1/.test(s.run || '')), 'prepare must refuse a patch that touches .github/workflows');
+});
