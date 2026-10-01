@@ -75,21 +75,38 @@ repo and shipped as a real defect.
 A new build is never applied under the reader mid-session: no reload, no
 swap of the controlling worker while a page is open. The worker registers,
 the page shows a "new version" pill, and the new build takes over on a
-gesture (the pill) or on the next launch. Two mechanisms satisfy that and
-each app picks ONE: a worker that WAITS (no `skipWaiting()` in install; the
-pill posts `SKIP_WAITING` and reloads on `controllerchange`) or a worker that
-activates on install but never `clients.claim()`s (the pill just reloads).
-Never mix them — a pill that posts `SKIP_WAITING` at a worker that already
-activated has nothing to wait for and strands on "Updating…", which shipped
-once.
+gesture (the pill) or on the next launch. One mechanism satisfies that: a
+worker that WAITS — no `skipWaiting()` in install. The pill reads
+`registration.waiting` when it is TAPPED (after a second deploy, the worker
+it was first shown for is redundant), posts it `SKIP_WAITING`, and reloads
+on `controllerchange`, on that worker turning redundant, or at a ceiling of
+seconds — never a sub-second timer, which reloads onto the old build; with
+nothing waiting it just reloads. The worker's activate skips its cache prune
+while a newer worker is installing or waiting. A worker that activates on
+install but never `clients.claim()`s does NOT satisfy the rule, whatever its
+pill does: activation hands every page the registration already controls to
+the new worker (the SW spec's Activate step — `claim()` only concerns pages
+no worker controls; measured in Chromium), and the open page then fetches
+through the new build. The apps still on that model, pwa-kit's
+`createServiceWorker` default among them, move to the waiting worker one at
+a time; never half-migrate one — a pill that posts `SKIP_WAITING` at a
+worker that already activated has nothing to wait for and strands on
+"Updating…", which shipped once.
 
 ### Dependencies
 
-Every npm repo carries `.github/dependabot.yml` (weekly npm, minor and patch
-grouped into one PR; monthly `github-actions`) and calls the family's
-`dependabot-merge.yml` reusable workflow, which squash-merges a Dependabot PR
-once the repo's CI is green on it and every bump in it is minor or patch. A
-MAJOR bump is left open for a session or a human. Dependabot never touches
-the `@jfs/*` git pins; the weekly kit-pin bump owns those. First-party
-`actions/*` are referenced by major tag; every other action is pinned by
-full SHA.
+Every npm repo carries `.github/dependabot.yml` — npm weekly, or monthly
+where the repo's MAINTENANCE.md records why (a Netlify free plan, where every
+merge is a paid deploy); minor and patch grouped, any production
+dependencies in a group of their own; monthly `github-actions`; a 7-day
+`cooldown` — and calls the family's `dependabot-merge.yml` reusable
+workflow, which squash-merges a Dependabot PR once the repo's CI is green on
+it and every bump in it is minor or patch. It
+leaves open every MAJOR, and every grouped npm version update that bumps a
+direct production dependency: those run where the keys live and the suites
+fake the network, so a session reads each package's release notes and merges
+it by hand. A security update arrives ungrouped and still merges on green —
+which makes the grouping load-bearing. Dependabot never touches the `@jfs/*`
+git pins; the kit-pin bump owns those (weekly, or on the cadence the repo
+records). First-party `actions/*` are referenced by major tag; every other
+action is pinned by full SHA.

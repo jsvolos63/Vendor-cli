@@ -1,8 +1,8 @@
 # Maintaining @jfs/vendor-cli
 
-This repo's own health is the shortest thing in this file: 228 tests green,
+This repo's own health is the shortest thing in this file: 255 tests green,
 `eslint .` clean, no advisories, nothing vendored that could drift, nothing
-deployed, and every version from `v0.17.0` to `v0.21.8` carrying a tag. What
+deployed, and every version from `v0.17.0` to `v0.21.10` carrying a tag. What
 maintenance here actually turns on is that nearly every file in this repository
 is an **input to thirteen others** — four reusable workflows, two canonical
 texts, one sanitizer policy, one code generator and one module linker — so the
@@ -19,9 +19,9 @@ findings each, on the rolling issue #60).
 | --- | --- | --- | --- | --- |
 | `.github/workflows/test.yml` → `family-ci.yml` **locally** (`uses: ./…`), with `node-version-file: .nvmrc`, `install-command: npm install`, `run: npm run lint` + `npm test`, `version-guard-paths: index.mjs bin family tools module-graph` | every push on every branch, every `pull_request`, `workflow_dispatch` | — it *is* the gate | nothing | red on the commit or the PR. The only automation here whose failure appears where somebody is already looking. |
 | `.github/workflows/release-self.yml` → `release.yml` locally | `workflow_run` on **Test** completed, `branches: [main]`; plus `workflow_dispatch` | the `v<version>` tag and its GitHub release | nothing | nothing — but it demonstrably works here. Every version back to `v0.17.0` is tagged and `v0.21.7` sits on `7a1e0b5`. Merges to `main` in this repo are made with a user token, which fires the push CI run the gate waits on; that is why this repo does not have the untagged-version problem three consumers do. |
-| `.github/workflows/dependabot-merge-self.yml` → `dependabot-merge.yml` locally | `workflow_run` on **Test** completed | every minor/patch bump, squash-merged on green | **every major**, and any PR body the parser cannot read | a PR sits open and nobody is told — until the monitor's weekly run, which now reports a bot PR that is red or conflicted at any age, not only one older than a week. A PR held on purpose carries the label `hold` and is named by number in this file, and is then listed as held rather than reported. |
-| `.github/workflows/family-liveness.yml` (`cron: '10 8 * * 1'`, Mondays 08:10 UTC) + dispatch | weekly | the family's four weekly questions asked mechanically; one rolling issue in *this* repo; a red run | acting on whatever it finds | its own red run and issue #60. Run 35789279594 (dispatched 2026-09-22 21:53 UTC, 16:53 CDT) exited 2, could-not-check, because the `FAMILY_READ_TOKEN` secret did not exist, and opened #60 saying so — the failure mode working as designed. The owner created the token on 2026-09-23: run 35914155538's first attempt still met nine private repos answering 404 (exit 2), and its second attempt and run 35918562939 (20:19 and 20:49 UTC, 15:19 and 15:49 CDT) read all fourteen repos and exited 1 with 44 findings each. Two of those were Surf-Tracker #256, a Dependabot major held by decision in that repo's MAINTENANCE.md and red by design — which a monitor with no way to tell a hold from neglect reports every Monday for ever. Since 0.21.9 a bot PR labelled `hold` AND named as `#<number>` in its repo's MAINTENANCE.md is listed under "Held" instead; a label with no record is a finding of its own. |
-| `.github/dependabot.yml` | npm weekly Tuesday (minor+patch grouped, `open-pull-requests-limit: 5`); `github-actions` monthly (no limit set, so GitHub's default 5) | opening the PRs | the review of every major | a PR sits open. |
+| `.github/workflows/dependabot-merge-self.yml` → `dependabot-merge.yml` locally | `workflow_run` on **Test** completed | every minor/patch bump, squash-merged on green — except, since 0.22.0, a grouped update of a direct production dependency (here only `esbuild`) | **every major**, a grouped production bump, and any PR the parser cannot read | a PR sits open and nobody is told — until the monitor's weekly run, which now reports a bot PR that is red or conflicted at any age, not only one older than a week. A PR held on purpose carries the label `hold` and is named by number in this file, and is then listed as held rather than reported. |
+| `.github/workflows/family-liveness.yml` (`cron: '10 8 * * 1'`, Mondays 08:10 UTC) + dispatch | weekly | the family's four weekly questions asked mechanically; one rolling issue in *this* repo; a red run | acting on whatever it finds | its own red run and issue #60. Run 35789279594 (dispatched 2026-09-22 21:53 UTC, 16:53 CDT) exited 2, could-not-check, because the `FAMILY_READ_TOKEN` secret did not exist, and opened #60 saying so — the failure mode working as designed. The owner created the token on 2026-09-23: run 35914155538's first attempt still met nine private repos answering 404 (exit 2), and its second attempt and run 35918562939 (20:19 and 20:49 UTC, 15:19 and 15:49 CDT) read all fourteen repos and exited 1 with 44 findings each. Two of those were Surf-Tracker #256, a Dependabot major held by decision in that repo's MAINTENANCE.md and red by design — which a monitor with no way to tell a hold from neglect reports every Monday for ever. Since 0.21.9 a bot PR labelled `hold` AND named as `#<number>` in its repo's MAINTENANCE.md is listed under "Held" instead; a label with no record is a finding of its own. Since 0.22.0 a dispatch of a scheduled workflow newer than its last scheduled run decides question 1, a pin is judged against the repo's own last bump run rather than a commit count, and a healthy run closes #60 — an open #60 means a session is needed now. |
+| `.github/dependabot.yml` | npm weekly Tuesday — minor+patch in two groups, `production` (`esbuild`) and `minor-and-patch` (development), `open-pull-requests-limit: 5`; `github-actions` monthly (no limit set, so GitHub's default 5); a 7-day `cooldown` on both since 2026-10-01 | opening the PRs | the review of every major and of an `esbuild` minor/patch | a PR sits open — and the monitor reports it once it is a week old. |
 | `.github/workflows/family-ci.yml`, `kit-pin-bump.yml`, `release.yml`, `dependabot-merge.yml` | `workflow_call` only — none of them has a trigger of its own | nothing, for this repo | — | see **Blast radius**. Three of the four run against this repo on every push; the fourth never does. |
 
 Two absences shape everything below.
@@ -56,7 +56,7 @@ npm test
 | Step | What it is |
 | --- | --- |
 | `npm run lint` | `eslint .` over `index.mjs`, `bin/`, `module-graph/`, `tools/`, `test/`. `test/fixture-kit/**` is ignored and must stay ignored: those files are deliberately malformed generator INPUTS. |
-| `npm test` | `node --test` over **nine explicitly named files** — `test/test.mjs`, `test/tooling.test.mjs`, `test/claude-md-sync.test.mjs`, `test/maintenance-sync.test.mjs`, `test/family-liveness.test.mjs`, `test/maintenance-doc-check.test.mjs`, `test/sanitizer-policy-sync.test.mjs`, `test/module-graph.test.mjs`, `test/workflows.test.mjs`. 228 cases, ~18 s. |
+| `npm test` | `node --test` over **ten explicitly named files** — `test/test.mjs`, `test/tooling.test.mjs`, `test/claude-md-sync.test.mjs`, `test/maintenance-sync.test.mjs`, `test/family-liveness.test.mjs`, `test/maintenance-doc-check.test.mjs`, `test/sanitizer-policy-sync.test.mjs`, `test/module-graph.test.mjs`, `test/workflows.test.mjs`, `test/dependabot-merge.test.mjs`. 255 cases, ~18 s. |
 
 Three properties of that gate matter more than the list.
 
@@ -102,8 +102,8 @@ else in the family. Counts verified by grep across the sibling checkouts on
 | `.github/workflows/kit-pin-bump.yml` | 12 consumer repos | `@main`, immediately | **no caller exists here** | silent, for a week at a time: a scheduled run on a page nobody opens. |
 | `.github/workflows/release.yml` | 10 consumer repos | `@main`, immediately | yes, `release-self.yml` | silent: a version ships untagged and nothing says so. |
 | `.github/workflows/dependabot-merge.yml` | 13 consumer repos | `@main`, immediately | yes, `dependabot-merge-self.yml` | silent: bot PRs stop merging and simply accumulate. |
-| `family/family-conventions.md` | 14 CLAUDE.md files | `jfs-claude-md-sync`, checked against vendor-cli **main** | yes | loud and immediate: every consumer's `claude-md-check` goes red the moment this merges, until each is re-synced. Has happened twice, thirteen repos at once the second time. |
-| `family/maintenance.md` | every MAINTENANCE.md with `maintenance-check: true` | `jfs-maintenance-sync`, checked against **main** | yes, as of this commit | same shape, narrower blast — which is precisely why the input defaults false. |
+| `family/family-conventions.md` | 14 CLAUDE.md files | `jfs-claude-md-sync`, checked against vendor-cli **main** | yes | loud and immediate: every consumer's `claude-md-check` goes red the moment this merges, until each is re-synced. Has happened twice, thirteen repos at once the second time; the third edit (2026-10-01) was re-synced in the same session. |
+| `family/maintenance.md` | every MAINTENANCE.md with `maintenance-check: true` — all thirteen consumers by 2026-10-01 | `jfs-maintenance-sync`, checked against **main**; since 0.22.0 the kit-pin bump carries it too, as it carries CLAUDE.md | yes | the same shape and, now that every consumer has opted in, the same blast. The input still defaults false so a repo joining the family is not red for a file it has not written. |
 | `family/sanitizer-policy.json` | `news-kit/index.js` marker regions (the only kit that carries any) | `jfs-sanitizer-policy-sync`, plus the generator's own refusal | no — nothing here carries a policy region | loud and fail-closed: the generator refuses to vendor a kit whose source regions drifted, so every consumer's `vendor:check` stops rather than shipping. |
 | `index.mjs` — the vendoring generator | 33 committed vendored copies across 8 consumers | the consumer's `@jfs/vendor-cli` **pin**, or a kit's own pin (a kit's vendor shim resolves the CLI from *inside* the kit) | yes, against `test/fixture-kit/` | the worst case in this repo: exit 0, a plausible file, a `ReferenceError` at load in a browser. `vendor:check` cannot see it, because regeneration repeats the bug. |
 | `module-graph/` — the buildless link gate | 5 suite files in 4 repos | the consumer's pin | yes, `test/module-graph.test.mjs` | red in those four repos' suites. |
@@ -146,6 +146,7 @@ rows are the monthly sweep's work and the mechanization backlog.
 | A caller's `workflows: [Test]` ↔ `test.yml`'s `name: Test` | `release-self.yml`, `dependabot-merge-self.yml` ↔ `test.yml` | **`test/workflows.test.mjs`** (here only; each consumer's pair is still prose) | the `workflow_run` trigger silently never fires: no releases, no Dependabot merges, no error. CLAUDE.md records that the name is `Test` in the kits, `Tests` in JFS-Sports and `CI` in the apps, so it cannot be defaulted. |
 | `npm test`'s named files ↔ `test/*.test.mjs` on disk | `package.json` ↔ `test/` | **`test/workflows.test.mjs`** | a test file that never runs, silently. |
 | A consumer bot PR labelled `hold` ↔ a `#<number>` naming it in that repo's MAINTENANCE.md, repo-specific half | the label on GitHub ↔ the consumer's `MAINTENANCE.md` (the deferred table the protocol's "hold it — visibly" asks for) | **`tools/family-liveness.mjs`, weekly** — an unbacked label is a finding, a missing or unreadable file is could-not-check; the rule itself by **`test/family-liveness.test.mjs`** | a label becomes a silent mute. The record is what makes a hold a decision rather than a way to stop hearing about a PR. |
+| A grouped Dependabot update carrying a direct production dependency waits for a session; an ungrouped one (a security update) and every development or `indirect` bump does not | `dependabot-merge.yml`'s merge step ↔ Dependabot's commit metadata (`dependency-type`, `dependency-group`) ↔ each consumer's `dependabot.yml` groups | **`test/dependabot-merge.test.mjs`** — the step's real script against a fake `gh`, each branch mutation-checked; the consumers' grouping is **prose only** (the canonical Dependencies text), except John's News, whose `scripts/drift.mjs` #9 holds its own | a production release auto-merges and deploys into the functions holding the keys (FAM-4) — or, if a consumer's dependabot.yml stops grouping minor/patch, production version updates arrive ungrouped and merge as if they were security updates. |
 | The 14-repo roster and the 5-kit package map in the monitor ↔ the real family | `tools/family-liveness.mjs` `REPOS`, `KIT_REPO_BY_PACKAGE` ↔ CLAUDE.md's "five kits / kit #6" count | **prose only** | a repo joins or leaves and the monitor never looks at it — the enumerated list is deliberate (reviewable in a diff), which means it is also forgettable. |
 | README's numbered job list ↔ the six bins | `README.md` ↔ `package.json` `bin` | **`test/workflows.test.mjs`** (every bin named) | it had drifted: README said the package "owns five jobs" and named neither `jfs-sanitizer-policy-sync` nor `jfs-maintenance-sync`, and `package.json`'s `description` omitted the sanitizer-policy sync. Both fixed in the sweep. |
 
@@ -166,7 +167,7 @@ that exists, and the step shapes above. It cannot prove a workflow *runs*:
 | The 13 consumers' *push and PR* CI | each consumer | red `main`, red PRs, Dependabot merges blocked | **the monitor, weekly, once it has a token.** Since the sweep `family-liveness.mjs` reports the newest non-scheduled run of each workflow on every default branch when it is red, and every open bot PR that is red or conflicted — except one held on purpose (label `hold` plus a `#<number>` in that repo's MAINTENANCE.md), which it lists as held. A session's own red PR is still nobody's to notice, and a canonical-text edit here still reddens thirteen repos up to a week before the Monday run says so — the re-sync in the same session remains the real control. |
 | "Allow GitHub Actions to create and approve pull requests" in each consumer | a per-repo GitHub setting, in no file anywhere | the bump pushes `auto/kit-pin-bump` and cannot open a PR | the monitor's stranded-branch question — but only *after* a bump has already been stranded. In a repo whose pins never move there is no push, no stranded branch, and no signal at all. |
 | `peter-evans/create-pull-request`, SHA-pinned at `5f6978faf089d4d20b00c7766989d076bb2fc7f1` (v8.1.1) | a third party | its next major, or a moved tag on its account | Dependabot's monthly `github-actions` entry, and `test/workflows.test.mjs`, which refuses a third-party `uses:` that is not a full SHA with a `# vX.Y.Z` comment. The step's first execution after a bump is still twelve consumers' Monday run. |
-| `esbuild`'s reprint | upstream | a version bump changes the BYTES of every narrowed vendored copy in eight consumers | Dependabot watches the version. **Nothing watches the output.** The 0.25.10 → 0.28.2 bump (#53) was auto-merged as a minor/patch group member and shipped with **no vendor-cli version bump at all**, because `version-guard-paths` does not include `package.json`. |
+| `esbuild`'s reprint | upstream | a version bump changes the BYTES of every narrowed vendored copy in eight consumers | Dependabot watches the version, and since 0.22.0 an `esbuild` minor/patch is a grouped production bump that waits for a session instead of auto-merging. **Nothing watches the output.** The 0.25.10 → 0.28.2 bump (#53) was auto-merged as a minor/patch group member and shipped with **no vendor-cli version bump at all**, because `version-guard-paths` does not include `package.json` — the session that merges the next one should bump the version by hand. |
 | GitHub Actions platform semantics | GitHub | this repo's design rests on four of them: a `GITHUB_TOKEN` push fires no workflows; `workflow_run` fires for any branch and for fork PRs; `setup-node` prefers a non-empty `node-version` over `node-version-file`; string `==` ignores case | nothing. Each is recorded in a comment beside the code that depends on it, which is the best available substitute. |
 | The npm registry and GitHub codeload for `github:` installs | third parties | every consumer's install fails loudly | nothing, and nothing needs to. |
 
@@ -189,7 +190,9 @@ repos.
   `package.json`, the repo and its workflow inventory), two per open bot PR,
   one `MAINTENANCE.md` read per repo that has a `hold`-labelled bot PR (and
   none in any other; labels come on the PR list it already reads), ten for
-  the five kit HEADs, and one `compare` per pin not at HEAD — order
+  the five kit HEADs, and one `compare` per pin not at HEAD (whose commit list
+also dates the oldest commit the pin lacks, for `pinVerdict` — no extra
+call) — order
   200 calls per weekly run against a PAT's 5,000/hour. Each call carries
   `AbortSignal.timeout(20_000)` and the job carries `timeout-minutes: 15`.
   There is no caching and no conditional-request handling; at family scale
@@ -223,30 +226,47 @@ checking it is family-ci's version-bump job, on pull requests and dispatches.
 
 ## Deferred and stuck
 
-Nothing is deferred. The four Dependabot majors that sat open 13 days in the
-hub (#49–#52, filling 4 of the `github-actions` ecosystem's 5 default PR
-slots) landed in the 2026-09-22 sweep as four separate commits on its branch,
-each carrying its proof; Dependabot closes a PR once `main` carries the
-version it proposed. `engines.node` went from `>=18` to `>=22` in the same
-sweep, with the test that holds it to `.nvmrc`.
+**Security work this repo owns** (the family audit of 2026-09-26, whose
+family-wide findings live in every app's SECURITY_AUDIT.md; this repo has no
+audit file of its own, so its share is tracked here):
 
-What the four majors still owe after merge is a real run in the places no CI
-here executes:
+| Finding | What it asks of this repo | Status |
+| --- | --- | --- |
+| FAM-1 (a) | run the bump's untrusted steps under a read-only token | **done**, 0.21.10 (#63): `prepare` is `contents: read`, the write job runs no repo code |
+| FAM-1 (b) | branch protection on `main` here and in the five public repos, with a bot identity whose PRs fire CI (a "require green CI" rule would otherwise block the bump's own merges) | **open, owner-only** — a settings change no session can make |
+| FAM-1 (c) | resolve signed tags, not each kit's default-branch HEAD, in `bumpKitPins` | open |
+| FAM-1 (d) | `auto-merge: false` for news-kit and pwa-kit (browser-shipped) in the eight apps | open — each app caller's decision, not this repo's |
+| FAM-1 (e) | a diff tripwire in the bump: refuse a re-vendor that touches a sanitizer-policy region, adds `eval`/`Function`/`innerHTML`/`importScripts`, or grows past a size delta | open — the `prepare` job refuses only `.github/workflows/` changes today |
+| FAM-2 | pin consumers' `uses: …@main` and family-ci's tooling checkout to a tag or SHA, rolled by the bump or Dependabot | open — every caller is still `@main` |
+| FAM-4 | production dependencies wait for a session; cooldown | **done here**, 0.22.0: `dependabot-merge.yml` holds grouped direct-production updates; cooldown and the production group are in this repo's dependabot.yml, and the consumers' were re-synced the same day |
 
-| Dependency | Now | Proved here | Still to observe after merge |
-| --- | --- | --- | --- |
-| `peter-evans/create-pull-request` | 7.0.9 → 8.1.1, `5f6978f…` | inputs and outputs read against the action's own `action.yml` at that SHA; the pinning test | a dispatched kit-pin bump in a consumer whose "Actions may create PRs" setting is on (Art-Gallery-): PR created, merged, release job run, no Node 20 warning. Not pwa-kit, fetch-kit or Netlify-kit, whose setting fails the step for another reason. |
-| `actions/checkout` | v5 → v7 | this PR's family-ci run (two checkouts, `fetch-depth: 0` in version-bump) | the first `checkout@v7` under `workflow_run` in the family: this repo's `release-self` run after the merge push. |
-| `actions/setup-node` | v5 → v7 | this PR's run resolves `.nvmrc` through the precedence guard | one consumer whose `.nvmrc` says 24 (BearsMockDraft): "Resolved .nvmrc as 24". |
-| `actions/setup-python` | v6 → v7 | nothing — the step is skipped here | Zepbound-'s CI, the one caller passing `python-version` (`'3.12'`). Its own crons already run `v7.0.0` green. |
+**The service-worker convention changed under seven apps.** Since 0.22.0
+the canonical Service-worker-updates text names one mechanism — the waiting
+worker — because the activate-on-install alternative it used to allow is not
+swap-free (market-monitor measured it in Chromium, #449). Surf-Tracker,
+BearsMockDraft, FlightCheck, John's News and Weather run pwa-kit's
+`createServiceWorker` default (`skipWaiting: true`), and Art-Gallery- and
+Zepbound- hand-roll the same model; each moves to `skipWaiting: false` plus a
+pill that reads `registration.waiting` at tap time, one app per PR, with a
+version bump and a production deploy each. pwa-kit keeps the old default on
+purpose: flipping it would switch all seven at once through an unreviewed
+weekly bump, and a pill that just reloads never activates a waiting worker.
 
-Not deferred, just not done: `esbuild` is exactly pinned at `0.28.2`, which is
-the current release; `eslint` (`^10.9.1`, latest 10.11.0), `@eslint/js`,
-`globals` and `yaml` are all inside their ranges; `npm audit --omit=dev
---audit-level=high` reports **0 vulnerabilities**. One merged-but-undeleted
-session branch, `claude/family-review-3urdej`, sits on the remote; it is an
-ancestor of `main` and harmless. There is no stranded `auto/*` branch here and
-there never will be.
+**What the 2026-09-22 Actions majors owed after merge — observed.** On
+2026-09-28 every consumer's scheduled bump ran 0.21.10's two jobs on
+`peter-evans/create-pull-request` 8.1.1 and `actions/checkout` v7, opened its
+PR, merged it and, where the caller asks, tagged it (e.g. Weather #159 as
+`v1.35.8`, JFS-Sports #726 as `v2.41.13`); `release-self` has run here on
+checkout v7 for every tag since `v0.21.8`. The two log-level checks — no
+Node 20 deprecation warning, and BearsMockDraft's "Resolved .nvmrc as 24" —
+were not read from the logs. Zepbound-'s CI is the one `setup-python` caller.
+
+Not deferred, just not done: `esbuild` is exactly pinned at `0.28.2`;
+`npm audit --omit=dev --audit-level=high` reports **0 vulnerabilities**. One
+merged-but-undeleted session branch, `claude/family-review-3urdej`, sits on
+this remote and on the four kits'; each is an ancestor of `main` and
+harmless, and deleting them is the owner's call. There is no stranded
+`auto/*` branch here and there never will be.
 
 ## What looks like cruft and is load-bearing
 
@@ -361,8 +381,9 @@ Fastest-resolving first.
    bump fails there and nowhere else — in particular, not on the push run
    that preceded it.
 
-8. **The family's automation stopped.** Run the monitor by hand before reading
-   anything else:
+8. **The family's automation stopped.** An open issue #60 means the last
+   run found something — a healthy run closes it. Run the monitor by hand
+   before reading anything else:
 
    ```
    FAMILY_READ_TOKEN=<pat> node tools/family-liveness.mjs
@@ -382,7 +403,10 @@ Fastest-resolving first.
    re-asks a hold's lifting condition — a stale `#<number>` anywhere in the
    repo half keeps honouring a labelled PR — so that is the monthly sweep's
    dependency-currency step, which walks every outstanding major, not the
-   monitor's job.
+   monitor's job. A stale-pin finding now names the kit commit the pin lacks
+   and the bump run that should have landed it: read that run first. A
+   scheduled workflow shown as `✓ (dispatch)` was last run by hand; its
+   scheduled runs since the dispatch are what to watch next.
 
 9. **A bump is stuck in a consumer.** `git ls-remote --heads origin
    'refs/heads/auto/*'` in that repo against its open PR list. Commits with no
@@ -394,6 +418,7 @@ Fastest-resolving first.
 
 | Date | Cadence | Outcome |
 | --- | --- | --- |
+| 2026-10-01 | Family follow-ups (the 2026-09-30 loose-ends survey) | **0.22.0.** (1) **`dependabot-merge.yml` holds a grouped npm version update that bumps a direct production dependency** (`hold-production`, default true) — FAM-4's second half, which every app's audit row said needed a change here. Decided by Dependabot's commit metadata (`dependency-type: direct:production` beside a `dependency-group:`), so no caller config; an ungrouped production PR is a security update and still merges (John's News's own rule, and FAM-4's recommended shape); `indirect` and Actions bumps are not held; unreadable npm metadata is. New `test/dependabot-merge.test.mjs` runs the step's real script against a fake `gh` — 12 cases, every branch mutation-checked. (2) **family-liveness**: a dispatch of a scheduled workflow newer than its last scheduled run decides question 1 (the 09-28 report still named JFS-Sports' 09-21 kit-bump failure, fixed by a green dispatch on 09-22); pin lag is judged against the repo's own last bump run (`pinVerdict`), not "more than one commit behind" — which assumed every repo bumps weekly, would report market-monitor whenever two kit commits landed between its monthly runs, and on today's dispatched run (#6, 36842978266) reported Art-Gallery-'s news-kit pin two behind for commits that landed after its Monday bump; a healthy run closes #60. Today's run also showed the JFS-Sports finding gone and one real one left: market-monitor's smoke, red on an invalid `GEMINI_API_KEY` (owner). (3) **`kit-pin-bump.yml`**: a workflow-level `merge-sha` output (market-monitor #449's ask, so its `ci-on-main` can stop firing on months with no merge), a `maintenance-sync-command` step beside the CLAUDE.md one, and the "There is NO backstop" comment corrected. (4) **`tools/maintenance-doc-check.mjs`**'s CLI guard compared `argv[1]` plainly and so printed nothing and exited 0 through a symlink (market-monitor measured it 2026-09-30); both tools now compare real paths (`invokedAsScript`), with a symlink test that fails on the old guard. (5) **Canonical texts**: Service-worker updates now names one mechanism, the waiting worker (activate-on-install without claim is not swap-free — the SW spec's Activate step, measured in Chromium); Dependencies allows a recorded monthly cadence, requires the production/development group split and the 7-day cooldown, and states the production hold; the maintenance protocol's table, gap 1, questions 1/3/4, the weekly cadence and triage step 5 now carry the dispatch rule, the pin rule, the production hold and the `hold` label + `#<number>` record (the 0.21.9 rule that had reached no consumer). Re-synced here and in all thirteen consumers in the same session. (6) This repo's own dependabot.yml gained the cooldown and the production group (`esbuild`). Tests 255, lint clean, both sync checks and `tools/maintenance-doc-check.mjs` clean. **Not done here, recorded above:** FAM-1 (b)–(e), FAM-2, the seven apps' service-worker migrations; the owner-only branch cleanup. |
 | 2026-09-26 | Hardening, from the family security audit (FAM-1) | **Split `kit-pin-bump.yml` into a read-only `prepare` job and a write-scoped `bump` job.** Until now one job ran `npm install` of kit commits resolved seconds ago, the kits' vendor CLIs and the caller's check-command with `contents: write` + `pull-requests: write` in its environment — in twelve repos every Monday, merged by nobody. Now every untrusted command runs under `contents: read`, the bumped tree crosses to the write job as a `git diff --binary` artifact applied with `git apply` (data, not code), the write job runs no repo code at all, and `prepare` refuses to hand over a patch touching `.github/workflows/`. New test in `test/workflows.test.mjs` pins which job runs the `inputs.*` commands, which holds write, the `needs` edge and the patch hand-over; both mutations (write token on `prepare`; check-command in `bump`) fail it. 17 → 18 workflow tests, lint clean. First execution, as always for this file, is a consumer's Monday run — dispatch one consumer's `kit-pin-bump.yml` by hand after this merges and read both jobs' logs. Not closed by this change, recorded in the audit: pins still resolve from HEAD with no provenance, and the PR still merges unreviewed; branch protection on the five public repos and a bot identity whose PRs trigger CI are next. Version 0.21.9 → 0.21.10 so the tag marks the behaviour change. |
 | 2026-09-22 | Maintenance plan written | First plan for this repo; the family-wide half is now the synced block below and everything above it is what is true of the hub alone. Opted `test.yml` into `maintenance-check: true`, so both new gates run here against this repo's own tree. Verified green: 177 tests over 8 files, `eslint .` clean, `npm audit --omit=dev --audit-level=high` 0 vulnerabilities, `esbuild` pinned at the current release, every version `v0.17.0`–`v0.21.6` tagged, no stranded `auto/*` branch, `claude-md-sync --check` in sync. Seven things the writing turned up. (1) **The commit that added the maintenance protocol changed `index.mjs`, `bin/` and `family/` without bumping the version**, which `version-guard-paths` requires — the job had been skipped because it only runs on `pull_request`, so the push run was green and the PR would not be. Bumped to `0.21.7` in this commit; it is the only fix made here. (2) **`kit-pin-bump.yml` is the one reusable workflow with no local caller**, because this repo pins no kit — so every edit to it is first executed in twelve consumers on a Monday, which is how it stayed broken for five weeks. (3) **Four Dependabot majors are open and green, 13 days old, filling 4 of the `github-actions` ecosystem's 5 default PR slots**; one of them, `peter-evans/create-pull-request` 8.1.1, is the fix for the Node 20 runner deprecation that affects twelve repos. (4) **`family-liveness.mjs` reads only `?event=schedule`**, so the failure a canonical-text edit here causes — thirteen consumers red on push/PR CI — is invisible to the monitor written to watch this repo's blast radius. (5) **The esbuild 0.25.10 → 0.28.2 bump shipped with no version bump**, since `version-guard-paths` omits `package.json`; the same guard also omits `module-graph/` and `tools/`, both of which `files` ships, and `v0.21.5` was bumped by hand for a `module-graph` change the guard would not have demanded. (6) **No test in this repo reads any YAML** — four workflows serving fourteen repos are validated only by being run, one of them nowhere. (7) `README.md` still says the package "owns five jobs" and lists neither `jfs-sanitizer-policy-sync` nor `jfs-maintenance-sync`; `package.json`'s `description` omits the latter as well. Also confirmed by run 35681572086's step list that `github.repository == 'jsvolos63/vendor-cli'` matches this repo despite its canonical capital V, so family-ci's self-reference genuinely validates the PR's own tooling. |
 | 2026-09-22/23 | Weekly sweep (interrupted by the account spend limit on the 22nd; finished on the 23rd) | Baseline at `main` `3e9e174`: 178 tests, `eslint .` clean. Final: 213 tests over 9 files, lint clean, both sync checks in sync, `tools/maintenance-doc-check.mjs` clean, `npm audit --omit=dev --audit-level=high` 0 vulnerabilities. **Weekly questions:** the monitor's first run (35789279594) exited 2 — `FAMILY_READ_TOKEN` does not exist — and opened #60, owner-only; this repo has no stranded `auto/*` branch (only the merged `claude/family-review-3urdej`) and pins no kit; its four bot PRs were the Dependabot majors below. **Landed on the branch, one commit each:** `peter-evans/create-pull-request` 8.1.1 (`5f6978f`, tag and `action.yml` inputs/outputs re-verified against the remote), `actions/checkout` v7, `actions/setup-node` v7, `actions/setup-python` v7 (#49–#52). **Fixed:** `test/workflows.test.mjs`, the first test here that reads YAML, mechanizing six of the invariant table's prose-only rows; `module-graph` added to `version-guard-paths`; `engines.node` `>=18` → `>=22`; the monitor reads `.nvmrc`; family-ci's version-bump job also runs on `workflow_dispatch` (the family merges on a green dispatch, which never carried it); `kit-pin-bump.yml` gains the `node-version-file` input family-ci has (inert unless passed); the monitor now reports a red default branch, red or conflicted bot PRs and workflows GitHub disabled for inactivity — reading PR verdicts from workflow runs, not check runs, so the documented token scope suffices, and asking per event so a 30-minute cron cannot push a red push run out of its window; README's job list and `package.json`'s description name all six bins. Version `0.21.7` → `0.21.8` (`tools/` changed). **Found in review:** the monitor read its own `family-liveness.yml` runs, and that run goes red on every finding and every could-not-check — so run 35789279594 (exit 2, before the token) would have made the first run WITH a token report the monitor itself as red on `main`, and each Monday after would report the previous Monday's red scheduled run: a latch no healthy family could clear. `judgedWorkflows` now drops that one path in this repo, with a unit test, an end-to-end test and a control. **Recorded, not done:** the monitor's `REPOS` roster is still prose-only against the real family; an `esbuild` bump still ships with no version bump because `package.json` is deliberately unguarded (guarding it would fail every Dependabot devDependency PR); `kit-pin-bump.yml` and `release.yml` can only be proven after merge — see "Deferred and stuck" for the four runs to watch. **Owner-only:** create `FAMILY_READ_TOKEN` (#60); turn on "Allow GitHub Actions to create and approve pull requests" in pwa-kit, fetch-kit and Netlify-kit; backfill the 15 untagged consumer versions by dispatching `release.yml` at each commit. |
@@ -432,21 +457,25 @@ A repo calls the ones that apply to it:
 | Workflow | Fires | Lands by itself | Leaves for a session |
 | --- | --- | --- | --- |
 | `family-ci.yml` | every push, every PR, `workflow_dispatch` | — it *is* the gate | nothing |
-| `dependabot-merge.yml` | when CI completes on a Dependabot PR | every bump that is minor or patch, squash-merged on green | **every major**, and any PR body it can't parse |
-| `kit-pin-bump.yml` | weekly, Mondays ~06:41 UTC | the `@jfs/*` pins, the re-vendor, the CLAUDE.md conventions block, the version bump | nothing, when it works |
+| `dependabot-merge.yml` | when CI completes on a Dependabot PR | every bump that is minor or patch, squash-merged on green — except a grouped version update of a direct production dependency (a security update, which arrives ungrouped, still lands) | **every major**, **every grouped npm version update bumping a direct production dependency**, and any PR it can't parse |
+| `kit-pin-bump.yml` | weekly, Mondays ~06:41 UTC — or the longer cadence a repo records in its half of this file | the `@jfs/*` pins, the re-vendor, the CLAUDE.md and MAINTENANCE.md family blocks, the version bump where the caller's command makes one | nothing, when it works |
 | `release.yml` | CI green on `main` | the `v<version>` tag and its GitHub release | nothing |
 
 Three gaps follow from that table and they are the whole reason this protocol
 exists. They are not oversights; each is a deliberate refusal to automate a
 judgement call, and each therefore needs a cadence instead.
 
-**1. Majors accumulate, and the backlog is not inert.** A major is a
-judgement, not a merge, so `dependabot-merge.yml` leaves it open. Nothing
-schedules the session that makes the judgement, and `.github/dependabot.yml`
-caps open PRs. Once the cap is full of unreviewed majors, the weekly
-minor/patch PR — the one the automation *does* land — stops being opened at
-all. The backlog turns from a to-do list into a block on the working half of
-the pipeline.
+**1. Majors and production bumps accumulate, and the backlog is not
+inert.** A major is a judgement, not a merge, so `dependabot-merge.yml` leaves
+it open. So is a minor or patch version update of a direct production
+dependency: it deploys into the runtime that holds the keys, and the suites
+fake the network, so green CI says nothing about what the release does — a
+session reads it first. (A security update is not held: it arrives outside
+the groups, and a published fix should not wait.) Nothing schedules the session that makes the judgement, and
+`.github/dependabot.yml` caps open PRs. Once the cap is full of unreviewed
+PRs, the development minor/patch PR — the one the automation *does* land —
+stops being opened at all. The backlog turns from a to-do list into a block on
+the working half of the pipeline.
 
 **2. CI cannot check prose, or anything whose halves live in different
 files.** Every repo's gate parses what it ships, lints it, regenerates the
@@ -494,14 +523,26 @@ So the weekly check below is not optional hygiene. It is the one cadence that
 protects every other cadence, and it asks four questions:
 
 1. **Did each scheduled workflow's last run succeed?** Not "is `main` green" —
-   a scheduled run fails on its own page. Check the run, not the branch.
+   a scheduled run fails on its own page. Check the run, not the branch. A
+   dispatch of the same workflow on the default branch since then is the
+   same automation run by hand, and counts.
 2. **Is there a stranded `auto/*` branch?** A branch with commits and no open
    PR means the automation did its work and could not deliver it. On any repo:
    `git ls-remote --heads origin 'refs/heads/auto/*'` against the open PR list.
-3. **Are the `@jfs/*` pins actually current?** A repo whose pins sit behind
-   every sibling's is a repo whose bump is not landing, whatever its workflow
-   page says. Compare the pins across repos, not against hope.
-4. **Is any bot PR older than seven days, red, or conflicted?**
+3. **Are the `@jfs/*` pins actually current?** A pin that lacks a kit commit
+   older than the repo's own last bump run is a bump that is not landing,
+   whatever the workflow page says. A commit newer than that run is the
+   cadence — a repo that bumps monthly lags its kits for up to a month by
+   design. Compare against the run, not against hope.
+4. **Is any bot PR older than seven days, red, or conflicted?** A production
+   dependency's minor/patch PR that `dependabot-merge.yml` left open is the
+   week's work, not a hold: read each package's release notes and what changed
+   between the versions, then squash-merge it once CI is green. A bot PR held
+   on PURPOSE — a major the triage below said to hold — carries the label
+   `hold` AND is named as `#<number>` in this file's repo-specific half, with
+   the reason and the condition that would lift it; the family monitor lists
+   such a PR as held instead of reporting it. A `hold` label the file does not
+   record is itself a finding, and mutes nothing.
 
 A clean week needs no action. Say so and stop.
 
@@ -530,7 +571,9 @@ place:
 
 #### Weekly — pipeline hygiene (~10 minutes)
 
-The four questions under "Who watches the watchers". Nothing else.
+The four questions under "Who watches the watchers" — question 4 includes
+merging, after reading, the production bumps the merge workflow left open.
+Nothing else.
 
 #### Monthly — the sweep (~1 hour)
 
@@ -597,8 +640,10 @@ service-worker cache name.
 
 **5. Or hold it — visibly.** A major that should not land gets a row in this
 file's deferred table, with the reason and **the condition that would change
-the answer**. The bot keeps the PR open either way; the table is what stops
-the next session spending an hour re-deriving the same no.
+the answer**, naming the PR as `#<number>` — and the PR gets the label `hold`.
+The bot keeps the PR open either way; the table is what stops the next session
+spending an hour re-deriving the same no, and the label plus the number is
+what lets the family monitor tell a decision from a forgotten PR.
 
 ### Green CI is not delivered
 

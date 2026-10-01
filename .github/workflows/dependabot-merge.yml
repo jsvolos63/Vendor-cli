@@ -12,6 +12,35 @@
 # or patch. A MAJOR bump is left open for a session or a human — that is a
 # behaviour change to read, not a lockfile refresh.
 #
+# So is an npm GROUPED version update that bumps a direct PRODUCTION
+# dependency, minor or patch (`hold-production`, default true — the family
+# security audit's FAM-4). A merge to main deploys, and a production
+# dependency runs in the functions that hold every API key, so auto-merging
+# one on green CI made a hijacked patch release a direct path into those
+# runtimes with no human anywhere — the suites fake the network, so CI says
+# nothing about what a release DOES. Dependabot's cooldown gives a bad release
+# a week to be yanked; this makes a session read it before it ships.
+# Development dependencies still merge on green: they run in CI and on
+# laptops, never in production.
+#
+# The test is Dependabot's own metadata — the `updated-dependencies:` block it
+# writes into its commit message: a `dependency-type:` per dependency
+# (`direct:production`, `direct:development`, `indirect`) and, for a grouped
+# version update, a `dependency-group:` — not the group's NAME, which each
+# repo's dependabot.yml spells however it likes. An UNGROUPED minor/patch PR
+# is not held: the family groups every minor/patch version update, so an
+# ungrouped one is a security update, and a fix for a published advisory
+# should not wait on a session (John's News drew the same line first, in its
+# own caller; FAM-4's fix has the same shape — exclude production from the
+# auto-merged GROUP). That makes the grouping load-bearing: a repo whose
+# dependabot.yml stopped grouping minor/patch would let production version
+# updates through ungrouped. `indirect` (lockfile-only) bumps are not held
+# either: the metadata cannot say which tree they sit under. An npm PR with no
+# readable metadata is held, as a body the major parser cannot read is.
+# GitHub Actions bumps are not npm and are not held. Pair this with a
+# dependabot.yml that groups production apart from development, or one
+# production bump holds the whole group's dev bumps with it.
+#
 #   name: Dependabot merge
 #   on:
 #     workflow_run:
@@ -36,6 +65,16 @@ on:
         description: Merge major bumps too (default false — leave them open)
         type: boolean
         default: false
+      hold-production:
+        description: >-
+          Leave an npm grouped version update open, minor or patch, when it
+          bumps a direct production dependency (Dependabot's
+          `dependency-type: direct:production` beside a `dependency-group:`),
+          so a session reads the release before it deploys (FAM-4). An
+          ungrouped one — a security update — still merges. Default true;
+          false restores merging every minor/patch bump on green.
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -58,6 +97,7 @@ jobs:
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           ALLOW_MAJOR: ${{ inputs.allow-major }}
+          HOLD_PRODUCTION: ${{ inputs.hold-production }}
         run: |
           set -euo pipefail
           pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$HEAD_BRANCH" --state open \
@@ -90,6 +130,35 @@ jobs:
           if [ "$seen" = 0 ]; then major=1; fi
           if [ "$major" = 1 ] && [ "$ALLOW_MAJOR" != "true" ]; then
             echo "PR #$number carries a major bump (or one this parser cannot read) — left open for a review"; exit 0
+          fi
+          # FAM-4: a grouped version update that bumps a direct production
+          # dependency waits for a session (see the header). npm only —
+          # Dependabot names the ecosystem in the branch,
+          # dependabot/npm_and_yarn/... — and read from its commit metadata,
+          # every commit on the PR, since a rebase can leave more than one.
+          if [ "$HOLD_PRODUCTION" = "true" ] && [[ "$HEAD_BRANCH" == dependabot/npm_and_yarn/* ]]; then
+            meta=$(gh pr view "$number" --repo "$GITHUB_REPOSITORY" --json commits \
+                     --jq '[.commits[].messageBody] | join("\n")')
+            types=$(grep -oE 'dependency-type: *[a-z:]+' <<<"$meta" | sed 's/dependency-type: *//' | sort -u || true)
+            if [ -z "$types" ]; then
+              echo "PR #$number carries no readable Dependabot metadata, so it may bump a production dependency — left open for a review"; exit 0
+            fi
+            if grep -qx 'direct:production' <<<"$types" && ! grep -qE 'dependency-group: *[^ ]' <<<"$meta"; then
+              echo "PR #$number bumps a production dependency outside any group — a security update, since every minor/patch version update is grouped — so it merges on green"
+            elif grep -qx 'direct:production' <<<"$types"; then
+              # Scoped names come double-quoted ("@netlify/blobs").
+              names=$(awk '/dependency-name:/ { n = $0; sub(/.*dependency-name:[[:space:]]*/, "", n); gsub(/"/, "", n) }
+                           /dependency-type:[[:space:]]*direct:production/ { print n }' <<<"$meta" \
+                        | sort -u | paste -sd, - || true)
+              echo "PR #$number bumps a production dependency (${names:-unnamed}) — left open for a session to read the release before it deploys (FAM-4)"
+              {
+                echo "### Dependabot PR #$number held: production dependency"
+                echo
+                echo "Bumps \`${names:-a direct production dependency}\`. Read each package's release notes and"
+                echo "what changed between the versions, then squash-merge it by hand once CI is green."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
           fi
           # The head check above is a snapshot; bind the merge itself to the
           # SHA the green run validated so a push landing in between is

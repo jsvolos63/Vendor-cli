@@ -91,6 +91,24 @@ jobs:
             gh issue create --title "$title" --body-file body.md
           fi
 
+      # A healthy run closes the rolling issue, so an OPEN issue always means
+      # "a session is needed now". Nothing closed it before: once the family
+      # was fixed, the last red report stood open as if it were current until
+      # someone closed it by hand. The healthy report is posted as the closing
+      # comment, so the thread records when and how it went green.
+      - name: Close the liveness issue when the family is healthy
+        if: steps.check.outputs.status == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="Family automation liveness: attention needed"
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file report.md
+            gh issue close "$existing" --reason completed
+          fi
+
       # The run itself must be red, not merely commented on: a green run with an
       # issue attached is the same invisible signal all over again.
       - name: Fail the run when something needs attention

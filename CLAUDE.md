@@ -29,17 +29,23 @@ workflow validates against its own copy.
 
 ## Kit pin bump (`.github/workflows/kit-pin-bump.yml`)
 
-The second reusable workflow: the weekly pin-bump/re-vendor/auto-merge flow
-that eight consumers used to hand-copy (~104 lines each, all eight drifted).
+The second reusable workflow: the pin-bump/re-vendor/auto-merge flow that
+eight consumers used to hand-copy (~104 lines each, all eight drifted). Weekly
+in most callers; market-monitor runs it monthly to save Netlify deploy
+credits, which the family texts and the liveness monitor now allow.
 Callers keep only the schedule and their repo-specific commands; everything
 else — checkout, node, install, `jfs-bump-kit-pins`, PR open, squash-merge —
 lives here. Inputs: `check-command` (required — the repo's CI checks, run
 in-workflow because default-token PRs never trigger pull_request CI),
 `install-command` (default `npm ci`), `vendor-sync-command`,
-`claude-md-sync-command` and `version-bump-command` ('' skips any),
-`node-version` (default 22), `node-version-file` ('' keeps `node-version`;
-the same opt-in family-ci has), `auto-merge` (default true), `soft-fail`
-(default false), `release-title` ('' skips), `pr-body-extra`.
+`claude-md-sync-command`, `maintenance-sync-command` and
+`version-bump-command` ('' skips any), `node-version` (default 22),
+`node-version-file` ('' keeps `node-version`; the same opt-in family-ci has),
+`auto-merge` (default true), `soft-fail` (default false), `release-title`
+('' skips), `pr-body-extra`. One output: `merge-sha`, the squash commit the
+bump landed, empty when nothing merged — a caller that dispatches its own CI
+on main afterwards gates on it (market-monitor's `ci-on-main` asked for it;
+before it, that job fired on every run, merged or not).
 
 **The bump is two jobs, and the split is a security boundary** (2026-09-26,
 audit finding FAM-1). Everything that executes code nobody reviewed — the
@@ -74,8 +80,13 @@ and nothing ran it — when the canonical text gained the Look & feel
 section, six consumers sat red on family CI's conventions check until a
 session re-synced them by hand. The re-install in the default matters:
 syncing from a stale pinned copy could regress the block, which is worse
-than skipping. It is a BACKSTOP, not the delivery — see "The canonical
-family-conventions text" below for why the sync cannot wait for Monday.
+than skipping. `maintenance-sync-command` does the same for the
+MAINTENANCE.md family-maintenance block (default: `jfs-maintenance-sync` when
+the repo has a MAINTENANCE.md — the bin refuses to create one); until
+2026-10-01 only CLAUDE.md rode the bump, so an edit to `family/maintenance.md`
+left every opted-in consumer red with nothing to carry the fix. Both are a
+BACKSTOP, not the delivery — see "The canonical family-conventions text"
+below for why the sync cannot wait for Monday.
 
 **The bump tags the version it lands, because nothing else can.** The merge
 this workflow makes is a default-`GITHUB_TOKEN` merge, and a `GITHUB_TOKEN`
@@ -333,9 +344,29 @@ the fix for a HIGH prod-audit failure that had CI red on main. Each repo now
 triggers this on its CI workflow completing (`workflow_run`, the same
 name-must-match rule as `release.yml`); it merges when the run is green, the
 PR is Dependabot's own, and every bump it carries is minor or patch. A MAJOR
-bump, or a body the parser cannot read, is left open. Every npm repo pairs it
-with a `.github/dependabot.yml` — weekly npm with minor and patch grouped,
-monthly `github-actions` — and the `@jfs/*` git pins stay the kit-pin bump's.
+bump, or a body the parser cannot read, is left open.
+
+**So is a grouped npm version update that bumps a direct production
+dependency** (`hold-production`, default true, since 0.22.0 — the family
+audit's FAM-4). A merge to main deploys, production dependencies run in the
+functions that hold the keys, and the suites fake the network, so green CI
+cannot vouch for a release; a session reads it and merges by hand. The test
+is Dependabot's own commit metadata — `dependency-type: direct:production`
+beside a `dependency-group:` — not a group name, so it needs nothing from the
+caller. An ungrouped production PR is a security update (the family groups
+every minor/patch version update) and still merges: John's News drew that
+line first in its own caller, and FAM-4's recommended fix has the same shape.
+`indirect` bumps and GitHub Actions bumps are not held; an npm PR with no
+readable metadata is. `test/dependabot-merge.test.mjs` runs the workflow's
+real script against a fake `gh` and holds every one of those branches.
+
+Every npm repo pairs it with a `.github/dependabot.yml` — npm weekly (monthly
+where the repo records why), minor and patch grouped with production apart
+from development, monthly `github-actions`, a 7-day cooldown — and the
+`@jfs/*` git pins stay the kit-pin bump's. The production group matters only
+where a repo has production npm dependencies (market-monitor, John's News,
+Surf-Tracker, FlightCheck and this repo, on 2026-10-01): with one catch-all
+group, every week a production release would hold the dev bumps with it.
 
 **Action pinning policy**, stated here because the review found it applied
 inconsistently: first-party `actions/*` are referenced by major tag (they
@@ -426,9 +457,16 @@ fix is not a monitor.** So `tools/family-liveness.mjs` asks the protocol's four
 weekly questions mechanically across every repo: did each repo's last
 *scheduled* run of each workflow succeed (per workflow, not per repo — a repo
 whose CI is green while one cron has failed for a month reads healthy otherwise);
-is any `auto/*` branch stranded with no PR; is any `@jfs/*` pin more than one
-commit behind its kit's default branch; is any bot PR older than a week, or
-red or conflicted at any age. Beside the first question it asks whether the
+is any `auto/*` branch stranded with no PR; does any `@jfs/*` pin lack a kit
+commit older than the repo's own last kit-pin-bump run (`pinVerdict` — the
+commit-count rule it replaced, "more than one behind", assumed every repo
+bumps weekly, so it would report market-monitor between its monthly runs, and
+on 2026-10-01 it reported Art-Gallery- for news-kit commits that landed after
+its Monday bump); is any bot PR older than a week, or red or conflicted at any
+age. In the first question, a dispatch of a scheduled workflow on the default
+branch newer than its last scheduled run decides instead — it is the same
+automation run by hand, and without it JFS-Sports' 2026-09-21 failure was
+still reported on 09-28 after a green dispatch on 09-22 had fixed it. Beside the first question it asks whether the
 newest non-scheduled run of any workflow on each default branch is red —
 the failure a canonical-text edit HERE causes, thirteen consumers red on push
 and PR CI at once, none of it a scheduled run — and whether GitHub has
@@ -459,7 +497,9 @@ and opens ONE rolling issue here when something needs a session. One issue in
 the hub rather than a notification in thirteen repos: per-repo notifications
 would need an `issues: write` grant in each, and the notifier's own failure
 would be silent. The run itself also goes red, because a green run with an
-issue attached is the same invisible signal again.
+issue attached is the same invisible signal again. A healthy run (exit 0)
+closes the issue with the healthy report as its last comment, so an OPEN
+issue always means a session is needed now.
 
 Six properties not to undo:
 
@@ -537,12 +577,15 @@ is re-synced. The weekly pin bump does carry the re-sync, but a repo
 cannot wait for Monday with CI red: the Dependabot merge workflow, for
 one, merges nothing while it is. This has now happened twice (the Look &
 feel section, then the Service-worker-updates and Dependencies sections:
-thirteen repos red at once). So the change to the canonical text and
-the re-sync of every consumer are ONE piece of work, in the same session:
-merge the vendor-cli change, then in each consumer run
-`node <vendor-cli checkout>/bin/claude-md-sync.mjs` from the repo root
-(it syncs the CWD's CLAUDE.md), open the PR, dispatch CI, merge. Docs
-only, so no consumer version bump.
+thirteen repos red at once; a third edit, on 2026-10-01, rewrote the
+Service-worker-updates and Dependencies sections and the protocol's
+hold rule). So the change to the canonical text and the re-sync of every
+consumer are ONE piece of work, in the same session: merge the vendor-cli
+change, then in each consumer run
+`node <vendor-cli checkout>/bin/claude-md-sync.mjs` and
+`node <vendor-cli checkout>/bin/maintenance-sync.mjs` from the repo root
+(each syncs the CWD's file), open the PR, dispatch CI, merge. Docs only, so
+no consumer version bump.
 
 ## The canonical sanitizer policy
 
@@ -655,24 +698,41 @@ repo and shipped as a real defect.
 A new build is never applied under the reader mid-session: no reload, no
 swap of the controlling worker while a page is open. The worker registers,
 the page shows a "new version" pill, and the new build takes over on a
-gesture (the pill) or on the next launch. Two mechanisms satisfy that and
-each app picks ONE: a worker that WAITS (no `skipWaiting()` in install; the
-pill posts `SKIP_WAITING` and reloads on `controllerchange`) or a worker that
-activates on install but never `clients.claim()`s (the pill just reloads).
-Never mix them — a pill that posts `SKIP_WAITING` at a worker that already
-activated has nothing to wait for and strands on "Updating…", which shipped
-once.
+gesture (the pill) or on the next launch. One mechanism satisfies that: a
+worker that WAITS — no `skipWaiting()` in install. The pill reads
+`registration.waiting` when it is TAPPED (after a second deploy, the worker
+it was first shown for is redundant), posts it `SKIP_WAITING`, and reloads
+on `controllerchange`, on that worker turning redundant, or at a ceiling of
+seconds — never a sub-second timer, which reloads onto the old build; with
+nothing waiting it just reloads. The worker's activate skips its cache prune
+while a newer worker is installing or waiting. A worker that activates on
+install but never `clients.claim()`s does NOT satisfy the rule, whatever its
+pill does: activation hands every page the registration already controls to
+the new worker (the SW spec's Activate step — `claim()` only concerns pages
+no worker controls; measured in Chromium), and the open page then fetches
+through the new build. The apps still on that model, pwa-kit's
+`createServiceWorker` default among them, move to the waiting worker one at
+a time; never half-migrate one — a pill that posts `SKIP_WAITING` at a
+worker that already activated has nothing to wait for and strands on
+"Updating…", which shipped once.
 
 ### Dependencies
 
-Every npm repo carries `.github/dependabot.yml` (weekly npm, minor and patch
-grouped into one PR; monthly `github-actions`) and calls the family's
-`dependabot-merge.yml` reusable workflow, which squash-merges a Dependabot PR
-once the repo's CI is green on it and every bump in it is minor or patch. A
-MAJOR bump is left open for a session or a human. Dependabot never touches
-the `@jfs/*` git pins; the weekly kit-pin bump owns those. First-party
-`actions/*` are referenced by major tag; every other action is pinned by
-full SHA.
+Every npm repo carries `.github/dependabot.yml` — npm weekly, or monthly
+where the repo's MAINTENANCE.md records why (a Netlify free plan, where every
+merge is a paid deploy); minor and patch grouped, any production
+dependencies in a group of their own; monthly `github-actions`; a 7-day
+`cooldown` — and calls the family's `dependabot-merge.yml` reusable
+workflow, which squash-merges a Dependabot PR once the repo's CI is green on
+it and every bump in it is minor or patch. It
+leaves open every MAJOR, and every grouped npm version update that bumps a
+direct production dependency: those run where the keys live and the suites
+fake the network, so a session reads each package's release notes and merges
+it by hand. A security update arrives ungrouped and still merges on green —
+which makes the grouping load-bearing. Dependabot never touches the `@jfs/*`
+git pins; the kit-pin bump owns those (weekly, or on the cadence the repo
+records). First-party `actions/*` are referenced by major tag; every other
+action is pinned by full SHA.
 
 <!-- jfs-family-conventions:end -->
 

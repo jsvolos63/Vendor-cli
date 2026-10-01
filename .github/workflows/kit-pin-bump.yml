@@ -85,6 +85,15 @@ name: Kit pin bump
 
 on:
   workflow_call:
+    outputs:
+      merge-sha:
+        description: >-
+          The commit the bump's squash-merge put on the default branch — empty
+          when nothing merged (no pin moved, auto-merge off, or the merge was
+          blocked). A caller that runs its own CI on the merged commit gates on
+          it (`if: needs.<job>.outputs.merge-sha != ''`) instead of firing on
+          every run, merged or not; market-monitor's `ci-on-main` asked for it.
+        value: ${{ jobs.bump.outputs.merge-sha }}
     inputs:
       node-version:
         description: Node.js version to set up. Ignored when node-version-file is set.
@@ -137,6 +146,18 @@ on:
         default: |
           npm install
           npx --no-install jfs-claude-md-sync
+      maintenance-sync-command:
+        description: >-
+          Commands that re-sync the MAINTENANCE.md family-maintenance block
+          from the @jfs/vendor-cli the CLAUDE.md step above just installed
+          ('' skips). The default does nothing in a repo with no
+          MAINTENANCE.md — jfs-maintenance-sync refuses to create one, on
+          purpose. Same reason as the CLAUDE.md step: family CI checks the
+          block against vendor-cli main, so an edit to the canonical text
+          must reach every consumer, and this is its backstop.
+        type: string
+        default: |
+          if [ -f MAINTENANCE.md ]; then npx --no-install jfs-maintenance-sync; fi
       check-command:
         description: >-
           The repo's CI checks, run against the bumped tree before the PR is
@@ -256,6 +277,15 @@ jobs:
         if: steps.diff.outputs.changed == 'true' && inputs.claude-md-sync-command != ''
         run: ${{ inputs.claude-md-sync-command }}
 
+      # The other canonical text, the same way. Before this step only
+      # CLAUDE.md rode the bump, so an edit to family/maintenance.md left every
+      # consumer that opted into family CI's maintenance-check red until a
+      # session re-synced it by hand — and a caller whose check-command runs
+      # that check would have failed its own bump.
+      - name: Sync the MAINTENANCE.md family-maintenance block
+        if: steps.diff.outputs.changed == 'true' && inputs.maintenance-sync-command != ''
+        run: ${{ inputs.maintenance-sync-command }}
+
       # The re-vendored copies are shipped assets, so the family's version
       # rule applies: patch-bump so the merged PR rolls the service-worker
       # cache instead of leaving returning visitors on the stale shell.
@@ -266,12 +296,14 @@ jobs:
       # PRs opened with the default GITHUB_TOKEN never trigger pull_request
       # workflows, so the repo's CI can't validate this PR before merge. Run
       # the same checks here instead — the merge job below is only reached
-      # if they pass. There is NO backstop after that: a merge made with
-      # GITHUB_TOKEN fires no push workflows either, so the merged commit
-      # gets no CI run on main (BearsMockDraft measured it: neither its
-      # pin-bump merge nor its data-refresh merge produced one). This step
-      # is the only validation the bump ever gets, which is why it is
-      # required rather than optional.
+      # if they pass. Nothing in THIS workflow runs CI after that: a merge
+      # made with GITHUB_TOKEN fires no push workflows either, so the merged
+      # commit gets no CI run on main (BearsMockDraft measured it: neither its
+      # pin-bump merge nor its data-refresh merge produced one). A caller can
+      # add that backstop itself — dispatch its own CI on main from a job
+      # gated on this workflow's `merge-sha` output, as market-monitor's
+      # `ci-on-main` does — but without one, this step is the only validation
+      # the bump ever gets, which is why it is required rather than optional.
       - name: Run the repo's CI checks against the bumped tree
         if: steps.diff.outputs.changed == 'true' && inputs.check-command != ''
         env:
@@ -370,8 +402,9 @@ jobs:
             Automated pin bump: the pinned `@jfs/*` kits have new commits on
             their default branches. Pins updated by `npm run kit-pins:bump`
             (the @jfs/vendor-cli jfs-bump-kit-pins bin); vendored copies
-            regenerated, the CLAUDE.md family-conventions block re-synced
-            from the bumped vendor-cli, and the app version bumped per this
+            regenerated, the CLAUDE.md family-conventions and MAINTENANCE.md
+            family-maintenance blocks re-synced from the bumped vendor-cli,
+            and the app version bumped per this
             repo's caller inputs; the repo's CI checks ran green inside the
             bump workflow (in a read-only job) before this PR was opened.
             (PRs opened with the default GITHUB_TOKEN never trigger
