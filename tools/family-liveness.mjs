@@ -35,13 +35,19 @@
 // cadence asks, mechanically, across every repo at once:
 //
 //   1. Did each repo's last SCHEDULED run of each workflow succeed? (Not "is
-//      main green" — a scheduled run fails on its own page.) And, beside it,
+//      main green" — a scheduled run fails on its own page. A dispatch of the
+//      same workflow on the default branch, newer than that run, decides
+//      instead: it is the same automation run by hand.) And, beside it,
 //      is the newest non-scheduled run of any workflow on the default branch
 //      red? That second half is the failure THIS repo causes: an edit to a
 //      canonical text here reddens every consumer's push and PR CI at once,
 //      and a monitor that read only scheduled runs could not see it.
 //   2. Is there a stranded `auto/*` branch: commits pushed, no pull request?
 //   3. Are the @jfs/* pins actually current against each kit's default branch?
+//      Judged against the repo's own last bump, not a commit count: a pin is
+//      stale when it lacks a kit commit older than that run (pinVerdict), so a
+//      repo on a longer cadence (market-monitor bumps monthly) is not reported
+//      for the commits that landed since.
 //   4. Is any bot pull request stale, red, or conflicted? (Red is the other
 //      place a canonical-text edit shows first: every open Dependabot PR's
 //      CI fails its conventions check, and a red PR is one
@@ -92,12 +98,12 @@
 // is the one job in the family that needs a PAT; without one it exits 2 rather
 // than reporting a comfortable nothing.
 
-import { pathToFileURL } from 'node:url';
 // A sibling tool, not a dependency: the one definition of MAINTENANCE.md's
-// repo-specific half. It imports only `node:` modules, and
-// test/family-liveness.test.mjs holds this script's whole import graph to
-// that, so the no-install property below survives the reuse.
-import { splitDoc } from './maintenance-doc-check.mjs';
+// repo-specific half, and of "was this file run as the script". It imports
+// only `node:` modules, and test/family-liveness.test.mjs holds this script's
+// whole import graph to that, so the no-install property below survives the
+// reuse.
+import { splitDoc, invokedAsScript } from './maintenance-doc-check.mjs';
 
 const OWNER = 'jsvolos63';
 
@@ -187,31 +193,79 @@ async function api(path, { allow404 = false } = {}) {
   }
 }
 
-/** The newest SCHEDULED run per workflow. A repo's cron jobs each fail on their
- *  own page, so the per-workflow newest is the only view that finds a job that
- *  has been failing for a month while every other workflow is green.
+/** The newest run of each SCHEDULED workflow. A repo's cron jobs each fail on
+ *  their own page, so the per-workflow newest is the only view that finds a job
+ *  that has been failing for a month while every other workflow is green.
+ *
+ *  `dispatched`, when given, is the repo's workflow_dispatch runs on its
+ *  default branch. A dispatch of a scheduled workflow is the same automation
+ *  run by hand — the protocol's own remedy for a red bump is "fix it, dispatch
+ *  it" — so a dispatch NEWER than the last scheduled run decides, green or red.
+ *  Without it a fixed cron stayed reported until its next tick: JFS-Sports'
+ *  kit-pin-bump failed on schedule on 2026-09-21, was fixed and dispatched
+ *  green on 09-22, and the Monday 09-28 report still named the 09-21 failure.
+ *  Only workflows with a scheduled run in view are judged here; a
+ *  dispatch-only workflow is not a cron, and the default-branch view covers it.
  *
  *  `existing`, when given, is the set of workflow paths the repo still has. A
  *  retired workflow's last run never ages out of the runs list, so without it
  *  a cron deleted after one failure is reported every week for ever —
  *  BearsMockDraft's refresh-news.yml was, 98 days after its file was gone. */
-export function newestScheduledPerWorkflow(workflowRuns, now = NOW, existing = null) {
+export function newestScheduledPerWorkflow(workflowRuns, now = NOW, existing = null, dispatched = []) {
   const newest = new Map();
-  for (const run of workflowRuns || []) {
+  const consider = (run) => {
     // An in-progress run says nothing yet; taking it as the newest would hide
     // the failed run behind it, which is the whole signal.
-    if (run.status !== 'completed') continue;
-    if (existing && !existing.has(run.path)) continue;
+    if (run.status !== 'completed') return;
+    if (existing && !existing.has(run.path)) return;
     const key = run.path || run.name;
     const prev = newest.get(key);
     if (!prev || Date.parse(run.run_started_at) > Date.parse(prev.run_started_at)) newest.set(key, run);
+  };
+  for (const run of workflowRuns || []) consider(run);
+  const crons = new Set(newest.keys());
+  for (const run of dispatched || []) {
+    if (run.event === 'workflow_dispatch' && crons.has(run.path || run.name)) consider(run);
   }
   return [...newest.values()].map((r) => ({
     workflow: (r.path || '').replace('.github/workflows/', '') || r.name,
     conclusion: r.conclusion,
+    event: r.event || 'schedule',
+    startedAt: r.run_started_at,
     ageDays: (now - Date.parse(r.run_started_at)) / 86_400_000,
     url: r.html_url,
   }));
+}
+
+// The family's pin-bump workflow, by the file name every caller uses.
+export const BUMP_WORKFLOW = 'kit-pin-bump.yml';
+
+/** Is a pin that sits `behind` commits behind its kit's HEAD a finding?
+ *
+ *  Judged against the repo's own bump, not against a commit count: a pin is
+ *  STALE when it lacks a kit commit older than the start of the repo's newest
+ *  kit-pin-bump run, because that run resolved the kit's HEAD after the commit
+ *  existed and still did not land it. A commit newer than that run is the
+ *  cadence, not a failure, however many there are. The count rule this
+ *  replaces (> 1 behind) assumed every repo bumps weekly, so it would report
+ *  market-monitor — monthly since 2026-09-30, for its Netlify deploy credits —
+ *  whenever two kit commits landed between its runs, and on 2026-10-01 it
+ *  reported Art-Gallery-'s
+ *  news-kit pin two commits behind for commits that landed AFTER its Monday
+ *  bump. The run's conclusion does not matter here: a red bump is question
+ *  1's finding, and its stale pins are the consequence, reported beside it.
+ *
+ *  `oldestMissing` is the committer date of the oldest commit the pin lacks
+ *  (the family lands every change by a squash merge on GitHub, so it is the
+ *  merge time). With no bump run in view — a repo with no kit-pin-bump.yml,
+ *  or none in the runs list — it falls back to the old rule, more than one
+ *  commit behind. Returns 'current' | 'lagging' | 'stale'. */
+export function pinVerdict({ behind, oldestMissing = null, bumpStartedAt = null }) {
+  if (!behind) return 'current';
+  if (bumpStartedAt && oldestMissing) {
+    return Date.parse(oldestMissing) < Date.parse(bumpStartedAt) ? 'stale' : 'lagging';
+  }
+  return behind > 1 ? 'stale' : 'lagging';
 }
 
 /** The repo's raw runs, one request per event. The scheduled list feeds
@@ -229,7 +283,12 @@ async function repoRuns(repo, branch) {
     ...BRANCH_EVENTS.map((e) => q(`branch=${b}&event=${e}`)),
   ]);
   const scheduled = schedule.workflow_runs || [];
-  return { scheduled, onBranch: [...scheduled, ...onBranch.flatMap((d) => d.workflow_runs || [])] };
+  const branchRuns = onBranch.flatMap((d) => d.workflow_runs || []);
+  return {
+    scheduled,
+    dispatched: branchRuns.filter((r) => r.event === 'workflow_dispatch'),
+    onBranch: [...scheduled, ...branchRuns],
+  };
 }
 
 /** The repo's workflows as GitHub knows them now: the paths that still exist,
@@ -468,13 +527,22 @@ async function kitHeads() {
   return heads;
 }
 
-/** How far behind a pin is. The SHA alone cannot say, so this compares and
- *  reports the distance — a pin one commit behind on a Monday morning is
- *  normal; one seven commits behind is a bump that is not landing. */
-async function behind(kit, sha, headSha) {
-  if (sha && headSha.startsWith(sha)) return 0;
-  const cmp = await api(`/repos/${OWNER}/${kit}/compare/${sha}...${headSha}`, { allow404: true });
-  return cmp?.ahead_by ?? null;
+/** How far behind a pin is, and since when. The SHA alone cannot say, so this
+ *  compares: `behind` is the distance, `oldestMissing` the committer date of
+ *  the oldest commit the pin lacks (the compare payload lists them, oldest
+ *  first, up to 250). pinVerdict decides what the two mean. */
+export function pinLag(cmp) {
+  if (!cmp || !Number.isInteger(cmp.ahead_by)) return null;
+  const dates = (cmp.commits || [])
+    .map((c) => c?.commit?.committer?.date)
+    .filter((d) => typeof d === 'string' && !Number.isNaN(Date.parse(d)))
+    .sort((a, b) => Date.parse(a) - Date.parse(b));
+  return { behind: cmp.ahead_by, oldestMissing: dates[0] ?? null };
+}
+
+async function lagOfPin(kit, sha, headSha) {
+  if (sha && headSha.startsWith(sha)) return { behind: 0, oldestMissing: null };
+  return pinLag(await api(`/repos/${OWNER}/${kit}/compare/${sha}...${headSha}`, { allow404: true }));
 }
 
 async function main() {
@@ -519,14 +587,15 @@ async function main() {
       const { existing: present, disabled } = workflowInventory(wfs.workflows);
       const existing = judgedWorkflows(repo, present);
       const raw = await repoRuns(repo, meta.default_branch);
-      const runs = newestScheduledPerWorkflow(raw.scheduled, NOW, existing);
+      const runs = newestScheduledPerWorkflow(raw.scheduled, NOW, existing, raw.dispatched);
       const redOnMain = redOnDefaultBranch(raw.onBranch, NOW, existing);
 
       row.scheduled = runs;
       for (const r of runs) {
         if (r.conclusion !== 'success') {
+          const how = r.event === 'workflow_dispatch' ? ' (its newest run, a dispatch)' : '';
           findings.push(
-            `${repo}: scheduled \`${r.workflow}\` last ran ${r.ageDays.toFixed(0)}d ago and ` +
+            `${repo}: scheduled \`${r.workflow}\` last ran ${r.ageDays.toFixed(0)}d ago${how} and ` +
             `concluded **${r.conclusion}** — ${r.url}`
           );
         }
@@ -627,23 +696,30 @@ async function main() {
       }
 
       if (repoPins && Object.keys(heads).length) {
+        // The repo's newest kit-pin-bump run, scheduled or dispatched, is
+        // what a pin's lag is judged against (pinVerdict).
+        const bump = runs.find((r) => r.workflow === BUMP_WORKFLOW);
         for (const [kit, sha] of Object.entries(repoPins)) {
           if (!heads[kit]) continue;
-          let n;
+          let lag;
           try {
-            n = await behind(kit, sha, heads[kit]);
+            lag = await lagOfPin(kit, sha, heads[kit]);
           } catch (e) {
             if (!(e instanceof CouldNotCheck)) throw e;
             row.unchecked.push(`pin ${kit}: ${e.message}`);
             continue;
           }
-          if (n === null) {
+          if (lag === null) {
             row.unchecked.push(`pin ${kit}: ${sha.slice(0, 7)} does not compare against HEAD`);
-          } else if (n > 1) {
-            // > 1 rather than > 0: the bump runs weekly, so a single commit of
-            // lag between a kit merge and Monday is the system working.
-            row.stalePins.push({ kit, sha: sha.slice(0, 7), behind: n });
-            findings.push(`${repo}: \`@jfs/${kit}\` pin ${sha.slice(0, 7)} is ${n} commits behind ${kit}'s default branch`);
+          } else if (pinVerdict({ ...lag, bumpStartedAt: bump?.startedAt }) === 'stale') {
+            row.stalePins.push({ kit, sha: sha.slice(0, 7), behind: lag.behind });
+            const why = bump && lag.oldestMissing
+              ? `, missing a commit from ${lag.oldestMissing.slice(0, 10)} that its kit-pin bump of ` +
+                `${bump.startedAt.slice(0, 10)} should have landed`
+              : '';
+            findings.push(
+              `${repo}: \`@jfs/${kit}\` pin ${sha.slice(0, 7)} is ${lag.behind} commits behind ${kit}'s default branch${why}`
+            );
           }
         }
       }
@@ -740,7 +816,10 @@ export function renderMarkdown(status, findings, unchecked, rows) {
   );
   for (const r of rows) {
     const runs = r.scheduled.length
-      ? r.scheduled.map((s) => `${s.workflow.replace(/\.ya?ml$/, '')} ${s.conclusion === 'success' ? '✓' : '✗ ' + s.conclusion}`).join('<br>')
+      ? r.scheduled.map((s) => {
+        const mark = s.conclusion === 'success' ? '✓' : '✗ ' + s.conclusion;
+        return `${s.workflow.replace(/\.ya?ml$/, '')} ${mark}${s.event === 'workflow_dispatch' ? ' (dispatch)' : ''}`;
+      }).join('<br>')
       : '_none_';
     // Rows built before a column existed (or by a test) may lack its field.
     const redOnMain = [
@@ -766,6 +845,6 @@ export function renderMarkdown(status, findings, unchecked, rows) {
 
 // Guarded so the pure exports above can be imported by the test suite without
 // this script reaching the network or calling process.exit().
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (invokedAsScript(import.meta.url)) {
   await main();
 }

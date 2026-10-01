@@ -390,7 +390,7 @@ test('kit-pin-bump runs every untrusted command under a read-only token, and the
   const w = wf('kit-pin-bump.yml');
   const jobs = w.jobs;
   const runsUntrusted = (job) => (job.steps || []).some((s) => typeof s.run === 'string'
-    && /\$\{\{\s*inputs\.(install-command|vendor-sync-command|claude-md-sync-command|version-bump-command|check-command)\s*\}\}|\bnpm\b|\bnpx\b/.test(s.run));
+    && /\$\{\{\s*inputs\.(install-command|vendor-sync-command|claude-md-sync-command|maintenance-sync-command|version-bump-command|check-command)\s*\}\}|\bnpm\b|\bnpx\b/.test(s.run));
   const holdsWrite = (job) => Object.values(job.permissions || {}).includes('write')
     || (job.steps || []).some((s) => /create-pull-request/.test(s.uses || '') || /gh pr merge/.test(s.run || ''));
   const untrusted = Object.entries(jobs).filter(([, j]) => !j.uses && runsUntrusted(j)).map(([n]) => n);
@@ -406,4 +406,29 @@ test('kit-pin-bump runs every untrusted command under a read-only token, and the
   assert.ok((jobs.prepare.steps || []).some((s) => /upload-artifact@/.test(s.uses || '')), 'prepare must upload the patch artifact');
   // And the untrusted job never gets to hand over a workflow edit.
   assert.ok((jobs.prepare.steps || []).some((s) => /\.github\/workflows/.test(s.run || '') && /exit 1/.test(s.run || '')), 'prepare must refuse a patch that touches .github/workflows');
+});
+
+test('kit-pin-bump exposes the merge it made as a workflow output, empty when nothing merged', () => {
+  // A caller that runs its own CI on main after the bump (market-monitor's
+  // ci-on-main) gates on this; without it that job fired on every run, merged
+  // or not. The value must be the bump job's own output, which is written
+  // only by the merge step.
+  const w = wf('kit-pin-bump.yml');
+  const out = w.on.workflow_call.outputs?.['merge-sha'];
+  assert.ok(out, 'workflow_call.outputs.merge-sha is missing');
+  assert.equal(out.value, '${{ jobs.bump.outputs.merge-sha }}');
+  assert.equal(typeof out.description, 'string');
+  assert.equal(w.jobs.bump.outputs['merge-sha'], '${{ steps.merge.outputs.merge-sha }}');
+});
+
+test('kit-pin-bump carries BOTH canonical blocks, the MAINTENANCE.md one only where the file exists', () => {
+  const w = wf('kit-pin-bump.yml');
+  const inputs = w.on.workflow_call.inputs;
+  assert.match(inputs['claude-md-sync-command'].default, /jfs-claude-md-sync/);
+  assert.match(inputs['maintenance-sync-command'].default, /\[ -f MAINTENANCE\.md \].*jfs-maintenance-sync/);
+  const steps = w.jobs.prepare.steps.map((s) => s.name || '');
+  const md = steps.indexOf('Sync the CLAUDE.md family-conventions block');
+  const maint = steps.indexOf('Sync the MAINTENANCE.md family-maintenance block');
+  const check = steps.indexOf("Run the repo's CI checks against the bumped tree");
+  assert.ok(md >= 0 && maint > md && check > maint, 'both syncs must run, CLAUDE.md first (it installs the bumped CLI), before the checks');
 });

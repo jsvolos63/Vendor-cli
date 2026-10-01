@@ -1,8 +1,21 @@
-# Family dependency policy (see CLAUDE.md): weekly npm with minor and patch
-# grouped into one PR that dependabot-merge.yml lands once CI is green;
-# majors arrive on their own and stay open for a review. The @jfs/* git pins
-# are the weekly kit-pin bump's, not Dependabot's. GitHub Actions monthly,
-# so SHA-pinned third-party actions pick up fixes.
+# Family dependency policy (see the Dependencies convention in CLAUDE.md):
+# weekly npm with minor and patch grouped into PRs that dependabot-merge.yml
+# lands once CI is green; majors arrive on their own and stay open for a
+# review. The @jfs/* git pins are the kit-pin bump's, not Dependabot's — and
+# this repo pins none. GitHub Actions monthly, so SHA-pinned third-party
+# actions pick up fixes.
+#
+# Production and development are separate groups (FAM-4). This package's one
+# production dependency is `esbuild`, exact-pinned: it runs inside every
+# consumer's vendor:sync, so a hijacked release would be vendored into eight
+# repos. dependabot-merge.yml leaves a grouped update carrying a direct
+# production dependency open for a session; with one catch-all group, an
+# esbuild release would hold the eslint/globals/yaml bumps with it.
+# An ungrouped production PR — a security update — still merges on green.
+#
+# cooldown: a version update is proposed only once the release is 7 days old,
+# so a bad release has a week to be caught and yanked first. GitHub never
+# delays a SECURITY update. `default-days` is supported for both ecosystems.
 version: 2
 updates:
   - package-ecosystem: npm
@@ -10,11 +23,19 @@ updates:
     schedule:
       interval: weekly
       day: tuesday
+    cooldown:
+      default-days: 7
     groups:
+      production:
+        dependency-type: production
+        update-types: [minor, patch]
       minor-and-patch:
+        dependency-type: development
         update-types: [minor, patch]
     open-pull-requests-limit: 5
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7

@@ -10,14 +10,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SCRIPT = join(ROOT, 'tools', 'maintenance-doc-check.mjs');
-const { checkRepo, findClaims, parseAllowlist, splitDoc } = await import(pathToFileURL(SCRIPT));
+const { checkRepo, findClaims, parseAllowlist, splitDoc, invokedAsScript } = await import(pathToFileURL(SCRIPT));
 const { familyMaintenanceBlock } = await import(pathToFileURL(join(ROOT, 'index.mjs')));
 
 function repo({ doc, scripts, workflows = {}, files = [], noPkg = false } = {}) {
@@ -187,4 +187,30 @@ test('an unterminated allowlist block is ONE finding, not a reading of the whole
   const res = checkRepo(repo({ doc }));
   assert.equal(res.findings.length, 1);
   assert.match(res.findings[0], /never closed with/);
+});
+
+test('run through a SYMLINK the CLI still runs — it used to print nothing and exit 0', () => {
+  // A consumer runs this from node_modules, which can be a symlinked checkout;
+  // node resolves the main module's symlink, so a plain argv[1] comparison
+  // never matched and the gate "passed" without running.
+  const dir = mkdtempSync(join(tmpdir(), 'maint-doc-check-link-'));
+  try {
+    const link = join(dir, 'maintenance-doc-check.mjs');
+    symlinkSync(SCRIPT, link);
+    const empty = repo({ noPkg: true });
+    const res = spawnSync(process.execPath, [link, empty], { encoding: 'utf8' });
+    assert.equal(res.status, 2, res.stdout + res.stderr);
+    assert.match(res.stderr, /maintenance-doc-check:/);
+    assert.equal(invokedAsScript(pathToFileURL(SCRIPT).href, link), true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('invokedAsScript is false for another file, a missing argv[1] and a path that does not exist', () => {
+  const url = pathToFileURL(SCRIPT).href;
+  assert.equal(invokedAsScript(url, SCRIPT), true);
+  assert.equal(invokedAsScript(url, join(ROOT, 'index.mjs')), false);
+  assert.equal(invokedAsScript(url, undefined), false);
+  assert.equal(invokedAsScript(url, join(ROOT, 'no-such-file.mjs')), false);
 });

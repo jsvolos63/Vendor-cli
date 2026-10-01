@@ -18,8 +18,11 @@ const SCRIPT = join(ROOT, 'tools', 'family-liveness.mjs');
 const {
   newestScheduledPerWorkflow, parseKitPins, renderMarkdown, redOnDefaultBranch, pullHealth, isRed, autoBranchNames,
   workflowInventory, judgedWorkflows, isHeldLabel, recordsPull, triageBotPulls, heldAcross, HOLD_LABEL,
+  pinVerdict, pinLag, BUMP_WORKFLOW,
 } =
   await import(pathToFileURL(SCRIPT));
+
+const NOW_FIXED = Date.parse('2026-10-01T09:00:00Z');
 
 const run = (path, name, started, conclusion, status = 'completed') => ({
   path: `.github/workflows/${path}`,
@@ -790,4 +793,140 @@ test('end to end: an unlabelled bot PR is reported as before, and costs no MAINT
     ]
   );
   assert.deepEqual(docReads(res), []);
+});
+
+// ── A dispatch of a scheduled workflow is the same automation, run by hand ──
+
+test('a green dispatch NEWER than a red scheduled run clears it (the JFS-Sports 2026-09-28 report)', () => {
+  // kit-pin-bump failed on schedule 09-21, was fixed and dispatched green on
+  // 09-22; the 09-28 report still named the 09-21 failure.
+  const now = Date.parse('2026-09-28T08:41:00Z');
+  const rows = newestScheduledPerWorkflow(
+    [branchRun('kit-pin-bump.yml', 'schedule', '2026-09-21T07:06:38Z', 'failure')],
+    now,
+    null,
+    [branchRun('kit-pin-bump.yml', 'workflow_dispatch', '2026-09-22T21:53:17Z', 'success')]
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].conclusion, 'success');
+  assert.equal(rows[0].event, 'workflow_dispatch');
+  assert.equal(rows[0].startedAt, '2026-09-22T21:53:17Z');
+});
+
+test('an OLDER green dispatch never clears a newer red scheduled run, and a newer red one is reported', () => {
+  const sched = [branchRun('kit-pin-bump.yml', 'schedule', '2026-09-28T06:41:00Z', 'failure')];
+  const older = newestScheduledPerWorkflow(sched, NOW_FIXED, null, [
+    branchRun('kit-pin-bump.yml', 'workflow_dispatch', '2026-09-22T21:53:17Z', 'success'),
+  ]);
+  assert.equal(older[0].conclusion, 'failure');
+  assert.equal(older[0].event, 'schedule');
+  const newerRed = newestScheduledPerWorkflow(
+    [branchRun('kit-pin-bump.yml', 'schedule', '2026-09-28T06:41:00Z', 'success')],
+    NOW_FIXED,
+    null,
+    [branchRun('kit-pin-bump.yml', 'workflow_dispatch', '2026-09-29T10:00:00Z', 'failure')]
+  );
+  assert.equal(newerRed[0].conclusion, 'failure');
+  assert.equal(newerRed[0].event, 'workflow_dispatch');
+});
+
+test('a dispatch-only workflow is not a cron, and only dispatch events count as dispatches', () => {
+  const rows = newestScheduledPerWorkflow(
+    [branchRun('smoke.yml', 'schedule', '2026-09-28T06:00:00Z', 'success')],
+    NOW_FIXED,
+    null,
+    [
+      branchRun('build-met.yml', 'workflow_dispatch', '2026-09-29T10:00:00Z', 'failure'),
+      branchRun('smoke.yml', 'push', '2026-09-29T10:00:00Z', 'failure'),
+    ]
+  );
+  assert.deepEqual(rows.map((r) => [r.workflow, r.conclusion]), [['smoke.yml', 'success']]);
+});
+
+// ── Pin lag is judged against the repo's own last bump, not a commit count ──
+
+test('a pin is stale only when it lacks a commit OLDER than the repo\'s last bump run', () => {
+  const bumpStartedAt = '2026-10-01T06:41:00Z';
+  assert.equal(pinVerdict({ behind: 0, bumpStartedAt }), 'current');
+  // Art-Gallery- on 2026-10-01: two news-kit commits that landed after its
+  // Monday bump — the cadence, not a failure, however many there are.
+  assert.equal(pinVerdict({ behind: 7, oldestMissing: '2026-10-01T12:00:00Z', bumpStartedAt }), 'lagging');
+  // A commit the bump's run could see and did not land.
+  assert.equal(pinVerdict({ behind: 1, oldestMissing: '2026-09-30T18:00:00Z', bumpStartedAt }), 'stale');
+});
+
+test('with no bump run or no commit dates in view the old count rule still applies', () => {
+  assert.equal(pinVerdict({ behind: 1 }), 'lagging');
+  assert.equal(pinVerdict({ behind: 2 }), 'stale');
+  assert.equal(pinVerdict({ behind: 2, bumpStartedAt: '2026-10-01T06:41:00Z' }), 'stale');
+  assert.equal(pinVerdict({ behind: 2, oldestMissing: '2026-09-01T00:00:00Z' }), 'stale');
+});
+
+test('pinLag reads the distance and the oldest missing commit off a compare payload', () => {
+  const at = (date) => ({ commit: { committer: { date } } });
+  assert.deepEqual(
+    pinLag({ ahead_by: 3, commits: [at('2026-09-30T10:00:00Z'), at('2026-09-29T09:00:00Z'), at('not a date'), {}] }),
+    { behind: 3, oldestMissing: '2026-09-29T09:00:00Z' }
+  );
+  assert.deepEqual(pinLag({ ahead_by: 0, commits: [] }), { behind: 0, oldestMissing: null });
+  assert.equal(pinLag(null), null);
+  assert.equal(pinLag({ status: 'diverged' }), null);
+  assert.equal(BUMP_WORKFLOW, 'kit-pin-bump.yml');
+});
+
+const KIT_PIN = 'b'.repeat(40);
+const pinnedRepo = (repo, bumpStarted, missingDates) => ({
+  [`/repos/jsvolos63/${repo}/contents/package.json`]: {
+    body: {
+      content: Buffer.from(JSON.stringify({ devDependencies: { '@jfs/news-kit': `github:jsvolos63/news-kit#${KIT_PIN}` } })).toString('base64'),
+      encoding: 'base64',
+    },
+  },
+  [`/repos/jsvolos63/${repo}/actions/runs?event=schedule`]: {
+    body: { workflow_runs: [branchRun('kit-pin-bump.yml', 'schedule', bumpStarted, 'success')] },
+  },
+  [`/repos/jsvolos63/news-kit/compare/${KIT_PIN}...`]: {
+    body: { ahead_by: missingDates.length, commits: missingDates.map((date) => ({ commit: { committer: { date } } })) },
+  },
+});
+
+test('end to end: kit commits that landed after the repo\'s last bump are not a finding', () => {
+  const res = runStubbed(pinnedRepo('market-monitor', '2026-10-01T06:41:00Z', ['2026-10-01T09:00:00Z', '2026-10-01T09:30:00Z']));
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  assert.deepEqual(JSON.parse(res.stdout).findings, []);
+});
+
+test('end to end: a commit the last bump should have landed is a finding that says so', () => {
+  const res = runStubbed(pinnedRepo('market-monitor', '2026-10-01T06:41:00Z', ['2026-09-30T18:00:00Z', '2026-10-01T09:00:00Z']));
+  assert.equal(res.status, 1, res.stdout + res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.deepEqual(out.findings, [
+    'market-monitor: `@jfs/news-kit` pin bbbbbbb is 2 commits behind news-kit\'s default branch, missing a commit ' +
+      'from 2026-09-30 that its kit-pin bump of 2026-10-01 should have landed',
+  ]);
+  assert.deepEqual(out.repos.find((r) => r.repo === 'market-monitor').stalePins, [{ kit: 'news-kit', sha: 'bbbbbbb', behind: 2 }]);
+});
+
+test('end to end: a red scheduled bump fixed by a later green dispatch reads healthy', () => {
+  const res = runStubbed({
+    '/repos/jsvolos63/JFS-Sports/actions/runs?event=schedule': {
+      body: { workflow_runs: [branchRun('kit-pin-bump.yml', 'schedule', '2026-09-21T07:06:38Z', 'failure')] },
+    },
+    '/repos/jsvolos63/JFS-Sports/actions/runs?branch=main&event=workflow_dispatch': {
+      body: { workflow_runs: [branchRun('kit-pin-bump.yml', 'workflow_dispatch', '2026-09-22T21:53:17Z', 'success')] },
+    },
+  });
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  const row = JSON.parse(res.stdout).repos.find((r) => r.repo === 'JFS-Sports');
+  assert.deepEqual(row.scheduled.map((r) => [r.workflow, r.conclusion, r.event]), [['kit-pin-bump.yml', 'success', 'workflow_dispatch']]);
+});
+
+test('the report marks a scheduled workflow whose newest run was a dispatch', () => {
+  const md = renderMarkdown('healthy', [], [], [
+    {
+      repo: 'JFS-Sports', kind: 'app', stranded: [], stalePulls: [], stalePins: [],
+      scheduled: [{ workflow: 'kit-pin-bump.yml', conclusion: 'success', event: 'workflow_dispatch', ageDays: 6 }],
+    },
+  ]);
+  assert.match(md, /\| JFS-Sports \| kit-pin-bump ✓ \(dispatch\) \|/);
 });

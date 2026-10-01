@@ -16,21 +16,25 @@ A repo calls the ones that apply to it:
 | Workflow | Fires | Lands by itself | Leaves for a session |
 | --- | --- | --- | --- |
 | `family-ci.yml` | every push, every PR, `workflow_dispatch` | — it *is* the gate | nothing |
-| `dependabot-merge.yml` | when CI completes on a Dependabot PR | every bump that is minor or patch, squash-merged on green | **every major**, and any PR body it can't parse |
-| `kit-pin-bump.yml` | weekly, Mondays ~06:41 UTC | the `@jfs/*` pins, the re-vendor, the CLAUDE.md conventions block, the version bump | nothing, when it works |
+| `dependabot-merge.yml` | when CI completes on a Dependabot PR | every bump that is minor or patch, squash-merged on green — except a grouped version update of a direct production dependency (a security update, which arrives ungrouped, still lands) | **every major**, **every grouped npm version update bumping a direct production dependency**, and any PR it can't parse |
+| `kit-pin-bump.yml` | weekly, Mondays ~06:41 UTC — or the longer cadence a repo records in its half of this file | the `@jfs/*` pins, the re-vendor, the CLAUDE.md and MAINTENANCE.md family blocks, the version bump where the caller's command makes one | nothing, when it works |
 | `release.yml` | CI green on `main` | the `v<version>` tag and its GitHub release | nothing |
 
 Three gaps follow from that table and they are the whole reason this protocol
 exists. They are not oversights; each is a deliberate refusal to automate a
 judgement call, and each therefore needs a cadence instead.
 
-**1. Majors accumulate, and the backlog is not inert.** A major is a
-judgement, not a merge, so `dependabot-merge.yml` leaves it open. Nothing
-schedules the session that makes the judgement, and `.github/dependabot.yml`
-caps open PRs. Once the cap is full of unreviewed majors, the weekly
-minor/patch PR — the one the automation *does* land — stops being opened at
-all. The backlog turns from a to-do list into a block on the working half of
-the pipeline.
+**1. Majors and production bumps accumulate, and the backlog is not
+inert.** A major is a judgement, not a merge, so `dependabot-merge.yml` leaves
+it open. So is a minor or patch version update of a direct production
+dependency: it deploys into the runtime that holds the keys, and the suites
+fake the network, so green CI says nothing about what the release does — a
+session reads it first. (A security update is not held: it arrives outside
+the groups, and a published fix should not wait.) Nothing schedules the session that makes the judgement, and
+`.github/dependabot.yml` caps open PRs. Once the cap is full of unreviewed
+PRs, the development minor/patch PR — the one the automation *does* land —
+stops being opened at all. The backlog turns from a to-do list into a block on
+the working half of the pipeline.
 
 **2. CI cannot check prose, or anything whose halves live in different
 files.** Every repo's gate parses what it ships, lints it, regenerates the
@@ -78,14 +82,26 @@ So the weekly check below is not optional hygiene. It is the one cadence that
 protects every other cadence, and it asks four questions:
 
 1. **Did each scheduled workflow's last run succeed?** Not "is `main` green" —
-   a scheduled run fails on its own page. Check the run, not the branch.
+   a scheduled run fails on its own page. Check the run, not the branch. A
+   dispatch of the same workflow on the default branch since then is the
+   same automation run by hand, and counts.
 2. **Is there a stranded `auto/*` branch?** A branch with commits and no open
    PR means the automation did its work and could not deliver it. On any repo:
    `git ls-remote --heads origin 'refs/heads/auto/*'` against the open PR list.
-3. **Are the `@jfs/*` pins actually current?** A repo whose pins sit behind
-   every sibling's is a repo whose bump is not landing, whatever its workflow
-   page says. Compare the pins across repos, not against hope.
-4. **Is any bot PR older than seven days, red, or conflicted?**
+3. **Are the `@jfs/*` pins actually current?** A pin that lacks a kit commit
+   older than the repo's own last bump run is a bump that is not landing,
+   whatever the workflow page says. A commit newer than that run is the
+   cadence — a repo that bumps monthly lags its kits for up to a month by
+   design. Compare against the run, not against hope.
+4. **Is any bot PR older than seven days, red, or conflicted?** A production
+   dependency's minor/patch PR that `dependabot-merge.yml` left open is the
+   week's work, not a hold: read each package's release notes and what changed
+   between the versions, then squash-merge it once CI is green. A bot PR held
+   on PURPOSE — a major the triage below said to hold — carries the label
+   `hold` AND is named as `#<number>` in this file's repo-specific half, with
+   the reason and the condition that would lift it; the family monitor lists
+   such a PR as held instead of reporting it. A `hold` label the file does not
+   record is itself a finding, and mutes nothing.
 
 A clean week needs no action. Say so and stop.
 
@@ -114,7 +130,9 @@ place:
 
 #### Weekly — pipeline hygiene (~10 minutes)
 
-The four questions under "Who watches the watchers". Nothing else.
+The four questions under "Who watches the watchers" — question 4 includes
+merging, after reading, the production bumps the merge workflow left open.
+Nothing else.
 
 #### Monthly — the sweep (~1 hour)
 
@@ -181,8 +199,10 @@ service-worker cache name.
 
 **5. Or hold it — visibly.** A major that should not land gets a row in this
 file's deferred table, with the reason and **the condition that would change
-the answer**. The bot keeps the PR open either way; the table is what stops
-the next session spending an hour re-deriving the same no.
+the answer**, naming the PR as `#<number>` — and the PR gets the label `hold`.
+The bot keeps the PR open either way; the table is what stops the next session
+spending an hour re-deriving the same no, and the label plus the number is
+what lets the family monitor tell a decision from a forgotten PR.
 
 ### Green CI is not delivered
 

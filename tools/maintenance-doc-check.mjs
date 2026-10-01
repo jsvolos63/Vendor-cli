@@ -54,9 +54,9 @@
 //   node tools/maintenance-doc-check.mjs [repoDir]
 //   node tools/maintenance-doc-check.mjs --json
 
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, realpathSync } from 'node:fs';
 import { resolve, join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 const MAINT_START = '<!-- jfs-family-maintenance:start';
 const MAINT_END = '<!-- jfs-family-maintenance:end -->';
@@ -261,4 +261,20 @@ function main() {
   process.exit(res.status === 'could-not-check' ? 2 : res.status === 'findings' ? 1 : 0);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();
+/** Was the module at `metaUrl` the script node was started with? Compared by
+ *  REAL path on both sides. Node resolves symlinks for the main module, so
+ *  `import.meta.url` is the real file while `process.argv[1]` is the path as
+ *  typed — and through a symlinked checkout or `node_modules` the plain
+ *  comparison this replaced was false: the CLI printed nothing and exited 0,
+ *  a check that "passed" without running (measured by market-monitor on
+ *  2026-09-30, which compares realpaths in its own CLIs for the same reason). */
+export function invokedAsScript(metaUrl, argv1 = process.argv[1]) {
+  if (!argv1) return false;
+  try {
+    return realpathSync(argv1) === realpathSync(fileURLToPath(metaUrl));
+  } catch {
+    return false;
+  }
+}
+
+if (invokedAsScript(import.meta.url)) main();
