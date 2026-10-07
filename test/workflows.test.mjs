@@ -408,6 +408,17 @@ test('kit-pin-bump runs every untrusted command under a read-only token, and the
   assert.ok((jobs.prepare.steps || []).some((s) => /\.github\/workflows/.test(s.run || '') && /exit 1/.test(s.run || '')), 'prepare must refuse a patch that touches .github/workflows');
 });
 
+test('kit-pin-bump merges whenever an open bump PR exists, not only when this run created or updated it', () => {
+  // create-pull-request (v8.1.1) reports operation 'none' — with the PR number
+  // set — when a retry rebuilds a branch that is even with its remote. The
+  // documented contract is that a refused merge reds the run, so the merge
+  // must still be attempted then. Measured against the pinned action bundle.
+  const merge = wf('kit-pin-bump.yml').jobs.bump.steps.find((s) => s.id === 'merge');
+  assert.ok(merge, 'the bump job has no step with id merge');
+  assert.equal(merge.if, "inputs.auto-merge && steps.cpr.outputs.pull-request-number != ''");
+  assert.doesNotMatch(merge.if, /pull-request-operation/);
+});
+
 test('kit-pin-bump exposes the merge it made as a workflow output, empty when nothing merged', () => {
   // A caller that runs its own CI on main after the bump (market-monitor's
   // ci-on-main) gates on this; without it that job fired on every run, merged

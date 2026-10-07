@@ -418,9 +418,15 @@ jobs:
       # blocks the merge, FAIL the run — a validated bump left unmerged is
       # exactly how pins silently drift, so it must be a red run, not a
       # warning (soft-fail: true restores the old behavior).
+      # Gated on the PR NUMBER, not on pull-request-operation: a re-run or a
+      # dispatch after a refused merge, with main and the kits unchanged,
+      # rebuilds a byte-identical branch, which create-pull-request reports as
+      # operation 'none' while still naming the open PR. A created/updated
+      # gate skipped the merge there and went green with the PR left open —
+      # the false green BearsMockDraft measured in its own refresh crons (#209).
       - name: Merge the validated pin-bump PR
         id: merge
-        if: inputs.auto-merge && (steps.cpr.outputs.pull-request-operation == 'created' || steps.cpr.outputs.pull-request-operation == 'updated')
+        if: inputs.auto-merge && steps.cpr.outputs.pull-request-number != ''
         env:
           GH_TOKEN: ${{ github.token }}
           PR_URL: ${{ steps.cpr.outputs.pull-request-url }}
