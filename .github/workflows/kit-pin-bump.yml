@@ -376,7 +376,7 @@ jobs:
           # nothing else here needs a credential in .git/config.
           persist-credentials: false
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: kit-pin-bump-${{ github.run_id }}
           path: ${{ runner.temp }}
