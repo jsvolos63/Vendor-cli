@@ -10,7 +10,10 @@
 # here; this job merges the PR when the run is green, the PR is Dependabot's
 # own (same repo, dependabot[bot] author) and every bump it carries is minor
 # or patch. A MAJOR bump is left open for a session or a human — that is a
-# behaviour change to read, not a lockfile refresh.
+# behaviour change to read, not a lockfile refresh. "Major" is read from the
+# title and body AND from the commit metadata's `update-type`, because a held
+# major that a session lands by hand comes back retargeted as a patch title
+# over semver-major metadata (Surf-Tracker #291, merged unreviewed 2026-10-07).
 #
 # So is an npm GROUPED version update that bumps a direct PRODUCTION
 # dependency, minor or patch (`hold-production`, default true — the family
@@ -128,17 +131,25 @@ jobs:
             [ "$fm" = "$tm" ] || major=1
           done < <(grep -oE '(Bumps|Updates|bumps|updates) [^ ]+ from [0-9][^ ]* to [0-9][^ ]*' <<<"$text" | sed 's/`//g' || true)
           if [ "$seen" = 0 ]; then major=1; fi
+          # Dependabot's commit metadata is read too, every commit on the PR.
+          # A held major that a session lands by hand is RETARGETED: the same
+          # ungrouped PR comes back titled as a patch ("from 11.1.1 to
+          # 11.1.2") while its metadata still says semver-major, and the
+          # ungrouped-production rule below took it for a security update and
+          # merged it (Surf-Tracker #291, 2026-10-07). A semver-major anywhere
+          # in the metadata counts.
+          meta=$(gh pr view "$number" --repo "$GITHUB_REPOSITORY" --json commits \
+                   --jq '[.commits[].messageBody] | join("\n")')
+          if grep -qE 'update-type: *version-update:semver-major' <<<"$meta"; then major=1; fi
           if [ "$major" = 1 ] && [ "$ALLOW_MAJOR" != "true" ]; then
-            echo "PR #$number carries a major bump (or one this parser cannot read) — left open for a review"; exit 0
+            echo "PR #$number carries a major bump (by its title, body or commit metadata, or one this parser cannot read) — left open for a review"; exit 0
           fi
           # FAM-4: a grouped version update that bumps a direct production
           # dependency waits for a session (see the header). npm only —
           # Dependabot names the ecosystem in the branch,
-          # dependabot/npm_and_yarn/... — and read from its commit metadata,
-          # every commit on the PR, since a rebase can leave more than one.
+          # dependabot/npm_and_yarn/... — and read from the commit metadata
+          # above, every commit on the PR, since a rebase can leave more than one.
           if [ "$HOLD_PRODUCTION" = "true" ] && [[ "$HEAD_BRANCH" == dependabot/npm_and_yarn/* ]]; then
-            meta=$(gh pr view "$number" --repo "$GITHUB_REPOSITORY" --json commits \
-                     --jq '[.commits[].messageBody] | join("\n")')
             types=$(grep -oE 'dependency-type: *[a-z:]+' <<<"$meta" | sed 's/dependency-type: *//' | sort -u || true)
             if [ -z "$types" ]; then
               echo "PR #$number carries no readable Dependabot metadata, so it may bump a production dependency — left open for a review"; exit 0

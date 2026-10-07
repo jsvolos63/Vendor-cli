@@ -213,3 +213,32 @@ test('a production-only GROUP (a repo that splits its groups by type) is held', 
   assert.equal(r.merged, '');
   assert.match(r.out, /\(dotenv,imapflow\)/);
 });
+
+test('a held major RETARGETED as a patch after a manual upgrade is still held', () => {
+  // Surf-Tracker #291, 2026-10-07: the ungrouped @netlify/blobs 8 → 11 major
+  // was held; a session landed 11.1.1 by hand; Dependabot rebased the same PR
+  // into "from 11.1.1 to 11.1.2" with its metadata still semver-major, and the
+  // title-only major check plus the ungrouped = security-update rule merged
+  // a production version update no session had read.
+  const r = runStep({
+    branch: 'dependabot/npm_and_yarn/netlify/blobs-11.1.1',
+    title: 'Bump @netlify/blobs from 11.1.1 to 11.1.2',
+    body: 'Bumps [@netlify/blobs](https://example.invalid) from 11.1.1 to 11.1.2.',
+    commits: ungrouped(['"@netlify/blobs"', 'direct:production', 'version-update:semver-major']),
+  });
+  assert.equal(r.status, 0, r.out);
+  assert.equal(r.merged, '', 'a retargeted major must not merge as a security update');
+  assert.match(r.out, /carries a major bump/);
+});
+
+test('allow-major: true still merges a retargeted development major on green', () => {
+  const r = runStep({
+    allowMajor: true,
+    branch: 'dependabot/npm_and_yarn/jsdom-31.0.0',
+    title: 'Bump jsdom from 31.0.0 to 31.0.1',
+    body: 'Bumps [jsdom](https://example.invalid) from 31.0.0 to 31.0.1.',
+    commits: ungrouped(['jsdom', 'direct:development', 'version-update:semver-major']),
+  });
+  assert.equal(r.status, 0, r.out);
+  assert.match(r.merged, /--match-head-commit/);
+});

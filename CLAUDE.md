@@ -344,7 +344,13 @@ the fix for a HIGH prod-audit failure that had CI red on main. Each repo now
 triggers this on its CI workflow completing (`workflow_run`, the same
 name-must-match rule as `release.yml`); it merges when the run is green, the
 PR is Dependabot's own, and every bump it carries is minor or patch. A MAJOR
-bump, or a body the parser cannot read, is left open.
+bump, or a body the parser cannot read, is left open. "Major" is read from the
+title and body AND from the commit metadata's `update-type`: a held major that
+a session then lands by hand comes back RETARGETED — the same ungrouped PR,
+titled as a patch, over metadata still saying semver-major — and before the
+metadata was read, the ungrouped-production rule below took that for a
+security update and merged it (Surf-Tracker #291, 2026-10-07: @netlify/blobs
+11.1.1 → 11.1.2, a second production deploy no session had read).
 
 **So is a grouped npm version update that bumps a direct production
 dependency** (`hold-production`, default true, since 0.22.0 — the family
