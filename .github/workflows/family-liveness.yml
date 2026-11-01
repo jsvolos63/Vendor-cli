@@ -12,8 +12,12 @@
 # in thirteen repos: a notification per repo would need an `issues: write` grant
 # in each of them, and the failure of the notifier would itself be silent.
 #
-# Runs Mondays 08:10 UTC — deliberately ~90 minutes after the 06:41 kit-pin
-# bump, so it observes THIS week's bump rather than last week's.
+# Runs Mondays 08:10 UTC, and also on the 2nd of each month at 08:10 —
+# deliberately ~90 minutes after the monthly 06:41 kit-pin bump, so it
+# observes THIS month's bump the morning it runs rather than up to a week
+# later. The weekly run stays: the data crons, Dependabot PRs and the
+# red-branch checks do not wait for the bump. (The bump moved from Mondays to
+# the 2nd on 2026-11-01, the owner's monthly-cadence decision.)
 #
 # NO `npm ci`. The script is dependency-free for exactly this reason: a broken
 # lockfile or a failed install must never be able to blind the monitor. Same
@@ -24,6 +28,7 @@ name: Family liveness
 on:
   schedule:
     - cron: '10 8 * * 1'
+    - cron: '10 8 2 * *'
   workflow_dispatch:
 
 permissions:
