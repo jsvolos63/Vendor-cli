@@ -17,12 +17,15 @@
 # blocked, so a stuck bump shows up as a red workflow run (set `soft-fail:
 # true` to get the old warning-only behavior back).
 #
-# Callers keep only the schedule and the repo-specific commands:
+# Callers keep only the schedule and the repo-specific commands. The family
+# schedule is monthly, on the 2nd at ~06:41 UTC (news-kit at ~06:11, so the
+# apps pick up its bump the same morning) — the owner's decision of
+# 2026-11-01, which moved every caller off the old Monday cron:
 #
 #   name: Kit pin bump
 #   on:
 #     schedule:
-#       - cron: '41 6 * * 1'
+#       - cron: '41 6 2 * *'
 #     workflow_dispatch:
 #   permissions:
 #     contents: write
@@ -72,7 +75,7 @@
 # `contents: read`. It hands the bumped tree to `bump` as a git patch
 # artifact. `bump` holds the write token and executes NOTHING from the repo:
 # checkout, apply the patch, open the PR, merge. So a compromised kit commit
-# (or a compromised dependency of one) landing in the weekly bump can at
+# (or a compromised dependency of one) landing in the monthly bump can at
 # worst ship itself in the PR it was always going to ride — it cannot push
 # to the default branch, touch other branches, or approve anything. Before
 # the split (2026-09-26) the single job ran that code with the write token
@@ -104,7 +107,7 @@ on:
           Path to a .nvmrc / .node-version in the CALLING repo, the same
           opt-in family-ci.yml has: when set, that file decides the Node the
           bump runs on and `node-version` is ignored, so a repo whose CI
-          already reads its .nvmrc does not validate its weekly bump on a
+          already reads its .nvmrc does not validate its bump on a
           different Node than its CI and its deploy. Default '' keeps
           `node-version` authoritative — a no-op for every caller that does
           not set it. The file must exist; setup-node fails rather than

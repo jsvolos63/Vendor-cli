@@ -95,18 +95,18 @@ worker that already activated has nothing to wait for and strands on
 
 ### Dependencies
 
-Every npm repo carries `.github/dependabot.yml` — npm weekly, or monthly
-where the repo's MAINTENANCE.md records why (a Netlify free plan, where every
-merge is a paid deploy); minor and patch grouped, any production
-dependencies in a group of their own; monthly `github-actions`; a 7-day
-`cooldown` — and calls the family's `dependabot-merge.yml` reusable
-workflow, which squash-merges a Dependabot PR once the repo's CI is green on
-it and every bump in it is minor or patch. It
-leaves open every MAJOR, and every grouped npm version update that bumps a
-direct production dependency: those run where the keys live and the suites
-fake the network, so a session reads each package's release notes and merges
-it by hand. A security update arrives ungrouped and still merges on green —
-which makes the grouping load-bearing. Dependabot never touches the `@jfs/*`
-git pins; the kit-pin bump owns those (weekly, or on the cadence the repo
-records). First-party `actions/*` are referenced by major tag; every other
+Every npm repo carries `.github/dependabot.yml` — npm and `github-actions`
+both monthly (the owner's decision of 2026-11-01: routine updates are
+monthly family-wide; security updates are not scheduled and still arrive
+when published); minor and patch grouped, any production dependencies in a
+group of their own; a 7-day `cooldown` — and calls the family's
+`dependabot-merge.yml` reusable workflow, which squash-merges a Dependabot
+PR once the repo's CI is green on it and every bump in it is minor or
+patch. It leaves open every MAJOR, and every grouped npm version update
+that bumps a direct production dependency: those run where the keys live
+and the suites fake the network, so a session reads each package's release
+notes and merges it by hand. A security update arrives ungrouped and still
+merges on green — which makes the grouping load-bearing. Dependabot never
+touches the `@jfs/*` git pins; the kit-pin bump owns those (monthly, on the
+2nd). First-party `actions/*` are referenced by major tag; every other
 action is pinned by full SHA.

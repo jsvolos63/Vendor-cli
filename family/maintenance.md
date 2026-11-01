@@ -17,7 +17,7 @@ A repo calls the ones that apply to it:
 | --- | --- | --- | --- |
 | `family-ci.yml` | every push, every PR, `workflow_dispatch` | — it *is* the gate | nothing |
 | `dependabot-merge.yml` | when CI completes on a Dependabot PR | every bump that is minor or patch, squash-merged on green — except a grouped version update of a direct production dependency (a security update, which arrives ungrouped, still lands) | **every major**, **every grouped npm version update bumping a direct production dependency**, and any PR it can't parse |
-| `kit-pin-bump.yml` | weekly, Mondays ~06:41 UTC — or the longer cadence a repo records in its half of this file | the `@jfs/*` pins, the re-vendor, the CLAUDE.md and MAINTENANCE.md family blocks, the version bump where the caller's command makes one | nothing, when it works |
+| `kit-pin-bump.yml` | monthly, on the 2nd ~06:41 UTC (news-kit ~06:11, ahead of its consumers) | the `@jfs/*` pins, the re-vendor, the CLAUDE.md and MAINTENANCE.md family blocks, the version bump where the caller's command makes one | nothing, when it works |
 | `release.yml` | CI green on `main` | the `v<version>` tag and its GitHub release | nothing |
 
 Three gaps follow from that table and they are the whole reason this protocol
@@ -91,8 +91,8 @@ protects every other cadence, and it asks four questions:
 3. **Are the `@jfs/*` pins actually current?** A pin that lacks a kit commit
    older than the repo's own last bump run is a bump that is not landing,
    whatever the workflow page says. A commit newer than that run is the
-   cadence — a repo that bumps monthly lags its kits for up to a month by
-   design. Compare against the run, not against hope.
+   cadence — the family bumps monthly, so a repo lags its kits for up to a
+   month by design. Compare against the run, not against hope.
 4. **Is any bot PR older than seven days, red, or conflicted?** A production
    dependency's minor/patch PR that `dependabot-merge.yml` left open is the
    week's work, not a hold: read each package's release notes and what changed

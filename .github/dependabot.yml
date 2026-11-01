@@ -1,6 +1,7 @@
 # Family dependency policy (see the Dependencies convention in CLAUDE.md):
-# weekly npm with minor and patch grouped into PRs that dependabot-merge.yml
-# lands once CI is green; majors arrive on their own and stay open for a
+# monthly npm (the owner's decision of 2026-11-01 — routine updates are
+# monthly family-wide) with minor and patch grouped into PRs that
+# dependabot-merge.yml lands once CI is green; majors arrive on their own and stay open for a
 # review. The @jfs/* git pins are the kit-pin bump's, not Dependabot's — and
 # this repo pins none. GitHub Actions monthly, so SHA-pinned third-party
 # actions pick up fixes.
@@ -21,8 +22,7 @@ updates:
   - package-ecosystem: npm
     directory: /
     schedule:
-      interval: weekly
-      day: tuesday
+      interval: monthly
     cooldown:
       default-days: 7
     groups:

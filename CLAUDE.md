@@ -30,9 +30,10 @@ workflow validates against its own copy.
 ## Kit pin bump (`.github/workflows/kit-pin-bump.yml`)
 
 The second reusable workflow: the pin-bump/re-vendor/auto-merge flow that
-eight consumers used to hand-copy (~104 lines each, all eight drifted). Weekly
-in most callers; market-monitor runs it monthly to save Netlify deploy
-credits, which the family texts and the liveness monitor now allow.
+eight consumers used to hand-copy (~104 lines each, all eight drifted).
+Monthly in every caller, on the 2nd at ~06:41 UTC (news-kit ~06:11, ahead of
+its consumers) — the owner's decision of 2026-11-01; until then it was weekly
+on Mondays everywhere but market-monitor.
 Callers keep only the schedule and their repo-specific commands; everything
 else — checkout, node, install, `jfs-bump-kit-pins`, PR open, squash-merge —
 lives here. Inputs: `check-command` (required — the repo's CI checks, run
@@ -56,7 +57,7 @@ in `prepare`, whose token is downgraded to `contents: read`. It hands the
 bumped tree to `bump` as a git patch artifact, and `bump` — the only job
 with `contents: write` + `pull-requests: write` — executes nothing from
 the repo: checkout, `git apply`, open the PR, merge. A compromised kit
-commit landing in the weekly bump can therefore at worst ship itself in
+commit landing in the monthly bump can therefore at worst ship itself in
 the PR it was always going to ride; it cannot push to the default branch,
 touch other branches or approve anything. `prepare` also refuses to hand
 over a patch that touches `.github/workflows/`. `test/workflows.test.mjs`
@@ -86,7 +87,7 @@ the repo has a MAINTENANCE.md — the bin refuses to create one); until
 2026-10-01 only CLAUDE.md rode the bump, so an edit to `family/maintenance.md`
 left every opted-in consumer red with nothing to carry the fix. Both are a
 BACKSTOP, not the delivery — see "The canonical family-conventions text"
-below for why the sync cannot wait for Monday.
+below for why the sync cannot wait for the monthly bump.
 
 **The bump tags the version it lands, because nothing else can.** The merge
 this workflow makes is a default-`GITHUB_TOKEN` merge, and a `GITHUB_TOKEN`
@@ -118,7 +119,7 @@ family); `soft-fail: true` restores warning-only. A minimal caller:
 name: Kit pin bump
 on:
   schedule:
-    - cron: '41 6 * * 1'
+    - cron: '41 6 2 * *'
   workflow_dispatch:
 permissions:
   contents: write        # the caller must grant both — a called
@@ -366,13 +367,13 @@ line first in its own caller, and FAM-4's recommended fix has the same shape.
 readable metadata is. `test/dependabot-merge.test.mjs` runs the workflow's
 real script against a fake `gh` and holds every one of those branches.
 
-Every npm repo pairs it with a `.github/dependabot.yml` — npm weekly (monthly
-where the repo records why), minor and patch grouped with production apart
+Every npm repo pairs it with a `.github/dependabot.yml` — npm monthly (the
+owner's decision of 2026-11-01), minor and patch grouped with production apart
 from development, monthly `github-actions`, a 7-day cooldown — and the
 `@jfs/*` git pins stay the kit-pin bump's. The production group matters only
 where a repo has production npm dependencies (market-monitor, John's News,
 Surf-Tracker, FlightCheck and this repo, on 2026-10-01): with one catch-all
-group, every week a production release would hold the dev bumps with it.
+group, every month a production release would hold the dev bumps with it.
 
 **Action pinning policy**, stated here because the review found it applied
 inconsistently: first-party `actions/*` are referenced by major tag (they
@@ -497,8 +498,9 @@ labels ride on the pulls list payload, so there is no new endpoint. A family
 whose only open business is recorded holds exits 0. The label is how a session
 SAYS a PR is held; the record is what the monitor checks.
 
-`.github/workflows/family-liveness.yml` runs it Mondays 08:10 UTC —
-deliberately ~90 minutes after the 06:41 bump, so it observes THIS week's run —
+`.github/workflows/family-liveness.yml` runs it Mondays 08:10 UTC and on the
+2nd of each month at 08:10 — ~90 minutes after the monthly 06:41 bump, so it
+observes THIS month's run the same morning —
 and opens ONE rolling issue here when something needs a session. One issue in
 the hub rather than a notification in thirteen repos: per-repo notifications
 would need an `issues: write` grant in each, and the notifier's own failure
@@ -579,8 +581,8 @@ consumer's pin.** `family-ci.yml` clones this repo's main into
 the moment an edit to the canonical text merges here, every consumer's
 next CI run — a Dependabot PR's, a session's dispatch, anything — fails
 its conventions check, and it stays red until that consumer's CLAUDE.md
-is re-synced. The weekly pin bump does carry the re-sync, but a repo
-cannot wait for Monday with CI red: the Dependabot merge workflow, for
+is re-synced. The monthly pin bump does carry the re-sync, but a repo
+cannot wait up to a month with CI red: the Dependabot merge workflow, for
 one, merges nothing while it is. This has now happened twice (the Look &
 feel section, then the Service-worker-updates and Dependencies sections:
 thirteen repos red at once; a third edit, on 2026-10-01, rewrote the
@@ -724,20 +726,20 @@ worker that already activated has nothing to wait for and strands on
 
 ### Dependencies
 
-Every npm repo carries `.github/dependabot.yml` — npm weekly, or monthly
-where the repo's MAINTENANCE.md records why (a Netlify free plan, where every
-merge is a paid deploy); minor and patch grouped, any production
-dependencies in a group of their own; monthly `github-actions`; a 7-day
-`cooldown` — and calls the family's `dependabot-merge.yml` reusable
-workflow, which squash-merges a Dependabot PR once the repo's CI is green on
-it and every bump in it is minor or patch. It
-leaves open every MAJOR, and every grouped npm version update that bumps a
-direct production dependency: those run where the keys live and the suites
-fake the network, so a session reads each package's release notes and merges
-it by hand. A security update arrives ungrouped and still merges on green —
-which makes the grouping load-bearing. Dependabot never touches the `@jfs/*`
-git pins; the kit-pin bump owns those (weekly, or on the cadence the repo
-records). First-party `actions/*` are referenced by major tag; every other
+Every npm repo carries `.github/dependabot.yml` — npm and `github-actions`
+both monthly (the owner's decision of 2026-11-01: routine updates are
+monthly family-wide; security updates are not scheduled and still arrive
+when published); minor and patch grouped, any production dependencies in a
+group of their own; a 7-day `cooldown` — and calls the family's
+`dependabot-merge.yml` reusable workflow, which squash-merges a Dependabot
+PR once the repo's CI is green on it and every bump in it is minor or
+patch. It leaves open every MAJOR, and every grouped npm version update
+that bumps a direct production dependency: those run where the keys live
+and the suites fake the network, so a session reads each package's release
+notes and merges it by hand. A security update arrives ungrouped and still
+merges on green — which makes the grouping load-bearing. Dependabot never
+touches the `@jfs/*` git pins; the kit-pin bump owns those (monthly, on the
+2nd). First-party `actions/*` are referenced by major tag; every other
 action is pinned by full SHA.
 
 <!-- jfs-family-conventions:end -->
