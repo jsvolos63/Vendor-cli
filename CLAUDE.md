@@ -43,7 +43,9 @@ in-workflow because default-token PRs never trigger pull_request CI),
 `version-bump-command` ('' skips any), `node-version` (default 22),
 `node-version-file` ('' keeps `node-version`; the same opt-in family-ci has),
 `auto-merge` (default true), `soft-fail` (default false), `release-title`
-('' skips), `pr-body-extra`. One output: `merge-sha`, the squash commit the
+('' skips), `pr-body-extra`, `ci-workflow` ('' finds the one workflow that
+calls family-ci.yml and has `workflow_dispatch`) and `ci-wait-minutes`
+(default 40). One output: `merge-sha`, the squash commit the
 bump landed, empty when nothing merged — a caller that dispatches its own CI
 on main afterwards gates on it (market-monitor's `ci-on-main` asked for it;
 before it, that job fired on every run, merged or not).
@@ -110,6 +112,28 @@ exists, so a kit caller — which bumps no version — simply no-ops. With
 `auto-merge: false` nothing is skipped that matters: a human's merge fires CI
 and the ordinary gated path tags it.
 
+**The bump PR is merged only on a green CI run of its own head commit**
+(since 2026-11-02). Every family `main` is branch-protected and requires the
+family-ci checks, and a PR opened with the default `GITHUB_TOKEN` fires no
+`pull_request` workflow, so a bump PR used to carry no check runs and its
+merge was refused (the first run to meet it would have been 2026-12-02's).
+`workflow_dispatch` is the one event that token may still fire: the `ci` step
+dispatches the caller's CI workflow on `auto/kit-pin-bump`, polls the runs of
+that workflow for the PR's head SHA (`event=workflow_dispatch`, created after
+the dispatch), and the merge runs `gh pr merge --match-head-commit` on that
+SHA only when the run concluded `success` — the run whose `family-ci / …`
+check runs branch protection reads. A red, cancelled or unfinished run reds
+the job and leaves the PR open (`soft-fail` makes it a warning, still
+unmerged); with `auto-merge: false` it only dispatches, so a human finds the
+checks there. The step runs nothing from the repo: it reads the PR and the
+workflow files and calls the Actions API, and the CI it starts runs under the
+CI workflow's own token. It needs `actions: write`, so **every caller grants
+it** — a caller without it fails at startup, because a called workflow cannot
+ask for more than its caller gave. The in-workflow `check-command` run stays:
+it is what decides whether a PR is opened at all.
+`test/kit-pin-bump-ci.test.mjs` runs both steps' real scripts against a fake
+`gh`.
+
 The important behavior change vs. the old copies: a blocked auto-merge of a
 validated bump **fails the run** instead of emitting an invisible
 `::warning::` (the old failure mode is how pins silently drifted across the
@@ -122,8 +146,9 @@ on:
     - cron: '41 6 2 * *'
   workflow_dispatch:
 permissions:
-  contents: write        # the caller must grant both — a called
+  contents: write        # the caller must grant all three — a called
   pull-requests: write   # workflow can't elevate its token
+  actions: write         # dispatch the repo's CI on the bump branch
 jobs:
   bump:
     uses: jsvolos63/vendor-cli/.github/workflows/kit-pin-bump.yml@main

@@ -3,11 +3,20 @@
 # The consumer half of the kit-update fan-out: check whether the pinned
 # @jfs/* kits have moved past the caller's pins, and if so open a PR with the
 # bumped pins + regenerated vendored copies. The workflow patch-bumps the app
-# version for the re-vendored assets, runs the repo's CI checks itself (PRs
-# opened with the default GITHUB_TOKEN never trigger pull_request workflows,
-# so normal CI can't gate them), and merges the PR when they pass — a kit fix
-# propagates with zero manual touches. It never pushes directly to the
+# version for the re-vendored assets, runs the repo's CI checks itself in a
+# read-only job, then DISPATCHES the repo's own family-ci workflow on the bump
+# branch and merges the PR only once that run is green on its head commit — a
+# kit fix propagates with zero manual touches. It never pushes directly to the
 # default branch.
+#
+# Why the dispatch (2026-11-02): main is branch-protected and REQUIRES the
+# family-ci checks. A PR opened with the default GITHUB_TOKEN never triggers
+# pull_request workflows, so before this the bump PR carried no check runs at
+# all and its merge was refused. workflow_dispatch is the one event a
+# GITHUB_TOKEN may still fire, and the check runs it creates sit on the PR's
+# head commit under the same names (`family-ci / checks`), which is what the
+# protection rule matches. It needs `actions: write`, which every caller must
+# grant (a called workflow cannot elevate its token).
 #
 # Eight consumer repos used to hand-copy this ~104-line skeleton and the
 # copies drifted (8 distinct files differing only in install/check/version
@@ -30,6 +39,7 @@
 #   permissions:
 #     contents: write
 #     pull-requests: write
+#     actions: write         # dispatch the repo's CI on the bump branch
 #   jobs:
 #     bump:
 #       uses: jsvolos63/vendor-cli/.github/workflows/kit-pin-bump.yml@main
@@ -195,10 +205,25 @@ on:
           re-vendor instructions for copy-in consumers)
         type: string
         default: ''
+      ci-workflow:
+        description: >-
+          File name of the CALLER's CI workflow to dispatch on the bump branch
+          before the merge (e.g. ci.yml). Default '' finds it: the one file in
+          .github/workflows that calls family-ci.yml and carries
+          workflow_dispatch; none or several is an error that names them.
+        type: string
+        default: ''
+      ci-wait-minutes:
+        description: >-
+          How long the merge waits for that CI run to finish on the bump
+          branch's head commit before giving up (a red run either way).
+        type: number
+        default: 40
 
 permissions:
   contents: write
   pull-requests: write
+  actions: write
 
 # Two runs (a schedule and a dispatch) racing on the same `auto/kit-pin-bump`
 # branch would each open/update the PR and fight over the merge; queue them.
@@ -354,16 +379,21 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # Write-scoped: applies the patch, opens the PR, merges. Runs NO code from
-  # the repo or its dependencies — no install, no scripts, no checks.
+  # Write-scoped: applies the patch, opens the PR, dispatches the repo's CI on
+  # it, merges. Runs NO code from the repo or its dependencies — no install,
+  # no scripts, no checks: the CI it dispatches runs in the repo's own CI
+  # workflow, under that workflow's own (read-only) token.
   bump:
     needs: prepare
     if: needs.prepare.outputs.changed == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The CI wait is bounded by ci-wait-minutes (default 40); this is the
+    # backstop above it.
+    timeout-minutes: 75
     permissions:
       contents: write
       pull-requests: write
+      actions: write
     outputs:
       # The commit the squash-merge put on the default branch, and the only
       # thing the release job below needs from this one. Empty whenever no
@@ -410,11 +440,91 @@ jobs:
             and the app version bumped per this
             repo's caller inputs; the repo's CI checks ran green inside the
             bump workflow (in a read-only job) before this PR was opened.
-            (PRs opened with the default GITHUB_TOKEN never trigger
-            pull_request CI, and neither does the merge it makes, so that
-            pre-merge run is the only validation this change gets.)
+            A PR opened with the default GITHUB_TOKEN triggers no
+            pull_request CI, so the bump then dispatches the repo's CI
+            workflow on this branch and merges only once that run is green
+            on the head commit — the run whose checks branch protection
+            reads.
 
             ${{ inputs.pr-body-extra }}
+
+      # Dispatch the repo's CI on the bump branch and wait for it on the head
+      # commit. Reads the PR and the workflow files, calls the Actions API;
+      # runs nothing from the repo. With auto-merge off it only dispatches,
+      # so a human finds the required checks already there.
+      - name: Run the repo's CI on the bump branch
+        id: ci
+        if: steps.cpr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ steps.cpr.outputs.pull-request-url }}
+          BRANCH: auto/kit-pin-bump
+          CI_WORKFLOW: ${{ inputs.ci-workflow }}
+          WAIT_MINUTES: ${{ inputs.ci-wait-minutes }}
+          AUTO_MERGE: ${{ inputs.auto-merge }}
+          SOFT_FAIL: ${{ inputs.soft-fail }}
+          POLL_SECONDS: '20'
+        run: |
+          set -euo pipefail
+          head=$(gh pr view "$PR_URL" --json headRefOid --jq '.headRefOid')
+          if [ ${#head} -ne 40 ] || [ -n "${head//[0-9a-f]/}" ]; then
+            echo "::error::Could not read the head commit of $PR_URL (got '$head')."
+            exit 1
+          fi
+          echo "head-sha=$head" >> "$GITHUB_OUTPUT"
+
+          wf="$CI_WORKFLOW"
+          if [ -z "$wf" ]; then
+            mapfile -t found < <(grep -lE 'uses:[[:space:]]*(jsvolos63/vendor-cli/|\./)\.github/workflows/family-ci\.ya?ml' .github/workflows/*.yml .github/workflows/*.yaml 2>/dev/null \
+                                   | xargs -r grep -lE '^[[:space:]]*workflow_dispatch:' || true)
+            if [ "${#found[@]}" -ne 1 ]; then
+              echo "::error::Expected exactly one workflow in .github/workflows that calls family-ci.yml and has workflow_dispatch; found ${#found[@]}${found[*]:+: ${found[*]}}. Pass ci-workflow to name it."
+              exit 1
+            fi
+            wf=$(basename "${found[0]}")
+          fi
+          if ! [[ "$wf" =~ ^[A-Za-z0-9._-]+\.ya?ml$ ]]; then
+            echo "::error::ci-workflow must be a workflow file name like ci.yml (got '$wf')."
+            exit 1
+          fi
+
+          # Runs created before this dispatch are not this dispatch's; the
+          # minute of slack covers runner/GitHub clock skew (a run that old on
+          # the same head commit validated the same tree anyway).
+          since=$(date -u -d '-60 seconds' +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run "$wf" --repo "$GITHUB_REPOSITORY" --ref "$BRANCH"
+          echo "Dispatched $wf on $BRANCH ($head)."
+          if [ "$AUTO_MERGE" != "true" ]; then
+            echo "auto-merge is off: the checks will be on $PR_URL for whoever merges it."
+            exit 0
+          fi
+
+          deadline=$(( $(date +%s) + WAIT_MINUTES * 60 ))
+          run=''
+          while :; do
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$wf/runs?head_sha=$head&event=workflow_dispatch&per_page=20" \
+                    --jq "[.workflow_runs[] | select(.created_at >= \"$since\")] | sort_by(.created_at) | last | select(. != null) | [.id, .status, (.conclusion // \"\"), .html_url] | @tsv")
+            status=$(cut -f2 <<<"$run")
+            if [ "$status" = "completed" ]; then break; fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              msg="CI ($wf) on $BRANCH did not finish within $WAIT_MINUTES minutes${run:+ (last seen: $status, $(cut -f4 <<<"$run"))}; $PR_URL is left open."
+              if [ "$SOFT_FAIL" = "true" ]; then echo "::warning::$msg"; echo "green=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+              echo "::error::$msg"
+              exit 1
+            fi
+            sleep "$POLL_SECONDS"
+          done
+          conclusion=$(cut -f3 <<<"$run")
+          url=$(cut -f4 <<<"$run")
+          if [ "$conclusion" = "success" ]; then
+            echo "green=true" >> "$GITHUB_OUTPUT"
+            echo "CI passed on $head: $url"
+            exit 0
+          fi
+          msg="CI ($wf) concluded '$conclusion' on the bump branch's head commit $head: $url — $PR_URL is left open. Fix the failure or merge by hand once it is green."
+          if [ "$SOFT_FAIL" = "true" ]; then echo "::warning::$msg"; echo "green=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          echo "::error::$msg"
+          exit 1
 
       # Squash-merge the validated PR; the branch is deleted so the next
       # scheduled run starts clean. If branch protection or a conflict
@@ -434,8 +544,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_URL: ${{ steps.cpr.outputs.pull-request-url }}
           SOFT_FAIL: ${{ inputs.soft-fail }}
+          CI_GREEN: ${{ steps.ci.outputs.green }}
+          HEAD_SHA: ${{ steps.ci.outputs.head-sha }}
         run: |
-          if gh pr merge --squash --delete-branch "$PR_URL"; then
+          # Reached with CI not green only under soft-fail (otherwise the CI
+          # step already failed the job): leave the PR open, say so.
+          if [ "$CI_GREEN" != "true" ]; then
+            echo "::warning::CI is not green on the bump branch — $PR_URL left open."
+            exit 0
+          fi
+          # Bound to the commit CI validated: a push landing in between is
+          # refused by GitHub rather than merged unvalidated.
+          if gh pr merge --squash --delete-branch --match-head-commit "$HEAD_SHA" "$PR_URL"; then
             echo "Pin-bump PR merged: $PR_URL"
             # Name the squash commit for the release job. `gh pr view` says
             # exactly which commit landed, where "the head of the default
