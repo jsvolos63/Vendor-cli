@@ -108,14 +108,13 @@
       "Bash(while:*)",
       "Bash(if:*)",
       "mcp__github__*",
-      "mcp__Claude_Code_Remote__*",
-      "Bash(gh api -X PUT repos/jsvolos63/*/pulls/*/merge *)"
+      "mcp__Claude_Code_Remote__*"
     ]
   },
   "autoMode": {
     "allow": [
       "$defaults",
-      "Squash-merging a pull request in a jsvolos63 repository through the GitHub REST API (gh api -X PUT repos/jsvolos63/<repo>/pulls/<n>/merge -f merge_method=squash -f sha=<head sha>) once CI is green on that head commit. The family's Session autonomy convention makes merging the session's job; the owner authorized this on 2026-11-01."
+      "Squash-merging a pull request in a jsvolos63 repository with the GitHub MCP merge tool (mcp__github__merge_pull_request, merge_method squash, expectedHeadSha set to the head commit CI passed on) once CI is green on that head commit. Never on a red or still-running run. The family's Session autonomy convention makes merging the session's job; the owner authorized this on 2026-11-01."
     ]
   }
 }
