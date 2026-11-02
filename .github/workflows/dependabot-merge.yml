@@ -95,6 +95,7 @@ jobs:
       && github.event.workflow_run.head_repository.full_name == github.repository
     steps:
       - name: Merge the green Dependabot PR
+        id: merge
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
@@ -103,6 +104,11 @@ jobs:
           HOLD_PRODUCTION: ${{ inputs.hold-production }}
         run: |
           set -euo pipefail
+          # Why a PR was left open, for the digest step below. A no-op outside
+          # Actions (the suite runs this script with no GITHUB_OUTPUT).
+          held() {
+            if [ -n "${GITHUB_OUTPUT:-}" ]; then printf 'held=%s\nnumber=%s\n' "$1" "$number" >> "$GITHUB_OUTPUT"; fi
+          }
           pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$HEAD_BRANCH" --state open \
                 --json number,author,headRefOid,body,title --jq '.[0]')
           if [ -z "$pr" ] || [ "$pr" = "null" ]; then
@@ -142,7 +148,8 @@ jobs:
                    --jq '[.commits[].messageBody] | join("\n")')
           if grep -qE 'update-type: *version-update:semver-major' <<<"$meta"; then major=1; fi
           if [ "$major" = 1 ] && [ "$ALLOW_MAJOR" != "true" ]; then
-            echo "PR #$number carries a major bump (by its title, body or commit metadata, or one this parser cannot read) — left open for a review"; exit 0
+            echo "PR #$number carries a major bump (by its title, body or commit metadata, or one this parser cannot read) — left open for a review"
+            held major; exit 0
           fi
           # FAM-4: a grouped version update that bumps a direct production
           # dependency waits for a session (see the header). npm only —
@@ -152,7 +159,8 @@ jobs:
           if [ "$HOLD_PRODUCTION" = "true" ] && [[ "$HEAD_BRANCH" == dependabot/npm_and_yarn/* ]]; then
             types=$(grep -oE 'dependency-type: *[a-z:]+' <<<"$meta" | sed 's/dependency-type: *//' | sort -u || true)
             if [ -z "$types" ]; then
-              echo "PR #$number carries no readable Dependabot metadata, so it may bump a production dependency — left open for a review"; exit 0
+              echo "PR #$number carries no readable Dependabot metadata, so it may bump a production dependency — left open for a review"
+              held unreadable; exit 0
             fi
             if grep -qx 'direct:production' <<<"$types" && ! grep -qE 'dependency-group: *[^ ]' <<<"$meta"; then
               echo "PR #$number bumps a production dependency outside any group — a security update, since every minor/patch version update is grouped — so it merges on green"
@@ -168,7 +176,7 @@ jobs:
                 echo "Bumps \`${names:-a direct production dependency}\`. Read each package's release notes and"
                 echo "what changed between the versions, then squash-merge it by hand once CI is green."
               } >> "$GITHUB_STEP_SUMMARY"
-              exit 0
+              held production; exit 0
             fi
           fi
           # The head check above is a snapshot; bind the merge itself to the
@@ -177,3 +185,93 @@ jobs:
           gh pr merge --squash --delete-branch --match-head-commit "$HEAD_SHA" \
             --repo "$GITHUB_REPOSITORY" "$number"
           echo "Merged Dependabot PR #$number"
+
+      # A held PR is a session's job (FAM-4, or a major), and "read each
+      # package's release notes and what changed" used to mean opening the
+      # registry by hand for every package, with only a step summary nobody
+      # reads to say a PR was waiting. This posts the facts a reviewer checks
+      # first, once per set of versions: how old each release is, install-time
+      # scripts (new ones flagged), maintainer changes, dependencies added or
+      # dropped. Dependabot's own body already carries the release notes.
+      #
+      # It reads registry METADATA only (`npm view`, which runs no package
+      # code), takes names and versions from Dependabot's own PR text and
+      # passes them only after validating them, as arguments with no shell,
+      # wraps every name in a code span (a bare `@netlify/blobs` would mention
+      # a team) and posts no maintainer email. continue-on-error: a registry
+      # or API hiccup costs the digest, never the run. The comment notifies,
+      # which is the point; the marker keeps a rebase of the same versions
+      # from posting it twice.
+      - name: Post a review digest on the held PR
+        if: steps.merge.outputs.held != ''
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.merge.outputs.number }}
+          HELD: ${{ steps.merge.outputs.held }}
+        run: |
+          node --input-type=module <<'DIGEST'
+          import { execFileSync } from 'node:child_process';
+          const repo = process.env.GITHUB_REPOSITORY;
+          const number = process.env.PR_NUMBER;
+          if (!/^\d+$/.test(String(number))) { console.log('no PR number — no digest'); process.exit(0); }
+          const gh = (args, input) => execFileSync('gh', args, { encoding: 'utf8', input, maxBuffer: 32 << 20 });
+          const pr = JSON.parse(gh(['pr', 'view', number, '--repo', repo, '--json', 'title,body,comments,headRefName']));
+          if (!String(pr.headRefName || '').startsWith('dependabot/npm_and_yarn/')) { console.log('not an npm update — no digest'); process.exit(0); }
+          const NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
+          const VER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+          const text = `${pr.title || ''}\n${pr.body || ''}`.slice(0, 200000)
+            .replace(/\[([^\]\n]{1,214})\]\([^)\s]{0,500}\)/g, '$1').replace(/`/g, '');
+          const bumps = new Map();
+          for (const m of text.matchAll(/\b(?:Bumps?|Updates?|bumps?|updates?) (\S{1,214}) from (\S{1,64}) to (\S{1,64})/g)) {
+            const to = m[3].replace(/[.,;:)]+$/, '');
+            if (NAME.test(m[1]) && VER.test(m[2]) && VER.test(to)) bumps.set(m[1], { from: m[2], to });
+          }
+          if (!bumps.size) { console.log('no readable bumps in the PR text — no digest'); process.exit(0); }
+          const key = [...bumps].map(([n, v]) => `${n}@${v.to}`).sort().join(',');
+          const marker = `<!-- jfs-dependabot-digest: ${key} -->`;
+          if ((pr.comments || []).some((c) => String(c.body || '').includes(marker))) { console.log('digest already posted for these versions'); process.exit(0); }
+          const view = (spec) => {
+            try {
+              return JSON.parse(execFileSync('npm', ['view', spec, 'version', 'time', 'maintainers', 'scripts', 'dependencies', '--json'],
+                { encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'ignore'] }));
+            } catch { return null; }
+          };
+          const INSTALL = ['preinstall', 'install', 'postinstall'];
+          const people = (v) => new Set((Array.isArray(v && v.maintainers) ? v.maintainers : [])
+            .map((x) => String(typeof x === 'string' ? x.replace(/\s*<[^>]*>/, '') : (x && x.name) || '').trim()).filter(Boolean));
+          const code = (s) => '`' + String(s).replace(/`/g, '') + '`';
+          const days = (iso) => Math.floor((Date.now() - Date.parse(iso)) / 86400000);
+          const out = [marker, `**Review digest** for this held update (${process.env.HELD || 'held'}): registry facts to check before merging by hand.`, ''];
+          for (const [name, { from, to }] of bumps) {
+            out.push(`- ${code(name)} ${code(from)} → ${code(to)} · https://www.npmjs.com/package/${name}/v/${to}`);
+            const a = view(`${name}@${from}`);
+            const b = view(`${name}@${to}`);
+            if (!b) { out.push('  - registry metadata unavailable: check it by hand'); continue; }
+            const published = b.time && b.time[to];
+            if (published) out.push(`  - published ${published.slice(0, 10)} (${days(published)} days ago)`);
+            const scripts = INSTALL.filter((s) => b.scripts && b.scripts[s]);
+            const newScripts = scripts.filter((s) => !(a && a.scripts && a.scripts[s] === b.scripts[s]));
+            out.push(scripts.length
+              ? `  - ⚠ install-time scripts: ${scripts.map((s) => `${s} ${code(b.scripts[s])}${newScripts.includes(s) ? ' (new or changed)' : ''}`).join('; ')}`
+              : '  - no install-time scripts');
+            if (a) {
+              const pa = people(a), pb = people(b);
+              const added = [...pb].filter((x) => !pa.has(x)), removed = [...pa].filter((x) => !pb.has(x));
+              out.push(added.length || removed.length
+                ? `  - ⚠ maintainers changed: added ${added.map(code).join(', ') || 'none'}; removed ${removed.map(code).join(', ') || 'none'}`
+                : '  - same maintainers');
+              const da = Object.keys(a.dependencies || {}), db = Object.keys(b.dependencies || {});
+              const newDeps = db.filter((d) => !da.includes(d)), gone = da.filter((d) => !db.includes(d));
+              const moved = db.filter((d) => da.includes(d) && a.dependencies[d] !== b.dependencies[d]);
+              out.push(`  - dependencies: ${newDeps.length ? `added ${newDeps.map(code).join(', ')}; ` : ''}${gone.length ? `dropped ${gone.map(code).join(', ')}; ` : ''}${moved.length} range(s) moved`);
+            } else {
+              out.push('  - the previous version is not on the registry: no comparison');
+            }
+          }
+          out.push('', 'Dependabot\'s description above carries the release notes. Merge by hand (squash) once CI is green on the head commit.',
+            '', '_Posted by the family\'s Dependabot merge workflow (jsvolos63/vendor-cli)._');
+          gh(['pr', 'comment', number, '--repo', repo, '--body-file', '-'], out.join('\n'));
+          console.log(`posted a review digest on PR #${number} for ${key}`);
+          DIGEST
