@@ -367,6 +367,20 @@ line first in its own caller, and FAM-4's recommended fix has the same shape.
 readable metadata is. `test/dependabot-merge.test.mjs` runs the workflow's
 real script against a fake `gh` and holds every one of those branches.
 
+**A held npm PR gets a review digest** (since 2026-11-02). The merge step
+records why it held (`held` = production / major / unreadable) and a second
+step comments once on the PR with what a reviewer checks first, per package:
+the release's age, install-time scripts (new ones flagged), maintainer
+changes, dependencies added or dropped. Before it, the only signal was a step
+summary nobody reads, and on 2026-11-01 three held production PRs were merged
+in fifteen seconds with no review recorded. It reads registry metadata only
+(`npm view` runs no package code), validates every name and version from
+Dependabot's text before passing it as an argument with no shell, wraps names
+in code spans (a bare `@netlify/blobs` would mention a team) and posts no
+maintainer email. It is `continue-on-error`, and a marker naming the version
+set keeps a rebase from posting twice. The same suite runs it against a fake
+`gh` and `npm`.
+
 Every npm repo pairs it with a `.github/dependabot.yml` — npm monthly (the
 owner's decision of 2026-11-01), minor and patch grouped with production apart
 from development, monthly `github-actions`, a 7-day cooldown — and the

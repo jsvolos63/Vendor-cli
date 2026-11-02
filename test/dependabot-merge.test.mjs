@@ -77,6 +77,7 @@ function runStep({
     chmodSync(gh, 0o755);
     const log = join(dir, 'log');
     const summary = join(dir, 'summary');
+    const output = join(dir, 'output');
     const r = spawnSync('bash', ['-c', SCRIPT], {
       encoding: 'utf8',
       env: {
@@ -85,6 +86,7 @@ function runStep({
         GH_TOKEN: 'x',
         GITHUB_REPOSITORY: 'jsvolos63/example',
         GITHUB_STEP_SUMMARY: summary,
+        GITHUB_OUTPUT: output,
         HEAD_BRANCH: branch,
         HEAD_SHA: SHA,
         ALLOW_MAJOR: String(allowMajor),
@@ -99,6 +101,7 @@ function runStep({
       out: r.stdout + r.stderr,
       merged: existsSync(log) ? readFileSync(log, 'utf8') : '',
       summary: existsSync(summary) ? readFileSync(summary, 'utf8') : '',
+      output: existsSync(output) ? readFileSync(output, 'utf8') : '',
     };
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -241,4 +244,161 @@ test('allow-major: true still merges a retargeted development major on green', (
   });
   assert.equal(r.status, 0, r.out);
   assert.match(r.merged, /--match-head-commit/);
+});
+
+// ---------- why a PR was held, for the digest step ----------
+
+test('the merge step records why it held a PR, and records nothing when it merges', () => {
+  const prod = runStep({ commits: meta(['"@netlify/blobs"', 'direct:production'], ['jsdom', 'direct:development']) });
+  assert.equal(prod.output, 'held=production\nnumber=77\n');
+  const major = runStep({ title: 'Bump x from 1.0.0 to 2.0.0', body: 'Bumps x from 1.0.0 to 2.0.0.', commits: ungrouped(['x', 'direct:development']) });
+  assert.equal(major.output, 'held=major\nnumber=77\n');
+  const unreadable = runStep({ commits: 'no metadata at all' });
+  assert.equal(unreadable.output, 'held=unreadable\nnumber=77\n');
+  const merged = runStep({ commits: meta(['jsdom', 'direct:development']) });
+  assert.match(merged.merged, /--match-head-commit/);
+  assert.equal(merged.output, '', 'a merged PR gets no digest');
+});
+
+// ---------- the review digest on a held PR ----------
+
+const DIGEST = WF.jobs.merge.steps.find((s) => /review digest/.test(s.name || ''));
+
+// gh answers `pr view` with $FAKE_PR_VIEW and records `pr comment` bodies;
+// npm answers `npm view <spec> …` from the JSON map in $FAKE_NPM (a spec it
+// lacks exits 1, like a registry miss) and logs every spec it was asked for.
+const DIGEST_GH = `#!/usr/bin/env bash
+case "$1 $2" in
+  "pr view") printf '%s\\n' "$FAKE_PR_VIEW" ;;
+  "pr comment") { echo "--- comment $3"; cat; } >> "$FAKE_LOG" ;;
+  *) echo "fake gh: unexpected: $*" >&2; exit 64 ;;
+esac
+`;
+const DIGEST_NPM = `#!/usr/bin/env node
+const spec = process.argv[3];
+require('fs').appendFileSync(process.env.FAKE_NPM_LOG, spec + '\\n');
+const map = JSON.parse(process.env.FAKE_NPM || '{}');
+if (!(spec in map)) process.exit(1);
+process.stdout.write(JSON.stringify(map[spec]));
+`;
+
+const REG = {
+  '@netlify/blobs@11.1.1': { version: '11.1.1', time: { '11.1.1': '2026-09-20T00:00:00.000Z' }, maintainers: ['netlify-bot <bot@example.invalid>'], scripts: {}, dependencies: { a: '^1.0.0', b: '^2.0.0' } },
+  '@netlify/blobs@11.1.6': { version: '11.1.6', time: { '11.1.6': '2026-10-21T14:35:08.086Z' }, maintainers: ['netlify-bot <bot@example.invalid>', 'newcomer <new@example.invalid>'], scripts: { postinstall: 'node setup.js', test: 'vitest' }, dependencies: { a: '^1.1.0', c: '^3.0.0' } },
+  'imapflow@2.1.2': { version: '2.1.2', time: { '2.9.1': '2026-10-22T16:19:21.770Z' }, maintainers: [{ name: 'andris', email: 'andris@example.invalid' }], scripts: { prepare: 'npm run build' }, dependencies: { libqp: '2.1.2' } },
+  'imapflow@2.9.1': { version: '2.9.1', time: { '2.9.1': '2026-10-22T16:19:21.770Z' }, maintainers: [{ name: 'andris', email: 'andris@example.invalid' }], scripts: { prepare: 'npm run build' }, dependencies: { libqp: '3.0.1' } },
+};
+
+function runDigest({
+  branch = 'dependabot/npm_and_yarn/runtime-1a2b3c',
+  title = 'Bump the runtime group across 1 directory with 2 updates',
+  body = 'Updates `@netlify/blobs` from 11.1.1 to 11.1.6\nUpdates `imapflow` from 2.1.2 to 2.9.1',
+  comments = [],
+  registry = REG,
+  number = '77',
+} = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'dependabot-digest-'));
+  try {
+    for (const [name, text] of [['gh', DIGEST_GH], ['npm', DIGEST_NPM]]) {
+      writeFileSync(join(dir, name), text);
+      chmodSync(join(dir, name), 0o755);
+    }
+    const log = join(dir, 'log');
+    const npmLog = join(dir, 'npm-log');
+    const r = spawnSync('bash', ['-c', DIGEST.run], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${dir}:${process.env.PATH}`,
+        GH_TOKEN: 'x',
+        GITHUB_REPOSITORY: 'jsvolos63/example',
+        PR_NUMBER: number,
+        HELD: 'production',
+        FAKE_PR_VIEW: JSON.stringify({ title, body, comments, headRefName: branch }),
+        FAKE_NPM: JSON.stringify(registry),
+        FAKE_LOG: log,
+        FAKE_NPM_LOG: npmLog,
+      },
+    });
+    return {
+      status: r.status,
+      out: r.stdout + r.stderr,
+      comment: existsSync(log) ? readFileSync(log, 'utf8') : '',
+      asked: existsSync(npmLog) ? readFileSync(npmLog, 'utf8').split('\n').filter(Boolean) : [],
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('the digest step runs only on a held PR, never fails the run, and posts with the PR token', () => {
+  assert.ok(DIGEST, 'digest step not found');
+  assert.equal(DIGEST.if, "steps.merge.outputs.held != ''");
+  assert.equal(DIGEST['continue-on-error'], true);
+  assert.equal(DIGEST.env.PR_NUMBER, '${{ steps.merge.outputs.number }}');
+  assert.ok(WF.jobs.merge.steps.indexOf(DIGEST) > WF.jobs.merge.steps.indexOf(STEP), 'it runs after the merge decision');
+});
+
+test('a held grouped update gets one comment with each package\'s registry facts', () => {
+  const r = runDigest();
+  assert.equal(r.status, 0, r.out);
+  assert.match(r.comment, /^--- comment 77$/m);
+  assert.match(r.comment, /<!-- jfs-dependabot-digest: @netlify\/blobs@11\.1\.6,imapflow@2\.9\.1 -->/);
+  assert.match(r.comment, /- `@netlify\/blobs` `11\.1\.1` → `11\.1\.6` · https:\/\/www\.npmjs\.com\/package\/@netlify\/blobs\/v\/11\.1\.6/);
+  assert.match(r.comment, /published 2026-10-21 \(\d+ days ago\)/);
+  assert.match(r.comment, /⚠ install-time scripts: postinstall `node setup\.js` \(new or changed\)/);
+  assert.match(r.comment, /⚠ maintainers changed: added `newcomer`; removed none/);
+  assert.match(r.comment, /dependencies: added `c`; dropped `b`; 1 range\(s\) moved/);
+  assert.match(r.comment, /- `imapflow` `2\.1\.2` → `2\.9\.1`[\s\S]*no install-time scripts[\s\S]*same maintainers/,
+    'prepare is not an install-time script for a registry install');
+  assert.doesNotMatch(r.comment, /example\.invalid/, 'no maintainer email reaches the comment');
+  // Every @scope sits inside a code span or a URL, so nothing mentions a team.
+  const prose = r.comment.replace(/`[^`]*`/g, '').replace(/https:\/\/\S+/g, '').replace(/<!--[\s\S]*?-->/, '');
+  assert.doesNotMatch(prose, /@\w/);
+  assert.deepEqual(r.asked.sort(), ['@netlify/blobs@11.1.1', '@netlify/blobs@11.1.6', 'imapflow@2.1.2', 'imapflow@2.9.1']);
+});
+
+test('the same versions are never digested twice; new versions are', () => {
+  const first = runDigest();
+  const marker = /<!-- jfs-dependabot-digest: [^>]* -->/.exec(first.comment)[0];
+  const again = runDigest({ comments: [{ body: `${marker}\nolder digest` }] });
+  assert.equal(again.status, 0, again.out);
+  assert.equal(again.comment, '', 'a rebase of the same versions posts nothing');
+  assert.match(again.out, /already posted/);
+  const newer = runDigest({ comments: [{ body: '<!-- jfs-dependabot-digest: @netlify/blobs@11.1.5,imapflow@2.9.1 -->' }] });
+  assert.match(newer.comment, /--- comment 77/, 'a new version set gets its own digest');
+});
+
+test('a single-package update reads the name out of Dependabot\'s markdown link', () => {
+  const r = runDigest({
+    branch: 'dependabot/npm_and_yarn/netlify/blobs-11.1.6',
+    title: 'Bump @netlify/blobs from 11.1.1 to 11.1.6',
+    body: 'Bumps [@netlify/blobs](https://github.com/netlify/primitives/tree/HEAD/packages/blobs) from 11.1.1 to 11.1.6.',
+  });
+  assert.equal(r.status, 0, r.out);
+  assert.match(r.comment, /jfs-dependabot-digest: @netlify\/blobs@11\.1\.6 -->/);
+});
+
+test('a registry miss still posts, saying what to check by hand', () => {
+  const r = runDigest({ registry: {} });
+  assert.equal(r.status, 0, r.out);
+  assert.match(r.comment, /registry metadata unavailable: check it by hand/);
+});
+
+test('nothing but a validated name and version ever reaches npm, and no shell sees them', () => {
+  const r = runDigest({
+    title: 'Bump things',
+    body: 'Updates `$(touch pwned)` from 1.0.0 to 1.0.1\nUpdates `x;id` from 1.0.0 to 1.0.1\nUpdates `ok-pkg` from 1.0.0 to latest',
+  });
+  assert.equal(r.status, 0, r.out);
+  assert.deepEqual(r.asked, [], 'no invalid name or version was looked up');
+  assert.equal(r.comment, '');
+  assert.match(r.out, /no readable bumps/);
+});
+
+test('no digest for a non-npm update or a missing PR number', () => {
+  assert.equal(runDigest({ branch: 'dependabot/github_actions/actions/checkout-5' }).comment, '');
+  const none = runDigest({ number: '' });
+  assert.equal(none.status, 0, none.out);
+  assert.equal(none.comment, '');
 });
