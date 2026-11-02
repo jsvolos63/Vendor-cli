@@ -24,7 +24,7 @@
     "module-graph"
   ],
   "scripts": {
-    "test": "node --test test/test.mjs test/tooling.test.mjs test/claude-md-sync.test.mjs test/maintenance-sync.test.mjs test/family-liveness.test.mjs test/maintenance-doc-check.test.mjs test/sanitizer-policy-sync.test.mjs test/module-graph.test.mjs test/workflows.test.mjs test/dependabot-merge.test.mjs",
+    "test": "node --test test/test.mjs test/tooling.test.mjs test/claude-md-sync.test.mjs test/maintenance-sync.test.mjs test/family-liveness.test.mjs test/maintenance-doc-check.test.mjs test/sanitizer-policy-sync.test.mjs test/module-graph.test.mjs test/workflows.test.mjs test/dependabot-merge.test.mjs test/kit-pin-bump-ci.test.mjs",
     "lint": "eslint ."
   },
   "repository": {
