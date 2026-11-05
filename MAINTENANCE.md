@@ -419,6 +419,7 @@ Fastest-resolving first.
 
 | Date | Cadence | Outcome |
 | --- | --- | --- |
+| 2026-11-05 | Follow-up from the liveness findings (0.22.3) | **Two rules join the family protocol's "Every change", and question 4 grows.** A fix to a scheduled job is verified by dispatching it in the same session, and a change to a setting the automation depends on is verified by one run of each automation it touches. Both came out of this week: Art-Gallery-'s bake fix was left for the 1 January bake, and branch protection went on with no bot run tried. Question 4 now also asks for any PR green and mergeable for over a day and still open, which the monitor reports since 0.22.2, and the protocol names the shared land-bot-pr action. Every consumer's MAINTENANCE.md block was re-synced the same session. |
 | 2026-11-05 | Follow-up from the liveness findings (0.22.2) | **The monitor runs daily and reports a green PR left open.** `family-liveness.yml` went from Mondays and the 2nd to `10 8 * * *`: weekly left the Bears refreshes stuck from Tuesday 2026-11-03 with nothing due to say so until the next Monday. The report now ends in a fingerprint of its findings (stable keys, not the wording, which carries ages), and the issue step comments only when it differs from the last report's or that report is a week old, so daily is not a daily comment. Question 4 gained `readyPulls`: any open non-draft PR, bot or person, green and mergeable on its head for over 24 hours (market-monitor #479 sat three days that way). A recorded hold mutes it; a person's PR costs a MAINTENANCE.md read only when it is ready and labelled. Tests: `pullHealth`'s green rule (a bot PR's `action_required` run beside a dispatched success), `readyPulls`, the fingerprint, four end-to-end runs, and the issue step's real bash against a fake `gh`; mutation-checked. 0.22.1 → 0.22.2, because `tools/` ships. |
 | 2026-11-05 | Follow-up from the liveness findings | **One copy of the open-test-merge steps.** The kit-pin bump's PR, CI-dispatch and merge steps moved into a composite action, `.github/actions/land-bot-pr`, which the bump's write job and BearsMockDraft's two refresh crons call at `@main`. The copies had drifted: the CI gate reached the bump on 2026-11-02 and not the crons, which then stopped landing data. Behaviour is unchanged for the bump; the merge now also writes a `merged` output. `test/kit-pin-bump-ci.test.mjs` became `test/land-bot-pr.test.mjs`, and `test/workflows.test.mjs` scans the action's own pins and holds every call to its declared inputs. No version bump: `.github/` is not shipped. |
 | 2026-11-05 | Liveness findings | **Bot merges are refused under the new branch protection, and signing did not fix it.** Every bot merge since protection went on (2026-11-02) failed with "the base branch policy prohibits the merge": Netlify-kit #58, BearsMockDraft #234 and #236. #73 added `sign-commits: true` on the theory that unsigned runner commits were the cause; the end-to-end test refuted it the same hour. Netlify-kit #59 and BearsMockDraft #236 were rebuilt signed, with both required checks green on the head from the dispatched run, and were still refused. A session PR as the owner with no review reads `clean`. Each bot PR also carries a `pull_request` run by `github-actions[bot]` that waits for approval and runs no jobs; the pre-protection bumps carried one too and merged. The refusing rule is not readable from a session; it is FAM-1 (b)'s open half (the row above). Signing stays: harmless, and it rules signatures out. A session merged #59, #234 and #236 on green CI. Until FAM-1 (b) lands, the 2026-12-02 bump in every repo, and the BearsMockDraft refresh crons, will end red with a green PR left open for a session or the owner to merge. |
@@ -467,6 +468,12 @@ A repo calls the ones that apply to it:
 | `dependabot-merge.yml` | when CI completes on a Dependabot PR | every bump that is minor or patch, squash-merged on green — except a grouped version update of a direct production dependency (a security update, which arrives ungrouped, still lands) | **every major**, **every grouped npm version update bumping a direct production dependency**, and any PR it can't parse |
 | `kit-pin-bump.yml` | monthly, on the 2nd ~06:41 UTC (news-kit ~06:11, ahead of its consumers) | the `@jfs/*` pins, the re-vendor, the CLAUDE.md and MAINTENANCE.md family blocks, the version bump where the caller's command makes one | nothing, when it works |
 | `release.yml` | CI green on `main` | the `v<version>` tag and its GitHub release | nothing |
+
+Every automation that opens a PR and merges it itself (the kit-pin bump, and
+BearsMockDraft's data crons) does it through one shared action,
+`.github/actions/land-bot-pr`: a signed commit, the repo's CI dispatched on
+the PR's branch, and a merge pinned to the commit that CI passed. One copy, so
+a fix to that path lands everywhere at once.
 
 Three gaps follow from that table and they are the whole reason this protocol
 exists. They are not oversights; each is a deliberate refusal to automate a
@@ -541,7 +548,11 @@ protects every other cadence, and it asks four questions:
    whatever the workflow page says. A commit newer than that run is the
    cadence — the family bumps monthly, so a repo lags its kits for up to a
    month by design. Compare against the run, not against hope.
-4. **Is any bot PR older than seven days, red, or conflicted?** A production
+4. **Is any bot PR older than seven days, red, or conflicted — and is any PR,
+   bot or person, green and mergeable for over a day and still open?** The
+   second half is finished work nobody landed: a session that ended before its
+   merge, or a bot PR whose own merge was refused. Merge it, or hold it on the
+   record as below. A production
    dependency's minor/patch PR that `dependabot-merge.yml` left open is the
    week's work, not a hold: read each package's release notes and what changed
    between the versions, then squash-merge it once CI is green. A bot PR held
@@ -574,7 +585,20 @@ place:
 - Docs change in the commit that makes them wrong, not in a later sweep.
 - Open the PR ready for review, dispatch CI, and merge on green — a
   session-pushed branch fires no `pull_request` workflows, so a dispatched run
-  on the head commit is the only gate there is.
+  on the head commit is the only gate there is. A PR left open and green is a
+  loose end; the family monitor reports it after a day.
+- A fix to a scheduled job is verified by dispatching that job in the same
+  session, as a dry run where the workflow has one, and watching it finish.
+  Never leave it for the next scheduled run: Art-Gallery-'s Wikidata bake fix
+  of 2026-11-02 was left for the next bake, due 1 January, and the dry run that
+  proved it took minutes.
+- A change to a setting the automation depends on (branch protection, an
+  Actions permission, a secret, a token's scope) is verified the same way:
+  dispatch one run of each automation it touches and watch it land. Branch
+  protection went on in every repo on 2026-11-02 and no bot run was tried
+  afterwards; three automations stopped landing their work, and the first
+  refusal was merged by hand without being written down. A kit's kit-pin bump
+  is the cheapest probe, since a kit deploys nothing.
 
 #### Weekly — pipeline hygiene (~10 minutes)
 
