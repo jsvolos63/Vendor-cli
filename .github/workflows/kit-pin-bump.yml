@@ -398,7 +398,7 @@ jobs:
       # The commit the squash-merge put on the default branch, and the only
       # thing the release job below needs from this one. Empty whenever no
       # merge happened (auto-merge off, the merge was blocked).
-      merge-sha: ${{ steps.merge.outputs.merge-sha }}
+      merge-sha: ${{ steps.land.outputs.merge-sha }}
     defaults:
       run:
         shell: bash
@@ -419,26 +419,17 @@ jobs:
           git apply --index --whitespace=nowarn "$RUNNER_TEMP/kit-pin-bump.patch"
           git status --short
 
-      - name: Open a pull request
-        id: cpr
-        # Pinned by SHA, not tag: this runs in every family repo with
-        # contents + pull-requests write, and a version tag (`v8`, `v8.1.1`)
-        # is movable on a third-party account. Bump the SHA deliberately,
-        # with the version it resolves to in the trailing comment.
-        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+      # Open the PR, run the repo's CI on it, and merge it on green: the
+      # family's shared land-bot-pr action, so BearsMockDraft's refresh
+      # crons and this bump run one copy of these steps. It runs nothing
+      # from the repo: create-pull-request (signed commit), gh against the
+      # API, and the CI workflow it dispatches under that workflow's own
+      # token. See its header for what the current branch protection still
+      # refuses (FAM-1 (b) in this repo's MAINTENANCE.md).
+      - name: Open, test and merge the bump PR
+        id: land
+        uses: jsvolos63/vendor-cli/.github/actions/land-bot-pr@main
         with:
-          token: ${{ github.token }}
-          # Signed, so a commit-signature rule can never be what refuses the
-          # merge: create-pull-request makes the commit through the GitHub
-          # API with the default token, which GitHub signs as
-          # github-actions[bot] (it ignores author/committer, refuses a file
-          # over 40 MiB). It is NOT enough on its own. Netlify-kit #59
-          # (2026-11-05) was signed with both required checks green on its
-          # head and was still refused: "the base branch policy prohibits the
-          # merge". Under the current protection a bot PR is merged by a
-          # session or the owner until FAM-1 (b)'s bot identity exists (this
-          # repo's MAINTENANCE.md).
-          sign-commits: true
           branch: auto/kit-pin-bump
           commit-message: "Bump @jfs kit pins to current HEADs; re-vendor"
           title: "Bump @jfs kit pins to current HEADs"
@@ -458,144 +449,11 @@ jobs:
             reads.
 
             ${{ inputs.pr-body-extra }}
-
-      # Dispatch the repo's CI on the bump branch and wait for it on the head
-      # commit. Reads the PR and the workflow files, calls the Actions API;
-      # runs nothing from the repo. With auto-merge off it only dispatches,
-      # so a human finds the required checks already there.
-      - name: Run the repo's CI on the bump branch
-        id: ci
-        if: steps.cpr.outputs.pull-request-number != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_URL: ${{ steps.cpr.outputs.pull-request-url }}
-          BRANCH: auto/kit-pin-bump
-          CI_WORKFLOW: ${{ inputs.ci-workflow }}
-          WAIT_MINUTES: ${{ inputs.ci-wait-minutes }}
-          AUTO_MERGE: ${{ inputs.auto-merge }}
-          SOFT_FAIL: ${{ inputs.soft-fail }}
-          POLL_SECONDS: '20'
-        run: |
-          set -euo pipefail
-          head=$(gh pr view "$PR_URL" --json headRefOid --jq '.headRefOid')
-          if [ ${#head} -ne 40 ] || [ -n "${head//[0-9a-f]/}" ]; then
-            echo "::error::Could not read the head commit of $PR_URL (got '$head')."
-            exit 1
-          fi
-          echo "head-sha=$head" >> "$GITHUB_OUTPUT"
-
-          wf="$CI_WORKFLOW"
-          if [ -z "$wf" ]; then
-            mapfile -t found < <(grep -lE 'uses:[[:space:]]*(jsvolos63/vendor-cli/|\./)\.github/workflows/family-ci\.ya?ml' .github/workflows/*.yml .github/workflows/*.yaml 2>/dev/null \
-                                   | xargs -r grep -lE '^[[:space:]]*workflow_dispatch:' || true)
-            if [ "${#found[@]}" -ne 1 ]; then
-              echo "::error::Expected exactly one workflow in .github/workflows that calls family-ci.yml and has workflow_dispatch; found ${#found[@]}${found[*]:+: ${found[*]}}. Pass ci-workflow to name it."
-              exit 1
-            fi
-            wf=$(basename "${found[0]}")
-          fi
-          if ! [[ "$wf" =~ ^[A-Za-z0-9._-]+\.ya?ml$ ]]; then
-            echo "::error::ci-workflow must be a workflow file name like ci.yml (got '$wf')."
-            exit 1
-          fi
-
-          # Runs created before this dispatch are not this dispatch's; the
-          # minute of slack covers runner/GitHub clock skew (a run that old on
-          # the same head commit validated the same tree anyway).
-          since=$(date -u -d '-60 seconds' +%Y-%m-%dT%H:%M:%SZ)
-          gh workflow run "$wf" --repo "$GITHUB_REPOSITORY" --ref "$BRANCH"
-          echo "Dispatched $wf on $BRANCH ($head)."
-          if [ "$AUTO_MERGE" != "true" ]; then
-            echo "auto-merge is off: the checks will be on $PR_URL for whoever merges it."
-            exit 0
-          fi
-
-          deadline=$(( $(date +%s) + WAIT_MINUTES * 60 ))
-          run=''
-          while :; do
-            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$wf/runs?head_sha=$head&event=workflow_dispatch&per_page=20" \
-                    --jq "[.workflow_runs[] | select(.created_at >= \"$since\")] | sort_by(.created_at) | last | select(. != null) | [.id, .status, (.conclusion // \"\"), .html_url] | @tsv")
-            status=$(cut -f2 <<<"$run")
-            if [ "$status" = "completed" ]; then break; fi
-            if [ "$(date +%s)" -ge "$deadline" ]; then
-              msg="CI ($wf) on $BRANCH did not finish within $WAIT_MINUTES minutes${run:+ (last seen: $status, $(cut -f4 <<<"$run"))}; $PR_URL is left open."
-              if [ "$SOFT_FAIL" = "true" ]; then echo "::warning::$msg"; echo "green=false" >> "$GITHUB_OUTPUT"; exit 0; fi
-              echo "::error::$msg"
-              exit 1
-            fi
-            sleep "$POLL_SECONDS"
-          done
-          conclusion=$(cut -f3 <<<"$run")
-          url=$(cut -f4 <<<"$run")
-          if [ "$conclusion" = "success" ]; then
-            echo "green=true" >> "$GITHUB_OUTPUT"
-            echo "CI passed on $head: $url"
-            exit 0
-          fi
-          msg="CI ($wf) concluded '$conclusion' on the bump branch's head commit $head: $url — $PR_URL is left open. Fix the failure or merge by hand once it is green."
-          if [ "$SOFT_FAIL" = "true" ]; then echo "::warning::$msg"; echo "green=false" >> "$GITHUB_OUTPUT"; exit 0; fi
-          echo "::error::$msg"
-          exit 1
-
-      # Squash-merge the validated PR; the branch is deleted so the next
-      # scheduled run starts clean. If branch protection or a conflict
-      # blocks the merge, FAIL the run — a validated bump left unmerged is
-      # exactly how pins silently drift, so it must be a red run, not a
-      # warning (soft-fail: true restores the old behavior).
-      # Gated on the PR NUMBER, not on pull-request-operation: a re-run or a
-      # dispatch after a refused merge, with main and the kits unchanged,
-      # rebuilds a byte-identical branch, which create-pull-request reports as
-      # operation 'none' while still naming the open PR. A created/updated
-      # gate skipped the merge there and went green with the PR left open —
-      # the false green BearsMockDraft measured in its own refresh crons (#209).
-      - name: Merge the validated pin-bump PR
-        id: merge
-        if: inputs.auto-merge && steps.cpr.outputs.pull-request-number != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_URL: ${{ steps.cpr.outputs.pull-request-url }}
-          SOFT_FAIL: ${{ inputs.soft-fail }}
-          CI_GREEN: ${{ steps.ci.outputs.green }}
-          HEAD_SHA: ${{ steps.ci.outputs.head-sha }}
-        run: |
-          # Reached with CI not green only under soft-fail (otherwise the CI
-          # step already failed the job): leave the PR open, say so.
-          if [ "$CI_GREEN" != "true" ]; then
-            echo "::warning::CI is not green on the bump branch — $PR_URL left open."
-            exit 0
-          fi
-          # Bound to the commit CI validated: a push landing in between is
-          # refused by GitHub rather than merged unvalidated.
-          if gh pr merge --squash --delete-branch --match-head-commit "$HEAD_SHA" "$PR_URL"; then
-            echo "Pin-bump PR merged: $PR_URL"
-            # Name the squash commit for the release job. `gh pr view` says
-            # exactly which commit landed, where "the head of the default
-            # branch now" would race whatever merged next — and GitHub fills
-            # mergeCommit a moment after the merge returns, so read it more
-            # than once before giving up.
-            SHA=''
-            for _ in 1 2 3; do
-              CANDIDATE=$(gh pr view "$PR_URL" --json mergeCommit --jq '.mergeCommit.oid // ""' || echo '')
-              if [ ${#CANDIDATE} -eq 40 ] && [ -z "${CANDIDATE//[0-9a-f]/}" ]; then
-                SHA="$CANDIDATE"
-                break
-              fi
-              sleep 3
-            done
-            if [ -n "$SHA" ]; then
-              echo "merge-sha=$SHA" >> "$GITHUB_OUTPUT"
-              echo "Merged as $SHA"
-            else
-              # Loud, but not fatal: the bump itself landed, and failing the
-              # run here would report the merge as broken when only the tag is.
-              echo "::error::Merged $PR_URL but could not read its squash commit, so this version will not be tagged. Dispatch the repo's Release workflow to tag it."
-            fi
-          elif [ "$SOFT_FAIL" = "true" ]; then
-            echo "::warning::Auto-merge failed (branch protection or conflict) — review and merge manually: $PR_URL"
-          else
-            echo "::error::Auto-merge of the validated pin-bump PR failed (branch protection, a conflict, or a permissions gap). The bump is stuck at $PR_URL — merge it manually or fix the blocker. Left unmerged, this repo's kit pins silently drift from the family."
-            exit 1
-          fi
+          ci-workflow: ${{ inputs.ci-workflow }}
+          ci-wait-minutes: ${{ inputs.ci-wait-minutes }}
+          auto-merge: ${{ inputs.auto-merge }}
+          soft-fail: ${{ inputs.soft-fail }}
+          stuck-note: Left unmerged, this repo's kit pins silently drift from the family.
 
   # Tag the version this bump just merged.
   #

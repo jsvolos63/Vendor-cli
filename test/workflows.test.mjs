@@ -25,7 +25,7 @@
 // and README's job list against the bins the package ships.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseDocument } from 'yaml';
@@ -50,6 +50,19 @@ const WF = Object.fromEntries(
   })
 );
 const wf = (file) => WF[file].value;
+
+// The family's shared composite actions, `.github/actions/<name>/action.yml`.
+const ACTIONS_DIR = join(ROOT, '.github', 'actions');
+const ACTIONS = Object.fromEntries(
+  (existsSync(ACTIONS_DIR) ? readdirSync(ACTIONS_DIR) : []).sort().map((name) => {
+    const src = readFileSync(join(ACTIONS_DIR, name, 'action.yml'), 'utf8');
+    return [name, { name, src, ...parse(src) }];
+  })
+);
+/** The action a step's `uses:` names when it is one of THIS repo's, in the
+ *  `@main` spelling every caller uses (a workflow called from another repo
+ *  cannot reach this repo's files through `./`). */
+const localAction = (uses) => (/^jsvolos63\/vendor-cli\/\.github\/actions\/([^@/]+)@main$/i.exec(uses || '') || [])[1] || null;
 
 /** Every string leaf under `node` — where GitHub expressions live. Comments
  *  are not in the parsed tree, so prose ABOUT an input never counts as a use. */
@@ -292,16 +305,26 @@ test('actions follow the pinning policy: actions/* by major tag, anything else b
   // Read from the RAW text, because the version comment beside a SHA pin is
   // part of the policy and comments are not in the parsed tree. The count is
   // then held against the parsed tree, so a `uses:` the regex failed to see
-  // cannot slip through unchecked.
+  // cannot slip through unchecked. The shared actions' own steps count too:
+  // a third-party action inside one runs in every job that calls it.
   let rawCount = 0;
   let parsedCount = 0;
-  for (const f of FILES) {
-    for (const line of WF[f].src.split('\n')) {
+  const sources = [
+    ...FILES.map((f) => [f, WF[f].src, allSteps(wf(f)).filter((s) => s.uses).length + Object.values(wf(f).jobs || {}).filter((j) => j.uses).length]),
+    ...Object.values(ACTIONS).map((a) => [`actions/${a.name}`, a.src, (a.value.runs.steps || []).filter((s) => s.uses).length]),
+  ];
+  for (const [f, src, parsed] of sources) {
+    for (const line of src.split('\n')) {
       const m = /^\s*(?:-\s+)?uses:\s*['"]?([^\s'"#]+)['"]?\s*(?:#\s*(.*))?$/.exec(line);
       if (!m) continue;
       rawCount++;
       const [, ref, comment] = m;
       if (localTarget(ref)) continue;
+      const action = localAction(ref);
+      if (action) {
+        assert.ok(ACTIONS[action], `${f}: uses ${ref}, but .github/actions/${action}/action.yml does not exist`);
+        continue;
+      }
       if (ref.startsWith('actions/')) {
         assert.match(ref, /^actions\/[a-z0-9-]+@v\d+$/, `${f}: first-party action not on a major tag: ${ref}`);
       } else {
@@ -309,10 +332,43 @@ test('actions follow the pinning policy: actions/* by major tag, anything else b
         assert.match(comment || '', /^v\d+\.\d+\.\d+$/, `${f}: SHA pin ${ref} has no "# vX.Y.Z" comment naming its version`);
       }
     }
-    parsedCount += allSteps(wf(f)).filter((s) => s.uses).length;
-    parsedCount += Object.values(wf(f).jobs || {}).filter((j) => j.uses).length;
+    parsedCount += parsed;
   }
   assert.equal(rawCount, parsedCount, 'the raw scan and the parsed tree disagree on how many `uses:` there are');
+});
+
+test('every shared action parses, reads every input it declares, and is called with declared inputs only', () => {
+  for (const a of Object.values(ACTIONS)) {
+    assert.deepEqual(a.errors, [], `actions/${a.name}: ${a.errors.join('; ')}`);
+    const v = a.value;
+    assert.equal(v.runs.using, 'composite', `actions/${a.name} must be a composite action`);
+    const declared = Object.keys(v.inputs || {});
+    const readInputs = new Set();
+    for (const str of strings(v.runs)) for (const m of str.matchAll(/\binputs\.([A-Za-z0-9_-]+)/g)) readInputs.add(m[1]);
+    for (const k of declared) {
+      assert.ok(readInputs.has(k), `actions/${a.name} declares input \`${k}\` and never reads it`);
+      assert.equal(typeof v.inputs[k].description, 'string', `actions/${a.name} input \`${k}\` has no description`);
+    }
+    for (const k of readInputs) assert.ok(declared.includes(k), `actions/${a.name} reads input \`${k}\`, which it does not declare`);
+    for (const [k, out] of Object.entries(v.outputs || {})) {
+      const m = /^\$\{\{ steps\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+) \}\}$/.exec(out.value);
+      assert.ok(m, `actions/${a.name} output \`${k}\` is not a step output`);
+      const step = v.runs.steps.find((s) => s.id === m[1]);
+      assert.ok(step, `actions/${a.name} output \`${k}\` reads a step that does not exist`);
+      if (step.run) assert.ok(step.run.includes(`${m[2]}=`), `actions/${a.name} output \`${k}\`: step ${m[1]} never writes ${m[2]}`);
+    }
+  }
+  for (const f of FILES) {
+    for (const s of allSteps(wf(f))) {
+      const name = localAction(s.uses);
+      if (!name) continue;
+      const declared = ACTIONS[name].value.inputs || {};
+      for (const k of Object.keys(s.with || {})) assert.ok(k in declared, `${f}: passes \`${k}\` to ${name}, which does not declare it`);
+      for (const [k, spec] of Object.entries(declared)) {
+        if (spec.required) assert.ok(k in (s.with || {}), `${f}: omits \`${k}\`, which ${name} requires`);
+      }
+    }
+  }
 });
 
 test('every job runs under a timeout, and every workflow caps its token', () => {
@@ -408,27 +464,38 @@ test('kit-pin-bump runs every untrusted command under a read-only token, and the
   assert.ok((jobs.prepare.steps || []).some((s) => /\.github\/workflows/.test(s.run || '') && /exit 1/.test(s.run || '')), 'prepare must refuse a patch that touches .github/workflows');
 });
 
-test('kit-pin-bump merges whenever an open bump PR exists, not only when this run created or updated it', () => {
+test('land-bot-pr merges whenever an open PR exists, not only when this run created or updated it', () => {
   // create-pull-request (v8.1.1) reports operation 'none' — with the PR number
   // set — when a retry rebuilds a branch that is even with its remote. The
   // documented contract is that a refused merge reds the run, so the merge
   // must still be attempted then. Measured against the pinned action bundle.
-  const merge = wf('kit-pin-bump.yml').jobs.bump.steps.find((s) => s.id === 'merge');
-  assert.ok(merge, 'the bump job has no step with id merge');
-  assert.equal(merge.if, "inputs.auto-merge && steps.cpr.outputs.pull-request-number != ''");
-  assert.doesNotMatch(merge.if, /pull-request-operation/);
+  const steps = ACTIONS['land-bot-pr'].value.runs.steps;
+  const merge = steps.find((s) => s.id === 'merge');
+  assert.ok(merge, 'land-bot-pr has no step with id merge');
+  assert.equal(merge.if, "inputs.auto-merge == 'true' && steps.cpr.outputs.pull-request-number != ''");
+  assert.equal(steps.find((s) => s.id === 'ci').if, "steps.cpr.outputs.pull-request-number != ''");
+  for (const s of steps) assert.doesNotMatch(String(s.if || ''), /pull-request-operation/);
 });
 
-test('kit-pin-bump signs the bump commit, so a signature rule is never what refuses its merge', () => {
+test('land-bot-pr signs the commit with the default token, so a signature rule is never what refuses its merge', () => {
   // Bot merges have been refused since branch protection went on (2026-11-02).
   // Signing did not fix that (Netlify-kit #59: signed, both required checks
   // green, still refused; MAINTENANCE.md FAM-1 (b)), but it keeps signatures
   // out of the question and the commit verified.
-  const steps = wf('kit-pin-bump.yml').jobs.bump.steps;
-  const cpr = steps.filter((s) => /create-pull-request@/.test(s.uses || ''));
+  const a = ACTIONS['land-bot-pr'].value;
+  const cpr = a.runs.steps.filter((s) => /create-pull-request@/.test(s.uses || ''));
   assert.equal(cpr.length, 1, 'expected exactly one create-pull-request step');
   assert.equal(cpr[0].with['sign-commits'], true, 'sign-commits must be true');
-  assert.equal(cpr[0].with.token, '${{ github.token }}', 'signing needs a bot token; a PAT makes unsigned commits');
+  assert.equal(cpr[0].with.token, '${{ inputs.token }}');
+  assert.equal(a.inputs.token.default, '${{ github.token }}', 'signing needs a bot token; a PAT makes unsigned commits');
+  // No workflow in this repo opens a PR any other way, or hands the action
+  // another token.
+  for (const f of FILES) {
+    assert.ok(!allSteps(wf(f)).some((s) => /create-pull-request@/.test(s.uses || '')), `${f} opens a PR without land-bot-pr`);
+    for (const s of allSteps(wf(f)).filter((x) => localAction(x.uses) === 'land-bot-pr')) {
+      assert.ok(!('token' in (s.with || {})), `${f} passes land-bot-pr a token of its own`);
+    }
+  }
 });
 
 test('kit-pin-bump exposes the merge it made as a workflow output, empty when nothing merged', () => {
@@ -441,7 +508,9 @@ test('kit-pin-bump exposes the merge it made as a workflow output, empty when no
   assert.ok(out, 'workflow_call.outputs.merge-sha is missing');
   assert.equal(out.value, '${{ jobs.bump.outputs.merge-sha }}');
   assert.equal(typeof out.description, 'string');
-  assert.equal(w.jobs.bump.outputs['merge-sha'], '${{ steps.merge.outputs.merge-sha }}');
+  assert.equal(w.jobs.bump.outputs['merge-sha'], '${{ steps.land.outputs.merge-sha }}');
+  assert.equal(w.jobs.bump.steps.find((st) => st.id === 'land').uses, 'jsvolos63/vendor-cli/.github/actions/land-bot-pr@main');
+  assert.equal(ACTIONS['land-bot-pr'].value.outputs['merge-sha'].value, '${{ steps.merge.outputs.merge-sha }}');
 });
 
 test('kit-pin-bump carries BOTH canonical blocks, the MAINTENANCE.md one only where the file exists', () => {

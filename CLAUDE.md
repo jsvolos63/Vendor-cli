@@ -146,8 +146,24 @@ CI workflow's own token. It needs `actions: write`, so **every caller grants
 it** — a caller without it fails at startup, because a called workflow cannot
 ask for more than its caller gave. The in-workflow `check-command` run stays:
 it is what decides whether a PR is opened at all.
-`test/kit-pin-bump-ci.test.mjs` runs both steps' real scripts against a fake
-`gh`.
+
+**Those steps live in one shared action, `.github/actions/land-bot-pr`**
+(since 2026-11-05). Opening the PR with a signed commit, dispatching CI and
+merging pinned to the head is a composite action that the bump's write job
+calls as `jsvolos63/vendor-cli/.github/actions/land-bot-pr@main`, and so do
+BearsMockDraft's two refresh crons. Each used to carry its own copy, and the
+copies drifted: the CI gate landed in the bump on 2026-11-02 and not in the
+crons, so the crons stopped landing data the next morning. A composite and
+not a reusable workflow, because the steps need the job's working tree: a
+second job would have to hand the tree over as an artifact, as the
+prepare/bump split does. It runs nothing from the calling repo, so it is safe
+in a write-scoped job. Its inputs are the branch, the commit message, title
+and body, `add-paths`, `ci-workflow`, `ci-wait-minutes`, `auto-merge`,
+`soft-fail` and `stuck-note` (what goes stale while a refused PR sits open);
+its outputs include `merged` and `merge-sha`, which a caller reads instead of
+a step outcome. `test/land-bot-pr.test.mjs` runs its CI and merge scripts
+against a fake `gh`, and `test/workflows.test.mjs` holds every call to its
+declared inputs and its own third-party pins to the pinning policy.
 
 The important behavior change vs. the old copies: a blocked auto-merge of a
 validated bump **fails the run** instead of emitting an invisible
