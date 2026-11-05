@@ -382,15 +382,16 @@ jobs:
 
       # Hand the result over as a patch. The write job applies it with
       # `git apply` — data, not code — so nothing that ran here ever meets
-      # the write token. A pin bump has no business touching the workflows
-      # (and GITHUB_TOKEN could not push one anyway); refuse rather than
-      # discover that at the PR step.
+      # the write token. A pin bump has no business touching .github/ or
+      # .claude/; refuse rather than discover that at the PR step. This copy
+      # of the check only fails early: code that ran in THIS job could have
+      # rewritten it, so the write job checks the patch again (see there).
       - name: Package the bumped tree as a patch
         if: steps.diff.outputs.changed == 'true'
         run: |
           git add -A
-          if git diff --cached --name-only | grep -q '^\.github/workflows/'; then
-            echo "::error::The bumped tree changes .github/workflows — a pin bump must never do that. Refusing to hand it to the write job."
+          if git diff --cached --name-only | grep -qE '^\.(github|claude)/'; then
+            echo "::error::The bumped tree changes .github/ or .claude/ — a pin bump must never do that. Refusing to hand it to the write job."
             exit 1
           fi
           git diff --cached --binary > "$RUNNER_TEMP/kit-pin-bump.patch"
@@ -439,9 +440,23 @@ jobs:
           name: kit-pin-bump-${{ github.run_id }}
           path: ${{ runner.temp }}
 
+      # The path refusal again, here, because this is the copy nothing
+      # untrusted can reach: `prepare` ran the code the patch came from, so
+      # its own check proves nothing about what it uploaded. Refused:
+      # - .github/ — workflows (which neither token could push anyway), but
+      #   also .github/actions/, which no token permission protects and
+      #   which a workflow on main may run with secrets;
+      # - .claude/ — the automated sessions' permission allowlist.
+      # Nothing a bump legitimately writes lives under either (pins, lockfile,
+      # vendored copies, CLAUDE.md, MAINTENANCE.md, version files).
       - name: Apply the bumped tree
         run: |
           git apply --index --whitespace=nowarn "$RUNNER_TEMP/kit-pin-bump.patch"
+          if refused=$(git diff --cached --name-only | grep -E '^\.(github|claude)/'); then
+            echo "::error::The bump patch changes paths a pin bump must never touch; nothing is opened:"
+            sed 's/^/  /' <<<"$refused"
+            exit 1
+          fi
           git status --short
 
       # Open the PR, run the repo's CI on it, and merge it on green: the

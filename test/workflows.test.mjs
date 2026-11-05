@@ -25,11 +25,11 @@
 // and README's job list against the bins the package ships.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseDocument } from 'yaml';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -462,9 +462,58 @@ test('kit-pin-bump runs every untrusted command under a read-only token, and the
   // pushed: `git apply` treats the bumped tree as data.
   assert.ok((jobs.bump.steps || []).some((s) => /git apply/.test(s.run || '')), 'the write job must apply the patch with git apply');
   assert.ok((jobs.prepare.steps || []).some((s) => /upload-artifact@/.test(s.uses || '')), 'prepare must upload the patch artifact');
-  // And the untrusted job never gets to hand over a workflow edit.
-  assert.ok((jobs.prepare.steps || []).some((s) => /\.github\/workflows/.test(s.run || '') && /exit 1/.test(s.run || '')), 'prepare must refuse a patch that touches .github/workflows');
+  // And the untrusted job never gets to hand over a .github/ or .claude/
+  // edit: it refuses early, and the write job refuses again after applying,
+  // since only the write job's copy is out of the untrusted code's reach.
+  const refuses = (s) => /grep -q?E '\^\\\.\(github\|claude\)\/'/.test(s.run || '') && /exit 1/.test(s.run || '');
+  assert.ok((jobs.prepare.steps || []).some(refuses), 'prepare must refuse a patch that touches .github/ or .claude/');
+  const apply = (jobs.bump.steps || []).find((s) => /git apply/.test(s.run || ''));
+  assert.ok(refuses(apply), 'the write job must re-check the applied patch for .github/ and .claude/ paths');
+  assert.ok(apply.run.indexOf('git apply') < apply.run.indexOf('grep -E'), 'the write job checks what it applied, after applying it');
 });
+
+test("the write job's path refusal holds on a real patch", () => {
+  // Runs the apply step's real script in a scratch repo: an ordinary bump
+  // applies, and a patch reaching .github/actions/ (which no token permission
+  // protects), .github/workflows/ or .claude/ is refused before anything opens.
+  const script = wf('kit-pin-bump.yml').jobs.bump.steps.find((s) => /git apply/.test(s.run || '')).run;
+  const git = (cwd, ...a) => execFileSync('git', a, { cwd, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+  const dir = mkdtempSync(join(tmpdir(), 'bump-apply-'));
+  try {
+    const make = (files) => {
+      const src = join(dir, `src-${Math.random().toString(36).slice(2)}`);
+      mkdirSync(src); git(src, 'init', '-q'); git(src, 'commit', '-q', '--allow-empty', '-m', 'base');
+      for (const [f, body] of Object.entries(files)) { mkdirSync(dirname(join(src, f)), { recursive: true }); writeFileSync(join(src, f), body); }
+      git(src, 'add', '-A');
+      return git(src, 'diff', '--cached', '--binary');
+    };
+    const applyIn = (patch) => {
+      const dst = join(dir, `dst-${Math.random().toString(36).slice(2)}`);
+      mkdirSync(dst); git(dst, 'init', '-q'); git(dst, 'commit', '-q', '--allow-empty', '-m', 'base');
+      writeFileSync(join(dir, 'kit-pin-bump.patch'), patch);
+      return spawnSync('bash', ['-eo', 'pipefail', '-c', script], { cwd: dst, encoding: 'utf8', env: { ...process.env, RUNNER_TEMP: dir } });
+    };
+    const ok = applyIn(make({ 'package.json': '{}\n', 'js/vendor/news-kit.js': 'export {};\n', 'CLAUDE.md': 'x\n' }));
+    assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+    for (const bad of ['.github/actions/land/action.yml', '.github/workflows/ci.yml', '.claude/settings.json']) {
+      const r = applyIn(make({ 'package.json': '{}\n', [bad]: 'x\n' }));
+      assert.equal(r.status, 1, `${bad} was not refused`);
+      assert.match(r.stdout, /::error::The bump patch changes paths a pin bump must never touch/);
+      assert.ok(r.stdout.includes(bad), `the refusal names ${bad}`);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+const APPLY_SCRIPT = [
+  'git apply --index --whitespace=nowarn "$RUNNER_TEMP/kit-pin-bump.patch"',
+  "if refused=$(git diff --cached --name-only | grep -E '^\\.(github|claude)/'); then",
+  '  echo "::error::The bump patch changes paths a pin bump must never touch; nothing is opened:"',
+  "  sed 's/^/  /' <<<\"$refused\"",
+  '  exit 1',
+  'fi',
+  'git status --short',
+  '',
+].join('\n');
 
 test("kit-pin-bump hands the family App's secrets to the write job alone, and only to land-bot-pr", () => {
   // The private key mints a token for every repo the App is installed on, so
@@ -490,7 +539,9 @@ test("kit-pin-bump hands the family App's secrets to the write job alone, and on
   // above holds the whole job; this holds the order too).
   const at = w.jobs.bump.steps.findIndex((s) => s.id === 'land');
   for (const s of w.jobs.bump.steps.slice(0, at)) {
-    assert.ok(!s.run || /^\s*git apply --index --whitespace=nowarn "\$RUNNER_TEMP\/kit-pin-bump\.patch"\n\s*git status --short\s*$/.test(s.run), `"${s.name}" runs something before the key arrives`);
+    // Exactly the apply, the path refusal (git, grep and printf only) and a
+    // status line: any other command here would run before the key arrives.
+    assert.ok(!s.run || s.run === APPLY_SCRIPT, `"${s.name}" runs something before the key arrives`);
     assert.ok(!s.uses || /^actions\/(checkout|download-artifact)@v\d+$/.test(s.uses), `"${s.name}" uses ${s.uses} before the key arrives`);
   }
   // No workflow in this repo forwards every secret it holds.

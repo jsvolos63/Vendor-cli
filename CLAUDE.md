@@ -61,8 +61,9 @@ with `contents: write` + `pull-requests: write` — executes nothing from
 the repo: checkout, `git apply`, open the PR, merge. A compromised kit
 commit landing in the monthly bump can therefore at worst ship itself in
 the PR it was always going to ride; it cannot push to the default branch,
-touch other branches or approve anything. `prepare` also refuses to hand
-over a patch that touches `.github/workflows/`. `test/workflows.test.mjs`
+touch other branches or approve anything. A patch that touches `.github/` or
+`.claude/` is refused twice: early in `prepare`, and again in `bump` after
+`git apply`, the copy the untrusted code cannot reach. `test/workflows.test.mjs`
 holds the split (which job runs the `inputs.*` commands, which holds the
 write token, that the write job depends on the read job and applies a
 patch rather than checking out a pushed branch), each half shown to fail
