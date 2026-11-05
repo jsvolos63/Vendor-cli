@@ -109,6 +109,18 @@ jobs:
   merge:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # The family App's key is read from the `family-bot` environment, not
+    # from repository secrets (2026-11-05). A repository secret is readable
+    # by any workflow on any branch of the repo: one pushed branch carrying
+    # a workflow that names FAMILY_BOT_PRIVATE_KEY would leak a key that
+    # mints write tokens for every family repo. The environment's deployment
+    # branch rule admits only the default branch, so its secrets reach only
+    # runs on it, and the workflow_run that calls this one runs there.
+    # An environment secret takes precedence over a repository secret of
+    # the same name, and the caller still passes both by name, so no caller
+    # changes. A repo whose environment does not exist yet gets an empty one
+    # on its first run and keeps its repository secrets until they move.
+    environment: family-bot
     if: >-
       github.event_name == 'workflow_run'
       && github.event.workflow_run.event == 'pull_request'
@@ -127,7 +139,7 @@ jobs:
       - name: Refuse a half-configured family App
         if: env.FAMILY_APP_ID_SET != env.FAMILY_APP_KEY_SET
         run: |
-          echo "::error::Only one of FAMILY_BOT_APP_ID and FAMILY_BOT_PRIVATE_KEY reached the Dependabot merge. Set both as repository secrets (and pass both from the caller), or neither to keep the default token."
+          echo "::error::Only one of FAMILY_BOT_APP_ID and FAMILY_BOT_PRIVATE_KEY reached the Dependabot merge. Set both in the repo's family-bot environment (and pass both from the caller), or neither to keep the default token."
           exit 1
 
       # The same token land-bot-pr mints, and the test holds them equal: this
