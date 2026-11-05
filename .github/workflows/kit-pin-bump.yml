@@ -43,6 +43,13 @@
 #   jobs:
 #     bump:
 #       uses: jsvolos63/vendor-cli/.github/workflows/kit-pin-bump.yml@main
+#       # The family App's two secrets, by name (never `secrets: inherit`,
+#       # which would hand this workflow every secret the repo holds). A repo
+#       # that does not hold them passes empty values and keeps the default
+#       # token.
+#       secrets:
+#         FAMILY_BOT_APP_ID: ${{ secrets.FAMILY_BOT_APP_ID }}
+#         FAMILY_BOT_PRIVATE_KEY: ${{ secrets.FAMILY_BOT_PRIVATE_KEY }}
 #       with:
 #         check-command: |
 #           npm run check
@@ -59,7 +66,9 @@
 # release.yml — gated on that CI run — never fires. Measured on 2026-09-22:
 # fifteen versions had landed on main untagged that way, every one of them a
 # Monday pin bump (Weather 6, Art-Gallery- 3, John's News 2, market-monitor 2,
-# Surf-Tracker 2).
+# Surf-Tracker 2). (A merge made as the family App fires CI on main and so
+# tags through the ordinary path too; the release job below is what covers a
+# repo without the App's secrets.)
 #
 # A KIT caller (a repo with no vendor:sync and no version:stamp — its semver
 # tracks index.js + bin) must ALSO pass:
@@ -74,8 +83,12 @@
 #
 # The caller MUST grant `contents: write` + `pull-requests: write` — a
 # called workflow can never elevate beyond what the caller passes. The
-# default github.token is used throughout (same as family-ci.yml), so no
-# secrets need to be forwarded; `secrets: inherit` is unnecessary.
+# default github.token runs everything except, where the repo holds the
+# family GitHub App's secrets (FAMILY_BOT_APP_ID, FAMILY_BOT_PRIVATE_KEY),
+# opening and merging the bump PR: under the family branch protection
+# (2026-11-02) GitHub refuses every merge the default token makes, so only a
+# repo with the secrets lands its bump by itself. The caller passes the two
+# by name; nothing else is forwarded.
 #
 # TWO JOBS, ON PURPOSE, AND THE SPLIT IS THE SECURITY BOUNDARY. Everything
 # that executes code nobody reviewed — `npm install` of kit commits resolved
@@ -107,6 +120,18 @@ on:
           it (`if: needs.<job>.outputs.merge-sha != ''`) instead of firing on
           every run, merged or not; market-monitor's `ci-on-main` asked for it.
         value: ${{ jobs.bump.outputs.merge-sha }}
+    # The family GitHub App's two secrets, which a caller passes by name (see
+    # the caller example above). Both optional: a caller that passes neither,
+    # or a repo that holds neither, keeps the default token and today's
+    # outcome. Only the `bump` job reads them; `prepare`, which runs the code
+    # nobody reviewed, never references them, so they never reach its runner.
+    secrets:
+      FAMILY_BOT_APP_ID:
+        description: The family GitHub App's ID. With the key, the bump PR is opened and merged as the App.
+        required: false
+      FAMILY_BOT_PRIVATE_KEY:
+        description: The family GitHub App's private key.
+        required: false
     inputs:
       node-version:
         description: Node.js version to set up. Ignored when node-version-file is set.
@@ -424,12 +449,17 @@ jobs:
       # crons and this bump run one copy of these steps. It runs nothing
       # from the repo: create-pull-request (signed commit), gh against the
       # API, and the CI workflow it dispatches under that workflow's own
-      # token. See its header for what the current branch protection still
-      # refuses (FAM-1 (b) in this repo's MAINTENANCE.md).
+      # token. With the family App's two secrets it opens and merges as the
+      # App; without them it uses the default token, whose merge the
+      # current branch protection refuses (FAM-1 (b) in this repo's
+      # MAINTENANCE.md). This job is the only place the key may go: nothing
+      # from the repo has run on this runner before the action does.
       - name: Open, test and merge the bump PR
         id: land
         uses: jsvolos63/vendor-cli/.github/actions/land-bot-pr@main
         with:
+          app-id: ${{ secrets.FAMILY_BOT_APP_ID }}
+          app-private-key: ${{ secrets.FAMILY_BOT_PRIVATE_KEY }}
           branch: auto/kit-pin-bump
           commit-message: "Bump @jfs kit pins to current HEADs; re-vendor"
           title: "Bump @jfs kit pins to current HEADs"
@@ -442,11 +472,12 @@ jobs:
             and the app version bumped per this
             repo's caller inputs; the repo's CI checks ran green inside the
             bump workflow (in a read-only job) before this PR was opened.
-            A PR opened with the default GITHUB_TOKEN triggers no
-            pull_request CI, so the bump then dispatches the repo's CI
-            workflow on this branch and merges only once that run is green
-            on the head commit — the run whose checks branch protection
-            reads.
+            The bump then dispatches the repo's CI workflow on this branch
+            and merges only once that run is green on the head commit — the
+            run whose checks branch protection reads. (A PR opened with the
+            default GITHUB_TOKEN triggers no pull_request CI; one opened by
+            the family App does, and the merge still waits for the
+            dispatched run.)
 
             ${{ inputs.pr-body-extra }}
           ci-workflow: ${{ inputs.ci-workflow }}
@@ -457,7 +488,8 @@ jobs:
 
   # Tag the version this bump just merged.
   #
-  # The merge above is made with the default GITHUB_TOKEN, and a GITHUB_TOKEN
+  # In a repo without the family App's secrets the merge above is made with
+  # the default GITHUB_TOKEN, and a GITHUB_TOKEN
   # push fires no workflows — the same fact the check step exists for, one
   # layer up. So the merged commit gets no CI run on the default branch, no
   # `workflow_run` reaches the repo's Release workflow, and the version this
@@ -470,6 +502,11 @@ jobs:
   # this file would be a second set of rules about what may be tagged — and it
   # still refuses to tag a version whose tag exists, so a kit caller (no
   # version bump) simply no-ops.
+  #
+  # A merge made as the family App DOES fire push workflows, so there CI on
+  # main runs and the ordinary CI-gated path reaches release.yml as well. This
+  # job still runs: the two meet in release.yml's concurrency group, and
+  # whichever comes second finds the tag and does nothing.
   #
   # Skipped when the caller names no title, when nothing merged, and when
   # auto-merge is off: there the human's own merge fires CI, and the ordinary

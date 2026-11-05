@@ -466,6 +466,39 @@ test('kit-pin-bump runs every untrusted command under a read-only token, and the
   assert.ok((jobs.prepare.steps || []).some((s) => /\.github\/workflows/.test(s.run || '') && /exit 1/.test(s.run || '')), 'prepare must refuse a patch that touches .github/workflows');
 });
 
+test("kit-pin-bump hands the family App's secrets to the write job alone, and only to land-bot-pr", () => {
+  // The private key mints a token for every repo the App is installed on, so
+  // it may only reach a job that has run nothing from the repository: a step
+  // earlier in the same job can rewrite the action on the runner's disk. That
+  // is the bump job, whose steps are checkout, apply a patch, land. Secrets a
+  // job never references never reach its runner, so `prepare` must not name
+  // them anywhere.
+  const w = wf('kit-pin-bump.yml');
+  assert.deepEqual(Object.keys(w.on.workflow_call.secrets).sort(), ['FAMILY_BOT_APP_ID', 'FAMILY_BOT_PRIVATE_KEY']);
+  for (const [name, sec] of Object.entries(w.on.workflow_call.secrets)) {
+    assert.equal(sec.required, false, `${name} must be optional: a repo without it keeps the default token`);
+  }
+  const referencing = Object.entries(w.jobs).filter(([, j]) => /\bsecrets\./.test(JSON.stringify(j))).map(([n]) => n);
+  assert.deepEqual(referencing, ['bump'], 'only the write job may name a secret');
+  const steps = w.jobs.bump.steps.filter((s) => /\bsecrets\./.test(JSON.stringify(s)));
+  assert.deepEqual(steps.map((s) => s.id), ['land'], 'and only in its land-bot-pr step');
+  assert.deepEqual(
+    { id: steps[0].with['app-id'], key: steps[0].with['app-private-key'] },
+    { id: '${{ secrets.FAMILY_BOT_APP_ID }}', key: '${{ secrets.FAMILY_BOT_PRIVATE_KEY }}' },
+  );
+  // Nothing before the land step runs repo code (the untrusted-command test
+  // above holds the whole job; this holds the order too).
+  const at = w.jobs.bump.steps.findIndex((s) => s.id === 'land');
+  for (const s of w.jobs.bump.steps.slice(0, at)) {
+    assert.ok(!s.run || /^\s*git apply --index --whitespace=nowarn "\$RUNNER_TEMP\/kit-pin-bump\.patch"\n\s*git status --short\s*$/.test(s.run), `"${s.name}" runs something before the key arrives`);
+    assert.ok(!s.uses || /^actions\/(checkout|download-artifact)@v\d+$/.test(s.uses), `"${s.name}" uses ${s.uses} before the key arrives`);
+  }
+  // No workflow in this repo forwards every secret it holds.
+  for (const f of FILES) {
+    assert.doesNotMatch(readFileSync(join(WF_DIR, f), 'utf8'), /^\s*secrets:\s*inherit\b/m, `${f} uses secrets: inherit`);
+  }
+});
+
 test('land-bot-pr merges whenever an open PR exists, not only when this run created or updated it', () => {
   // create-pull-request (v8.1.1) reports operation 'none' — with the PR number
   // set — when a retry rebuilds a branch that is even with its remote. The
@@ -479,16 +512,19 @@ test('land-bot-pr merges whenever an open PR exists, not only when this run crea
   for (const s of steps) assert.doesNotMatch(String(s.if || ''), /pull-request-operation/);
 });
 
-test('land-bot-pr signs the commit with the default token, so a signature rule is never what refuses its merge', () => {
+test('land-bot-pr signs the commit with a bot token (the default one, or the family App\'s), so a signature rule is never what refuses its merge', () => {
   // Bot merges have been refused since branch protection went on (2026-11-02).
   // Signing did not fix that (Netlify-kit #59: signed, both required checks
   // green, still refused; MAINTENANCE.md FAM-1 (b)), but it keeps signatures
-  // out of the question and the commit verified.
+  // out of the question and the commit verified. Both tokens the action may
+  // use are bot tokens: the default GITHUB_TOKEN, or an installation token of
+  // the family App.
   const a = ACTIONS['land-bot-pr'].value;
   const cpr = a.runs.steps.filter((s) => /create-pull-request@/.test(s.uses || ''));
   assert.equal(cpr.length, 1, 'expected exactly one create-pull-request step');
   assert.equal(cpr[0].with['sign-commits'], true, 'sign-commits must be true');
-  assert.equal(cpr[0].with.token, '${{ inputs.token }}');
+  assert.equal(cpr[0].with.token, '${{ steps.app.outputs.token || inputs.token }}');
+  assert.equal(a.runs.steps.find((s) => s.id === 'app').uses, 'actions/create-github-app-token@v3');
   assert.equal(a.inputs.token.default, '${{ github.token }}', 'signing needs a bot token; a PAT makes unsigned commits');
   // No workflow in this repo opens a PR any other way, or hands the action
   // another token.

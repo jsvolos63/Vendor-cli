@@ -97,7 +97,7 @@ function runCi(setupOpts, env) {
 
 test('the CI step sits between the PR and the merge, and the bump job may dispatch', () => {
   assert.equal(ACTION.runs.using, 'composite');
-  assert.deepEqual(STEPS.map((s) => s.id), ['cpr', 'ci', 'merge']);
+  assert.deepEqual(STEPS.map((s) => s.id), ['app-check', 'app', 'identity', 'cpr', 'ci', 'merge']);
   for (const s of STEPS.filter((x) => x.run)) assert.equal(s.shell, 'bash', `${s.id}: a composite run step must name its shell`);
   assert.equal(CI.if, "steps.cpr.outputs.pull-request-number != ''");
   const cpr = STEPS.find((s) => s.id === 'cpr');
@@ -230,4 +230,110 @@ test('the merge happens only on green CI, bound to the commit CI validated', () 
   assert.match(refused.out, /stuck at .*pull\/9, green/);
   const noted = runMerge({ CI_GREEN: 'true', HEAD_SHA: HEAD, FAKE_MERGE_EXIT: '1', STUCK_NOTE: 'The depth chart stops tracking the team.' });
   assert.match(noted.out, /merge it by hand or fix the blocker\. The depth chart stops tracking the team\.$/m, 'the caller says what goes stale');
+});
+
+// ------------------------------------------------------------ the family App
+//
+// Since 2026-11-02 GitHub refuses every merge the default token makes under
+// the family branch protection (Netlify-kit #59, BearsMockDraft #236). A repo
+// holding the family GitHub App's two secrets opens and merges as the App
+// instead; one holding neither keeps the default token. The private key can
+// mint a token for EVERY repo the App is installed on, so what the token may
+// do, where the key may appear, and what happens with half a configuration
+// are each pinned here.
+
+const APP_CHECK = STEPS.find((s) => s.id === 'app-check');
+const MINT = STEPS.find((s) => s.id === 'app');
+const IDENTITY = STEPS.find((s) => s.id === 'identity');
+const CPR = STEPS.find((s) => s.id === 'cpr');
+const APP_OR_DEFAULT = '${{ steps.app.outputs.token || inputs.token }}';
+
+// The two step conditions, evaluated the way GitHub's expression engine does
+// for these shapes (string == string, boolean != boolean, &&).
+function evalIf(expr, inputs) {
+  const js = expr
+    .replace(/inputs\.([a-z-]+)/g, (_, k) => JSON.stringify(inputs[k] ?? ''))
+    .replace(/'([^']*)'/g, (_, v) => JSON.stringify(v))
+    .replace(/==/g, '===')
+    .replace(/!===/g, '!==');
+  return Function(`"use strict"; return (${js});`)();
+}
+
+test('the App is used only when both secrets reached the action, and half a configuration fails first', () => {
+  const cases = [
+    { 'app-id': '', 'app-private-key': '', check: false, mint: false },
+    { 'app-id': '123456', 'app-private-key': '-----BEGIN RSA PRIVATE KEY-----', check: false, mint: true },
+    { 'app-id': '123456', 'app-private-key': '', check: true, mint: false },
+    { 'app-id': '', 'app-private-key': '-----BEGIN RSA PRIVATE KEY-----', check: true, mint: false },
+  ];
+  for (const c of cases) {
+    assert.equal(evalIf(APP_CHECK.if, c), c.check, `app-check for ${JSON.stringify(c)}`);
+    assert.equal(evalIf(MINT.if, c), c.mint, `mint for ${JSON.stringify(c)}`);
+  }
+  // The refusal is a hard stop, and it names both secrets.
+  assert.equal(APP_CHECK.shell, 'bash');
+  const r = spawnSync('bash', ['-c', APP_CHECK.run], { encoding: 'utf8' });
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^::error::.*FAMILY_BOT_APP_ID.*FAMILY_BOT_PRIVATE_KEY/m);
+  assert.deepEqual(Object.keys(ACTION.inputs['app-id']), ['description', 'default']);
+  assert.equal(ACTION.inputs['app-id'].default, '');
+  assert.equal(ACTION.inputs['app-private-key'].default, '', 'neither input is required: a repo without the secrets keeps the default token');
+});
+
+test("the App's token reaches this repository alone, with contents and pull-requests write and nothing more", () => {
+  assert.equal(MINT.uses, 'actions/create-github-app-token@v3', 'first-party: major tag, per the family pinning policy');
+  assert.deepEqual(MINT.with, {
+    'client-id': '${{ inputs.app-id }}',
+    'private-key': '${{ inputs.app-private-key }}',
+    'permission-contents': 'write',
+    'permission-pull-requests': 'write',
+  }, 'no owner / repositories (the token stays on this repo), no workflows permission (a .github/workflows change stays unpushable), no skip-token-revoke');
+});
+
+test('the private key appears in the mint step and nowhere else', () => {
+  const where = STEPS.filter((s) => JSON.stringify(s).includes('inputs.app-private-key')).map((s) => s.id);
+  assert.deepEqual(where.sort(), ['app', 'app-check'].sort());
+  // app-check only tests it for emptiness, in its condition, never in a shell.
+  assert.doesNotMatch(JSON.stringify({ run: APP_CHECK.run, env: APP_CHECK.env ?? {} }), /app-private-key/);
+  for (const s of STEPS) {
+    assert.doesNotMatch(JSON.stringify(s.env ?? {}), /app-private-key|app-id/, `${s.id} puts an App input in a shell's environment`);
+  }
+});
+
+test('the identity that opens the PR merges it; the dispatch always uses the default token', () => {
+  assert.equal(CPR.with.token, APP_OR_DEFAULT);
+  assert.equal(MERGE.env.GH_TOKEN, APP_OR_DEFAULT);
+  assert.equal(CI.env.GH_TOKEN, '${{ inputs.token }}', "the App's token is not given actions: write; the caller's job grants it to the default token");
+  assert.equal(MERGE.env.IDENTITY, '${{ steps.identity.outputs.identity }}');
+  assert.equal(ACTION.outputs.identity.value, '${{ steps.identity.outputs.identity }}');
+});
+
+test('the run says which identity it lands as', () => {
+  const say = (env) => {
+    const dir = setup();
+    try { return exec(IDENTITY.run, dir, env); } finally { rmSync(dir, { recursive: true, force: true }); }
+  };
+  assert.deepEqual(IDENTITY.env, { MINTED: '${{ steps.app.outcome }}', APP_SLUG: '${{ steps.app.outputs.app-slug }}' });
+  const app = say({ MINTED: 'success', APP_SLUG: 'jsvolos63-family-bot' });
+  assert.equal(app.status, 0);
+  assert.equal(app.outputs.identity, 'app');
+  assert.match(app.out, /as the family App \(jsvolos63-family-bot\)/);
+  for (const MINTED of ['skipped', '', 'failure']) {
+    const d = say({ MINTED, APP_SLUG: '' });
+    assert.equal(d.outputs.identity, 'default', `outcome '${MINTED}' is the default token`);
+    assert.match(d.out, /default token/);
+  }
+});
+
+test("a refused merge says whose merge it was, and soft-fail still never merges", () => {
+  const asApp = runMerge({ CI_GREEN: 'true', HEAD_SHA: HEAD, FAKE_MERGE_EXIT: '1', IDENTITY: 'app' });
+  assert.equal(asApp.status, 1);
+  assert.match(asApp.out, /::error::.*the family App's merge was refused.*let the App merge/);
+  const asDefault = runMerge({ CI_GREEN: 'true', HEAD_SHA: HEAD, FAKE_MERGE_EXIT: '1', IDENTITY: 'default' });
+  assert.equal(asDefault.status, 1);
+  assert.match(asDefault.out, /::error::.*no family App secrets reached the action \(FAMILY_BOT_APP_ID, FAMILY_BOT_PRIVATE_KEY\)/);
+  const soft = runMerge({ CI_GREEN: 'true', HEAD_SHA: HEAD, FAKE_MERGE_EXIT: '1', IDENTITY: 'app', SOFT_FAIL: 'true' });
+  assert.equal(soft.status, 0, 'soft-fail makes a refusal a warning');
+  assert.match(soft.out, /^::warning::Auto-merge failed \(the family App's merge was refused/m);
+  assert.equal(soft.outputs.merged, undefined);
 });

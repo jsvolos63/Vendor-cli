@@ -26,13 +26,32 @@ description: >-
 # `actions: write` (the dispatch), and must already have the changes in its
 # working tree.
 #
-# WHAT IT CANNOT DO (2026-11-05)
-# ------------------------------
-# Under the current family branch protection GitHub refuses every merge made
-# with the default token, even with a signed commit and both required checks
-# green on the head (Netlify-kit #59, BearsMockDraft #236). The merge step then
-# reds the run and leaves the green PR open for a session or the owner to
-# merge. That is the owner's to change: vendor-cli's MAINTENANCE.md, FAM-1 (b).
+# WHO OPENS AND MERGES THE PR (2026-11-05)
+# ----------------------------------------
+# Under the family branch protection (since 2026-11-02) GitHub refuses every
+# merge made with the default token, even with a signed commit and both
+# required checks green on the head (Netlify-kit #59, BearsMockDraft #236).
+# So a caller that holds the family GitHub App's two secrets
+# (FAMILY_BOT_APP_ID, FAMILY_BOT_PRIVATE_KEY) passes them as `app-id` and
+# `app-private-key`, and the PR is opened and merged with an installation
+# token minted here for THIS repository alone, with contents and
+# pull-requests write and nothing more. No `workflows` permission, so a change
+# to .github/workflows/ is refused at the push exactly as it is under the
+# default token. The token is revoked when the job ends.
+#
+# A caller with neither keeps the default token and the outcome it has today:
+# a refused merge reds the run and leaves the green PR open for a session or
+# the owner (vendor-cli's MAINTENANCE.md, FAM-1 (b)). One secret without the
+# other is a misconfiguration and fails the run before anything is opened.
+# The CI dispatch and the wait always use the default token, whichever
+# identity opens the PR.
+#
+# The private key can mint a token for every repository the App is installed
+# on (all of them), so it belongs ONLY in a job that has run nothing from the
+# repository before this action: a step earlier in the same job can rewrite
+# this action's files on the runner's disk before they execute. That is
+# kit-pin-bump.yml's `bump` job and BearsMockDraft's refresh `land` jobs;
+# test/workflows.test.mjs holds the first.
 #
 # Tested by test/land-bot-pr.test.mjs, which runs the CI and merge steps' real
 # scripts against a fake `gh`, and test/workflows.test.mjs.
@@ -40,10 +59,24 @@ description: >-
 inputs:
   token:
     description: >-
-      Token for the PR, the dispatch and the merge. Leave it as the default
-      GITHUB_TOKEN: commit signing works only with a bot token, and a PAT makes
-      unsigned commits.
+      The default token. It always dispatches CI and reads the run, and it
+      opens and merges the PR when no App is configured. Leave it as the
+      default GITHUB_TOKEN: commit signing works only with a bot token, and a
+      PAT makes unsigned commits.
     default: ${{ github.token }}
+  app-id:
+    description: >-
+      The family GitHub App's ID (the repo secret FAMILY_BOT_APP_ID). With
+      app-private-key, the PR is opened and merged as the App, under a token
+      for this repository alone. Both empty keeps the default token; one
+      without the other fails the run.
+    default: ''
+  app-private-key:
+    description: >-
+      The family GitHub App's private key (the repo secret
+      FAMILY_BOT_PRIVATE_KEY). Pass it only from a job that ran nothing from
+      the repository before this action; see the header.
+    default: ''
   branch:
     description: The fixed branch the PR is opened from, e.g. auto/kit-pin-bump.
     required: true
@@ -86,6 +119,9 @@ inputs:
     default: ''
 
 outputs:
+  identity:
+    description: "'app' when the family App opened and merged the PR, 'default' when the default token did."
+    value: ${{ steps.identity.outputs.identity }}
   pull-request-number:
     description: The PR's number; empty when there was nothing to open.
     value: ${{ steps.cpr.outputs.pull-request-number }}
@@ -105,6 +141,51 @@ outputs:
 runs:
   using: composite
   steps:
+    # A repo holding one of the two secrets meant to hold both. Falling back to
+    # the default token there would end in the refused merge the App exists to
+    # avoid, with nothing saying why, so it fails first. The condition reads
+    # only whether each input is empty; the key never reaches a shell.
+    - name: Refuse a half-configured family App
+      id: app-check
+      if: (inputs.app-id == '') != (inputs.app-private-key == '')
+      shell: bash
+      run: |
+        echo "::error::Only one of FAMILY_BOT_APP_ID and FAMILY_BOT_PRIVATE_KEY reached land-bot-pr. Set both as repository secrets (and pass both from the caller), or neither to keep the default token."
+        exit 1
+
+    # First-party, so referenced by major tag (the family pinning policy).
+    # The token covers this repository only: no owner or repositories input,
+    # though the App is installed on every family repo. Exactly the two
+    # permissions opening and merging a PR take; asking for no `workflows`
+    # keeps a .github/workflows/ change unpushable, as under the default token.
+    - name: Mint the family App's token for this repository
+      id: app
+      if: inputs.app-id != '' && inputs.app-private-key != ''
+      uses: actions/create-github-app-token@v3
+      with:
+        client-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.app-private-key }}
+        permission-contents: write
+        permission-pull-requests: write
+
+    # Which identity this run lands as, in the log and as an output: the one
+    # place a reader of the run page can see whether the repo's secrets
+    # reached the action.
+    - name: Say who opens and merges the PR
+      id: identity
+      shell: bash
+      env:
+        MINTED: ${{ steps.app.outcome }}
+        APP_SLUG: ${{ steps.app.outputs.app-slug }}
+      run: |
+        if [ "$MINTED" = "success" ]; then
+          echo "identity=app" >> "$GITHUB_OUTPUT"
+          echo "The PR is opened and merged as the family App (${APP_SLUG:-unnamed}), with a token for this repository alone."
+        else
+          echo "identity=default" >> "$GITHUB_OUTPUT"
+          echo "No family App secrets reached this action, so the PR is opened and merged with the default token. Under the family branch protection that merge is refused (FAM-1 (b))."
+        fi
+
     - name: Open a pull request
       id: cpr
       # Pinned by SHA, not tag: this runs in jobs with contents and
@@ -113,12 +194,15 @@ runs:
       # resolves to in the trailing comment.
       uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
       with:
-        token: ${{ inputs.token }}
+        # The App's token when one was minted, else the default token.
+        token: ${{ steps.app.outputs.token || inputs.token }}
         # Signed, so a commit-signature rule is never what refuses the merge:
-        # the commit is made through the GitHub API with the default token,
-        # which GitHub signs as github-actions[bot] (it ignores author /
-        # committer, and refuses a file over 40 MiB). Not enough on its own;
-        # see WHAT IT CANNOT DO above.
+        # the commit is made through the GitHub API, which GitHub signs as the
+        # token's bot (github-actions[bot], or the App's bot; it ignores author
+        # / committer, and refuses a file over 40 MiB). A push made with the
+        # App's token also fires the repo's pull_request CI, which the default
+        # token's never did; the dispatch below still runs and is what the
+        # merge waits for.
         sign-commits: true
         branch: ${{ inputs.branch }}
         add-paths: ${{ inputs.add-paths }}
@@ -130,6 +214,8 @@ runs:
     # commit. A PR opened with the default token gets no pull_request CI (its
     # run waits for an approval nobody gives), and workflow_dispatch is the one
     # event that token may still fire. With auto-merge off it only dispatches.
+    # Always the default token, App or not: it needs actions: write, which the
+    # caller's job grants and the App's token is not given.
     #
     # Gated on the PR NUMBER, not on pull-request-operation: a re-run after a
     # refused merge, with nothing upstream changed, rebuilds a byte-identical
@@ -220,7 +306,9 @@ runs:
       if: inputs.auto-merge == 'true' && steps.cpr.outputs.pull-request-number != ''
       shell: bash
       env:
-        GH_TOKEN: ${{ inputs.token }}
+        # The same identity that opened the PR merges it.
+        GH_TOKEN: ${{ steps.app.outputs.token || inputs.token }}
+        IDENTITY: ${{ steps.identity.outputs.identity }}
         PR_URL: ${{ steps.cpr.outputs.pull-request-url }}
         SOFT_FAIL: ${{ inputs.soft-fail }}
         STUCK_NOTE: ${{ inputs.stuck-note }}
@@ -260,9 +348,16 @@ runs:
             # here would report the merge as broken when only the tag is.
             echo "::error::Merged $PR_URL but could not read its squash commit, so a caller that tags it will not. Dispatch the repo's Release workflow to tag it."
           fi
-        elif [ "$SOFT_FAIL" = "true" ]; then
-          echo "::warning::Auto-merge failed (branch protection or conflict) — review and merge manually: $PR_URL"
         else
-          echo "::error::Auto-merge of the validated PR failed (branch protection, a conflict, or a permissions gap). It is stuck at $PR_URL, green: merge it by hand or fix the blocker.${STUCK_NOTE:+ $STUCK_NOTE}"
-          exit 1
+          if [ "$IDENTITY" = "app" ]; then
+            who="the family App's merge was refused: the branch protection or ruleset on the default branch must let the App merge a PR with green checks, or a conflict or permissions gap is in the way"
+          else
+            who="branch protection, a conflict, or a permissions gap; the merge used the default token because no family App secrets reached the action (FAMILY_BOT_APP_ID, FAMILY_BOT_PRIVATE_KEY)"
+          fi
+          if [ "$SOFT_FAIL" = "true" ]; then
+            echo "::warning::Auto-merge failed ($who) — review and merge manually: $PR_URL"
+          else
+            echo "::error::Auto-merge of the validated PR failed ($who). It is stuck at $PR_URL, green: merge it by hand or fix the blocker.${STUCK_NOTE:+ $STUCK_NOTE}"
+            exit 1
+          fi
         fi
