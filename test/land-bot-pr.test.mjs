@@ -35,6 +35,8 @@ const hasJq = spawnSync('jq', ['--version']).status === 0;
 // logged; `gh api …/runs` answers with the next file of $FAKE_RUNS_DIR
 // (0.json, 1.json, … — the last one repeats), passed through the --jq
 // expression the script supplies, exactly as gh would.
+// $FAKE_API_FAIL lists the 0-based `gh api` calls that fail like a 502
+// instead (each still consumes its runs file).
 const FAKE_GH = `#!/usr/bin/env bash
 case "$1 $2" in
   "pr view")
@@ -46,6 +48,7 @@ case "$1 $2" in
     n=$(cat "$FAKE_RUNS_DIR/n" 2>/dev/null || echo 0)
     f="$FAKE_RUNS_DIR/$n.json"; [ -f "$f" ] || f=$(ls "$FAKE_RUNS_DIR"/*.json | sort -V | tail -1)
     echo $((n + 1)) > "$FAKE_RUNS_DIR/n"
+    case ",\${FAKE_API_FAIL:-}," in *",$n,"*) echo "HTTP 502: Bad Gateway (fake)" >&2; exit 1 ;; esac
     jqexpr=''; while [ $# -gt 0 ]; do [ "$1" = "--jq" ] && { jqexpr="$2"; shift; }; shift; done
     jq -r "$jqexpr" "$f" ;;
   *) echo "fake gh: unexpected: $*" >&2; exit 64 ;;
@@ -385,4 +388,38 @@ test("a refused merge says whose merge it was, and soft-fail still never merges"
   assert.equal(soft.status, 0, 'soft-fail makes a refusal a warning');
   assert.match(soft.out, /^::warning::Auto-merge failed \(the family App's merge was refused/m);
   assert.equal(soft.outputs.merged, undefined);
+});
+
+// A transient API error during the wait (a 502, a secondary rate limit) used
+// to end the step under `set -e`: the green PR was left open with only gh's
+// message in the log, once a month in every family repo that met one.
+test('one failed poll is retried, not fatal', { skip: !hasJq && 'jq not installed' }, () => {
+  const r = runCi({ runs: [[], [run(7, 'in_progress')], [run(7, 'completed', 'success')]] }, { FAKE_API_FAIL: '0' });
+  assert.equal(r.status, 0, r.out);
+  assert.match(r.out, /::warning::Reading the CI runs on c{40} failed \(1 in a row\); retrying\./);
+  assert.deepEqual(r.outputs, { 'head-sha': HEAD, green: 'true' });
+});
+
+test('polls that keep failing still fail the step, and never read as green', { skip: !hasJq && 'jq not installed' }, () => {
+  const r = runCi({ runs: [[run(7, 'completed', 'success')]] }, { FAKE_API_FAIL: '0,1,2', MAX_POLL_FAILURES: '3' });
+  assert.equal(r.status, 1, r.out);
+  assert.match(r.out, /::error::Reading the CI runs on c{40} failed 3 times in a row; .*pull\/9 is left open\./);
+  assert.equal(r.outputs.green, undefined);
+  // A success between failures resets the count.
+  const ok = runCi({ runs: [[], [], [run(7, 'in_progress')], [], [run(7, 'completed', 'success')]] }, { FAKE_API_FAIL: '0,1,3', MAX_POLL_FAILURES: '3' });
+  assert.equal(ok.status, 0, ok.out);
+});
+
+// Under the App an EMPTY answer means "no other run is unfinished" and lets
+// the merge go ahead, so a failed poll there must be retried, never taken as
+// that answer: otherwise a 502 merges before the pull_request run finishes.
+test('a failed poll in the App wait is not read as "nothing unfinished"', { skip: !hasJq && 'jq not installed' }, () => {
+  const green = run(7, 'completed', 'success');
+  const pr = run(8, 'in_progress');
+  const r = runCi({ runs: [[green], [], [pr], [green]] }, { IDENTITY: 'app', FAKE_API_FAIL: '1' });
+  assert.equal(r.status, 0, r.out);
+  assert.match(r.out, /retrying/);
+  assert.match(r.out, /Waiting for another CI run on c{40}: .*runs\/8/, 'it went on to see the unfinished run');
+  assert.equal((r.log.match(/^api /gm) || []).length, 4);
+  assert.equal(r.outputs.green, 'true');
 });
