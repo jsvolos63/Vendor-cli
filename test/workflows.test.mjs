@@ -419,6 +419,18 @@ test('kit-pin-bump merges whenever an open bump PR exists, not only when this ru
   assert.doesNotMatch(merge.if, /pull-request-operation/);
 });
 
+test('kit-pin-bump signs the bump commit, or branch protection refuses the merge', () => {
+  // Every family main requires signed commits for non-admins. Netlify-kit #58
+  // (2026-11-02) carried an unsigned runner commit: both required checks
+  // green, mergeable_state `blocked`, merge refused. Measured beside it: a
+  // signed session commit with no review read `clean` (market-monitor #479).
+  const steps = wf('kit-pin-bump.yml').jobs.bump.steps;
+  const cpr = steps.filter((s) => /create-pull-request@/.test(s.uses || ''));
+  assert.equal(cpr.length, 1, 'expected exactly one create-pull-request step');
+  assert.equal(cpr[0].with['sign-commits'], true, 'sign-commits must be true');
+  assert.equal(cpr[0].with.token, '${{ github.token }}', 'signing needs a bot token; a PAT makes unsigned commits');
+});
+
 test('kit-pin-bump exposes the merge it made as a workflow output, empty when nothing merged', () => {
   // A caller that runs its own CI on main after the bump (market-monitor's
   // ci-on-main) gates on this; without it that job fired on every run, merged
