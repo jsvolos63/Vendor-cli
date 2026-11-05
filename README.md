@@ -26,8 +26,11 @@ hand-rolled — often as drifting copies — across the kits and their consumers
    link a browser module graph with V8's own resolver; see below.
 
 It also hosts the family's four reusable workflows under `.github/workflows/`
-(`family-ci.yml`, `kit-pin-bump.yml`, `release.yml`, `dependabot-merge.yml`)
-and the monitor that watches them, `tools/family-liveness.mjs`.
+(`family-ci.yml`, `kit-pin-bump.yml`, `release.yml`, `dependabot-merge.yml`),
+one shared composite action, `.github/actions/land-bot-pr` (open a bot PR,
+run the repo's CI on it, merge it on green; the kit-pin bump and
+BearsMockDraft's refresh crons call it), and the monitor that watches them,
+`tools/family-liveness.mjs`.
 
 The family's consumers are buildless static sites: `node_modules` is not
 deployed, so each consumer commits a generated copy of every kit it uses and

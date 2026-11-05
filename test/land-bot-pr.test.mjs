@@ -1,14 +1,16 @@
-// Runs kit-pin-bump.yml's CI and merge steps — the real scripts, read out of
-// the workflow — against a fake `gh`, and asserts what they dispatch, how long
-// they wait, and what they merge.
+// Runs the land-bot-pr action's CI and merge steps (the real scripts, read out
+// of .github/actions/land-bot-pr/action.yml) against a fake `gh`, and asserts
+// what they dispatch, how long they wait, and what they merge. The action is
+// the one copy of these steps; kit-pin-bump.yml and BearsMockDraft's refresh
+// crons call it.
 //
 // Why these steps exist (2026-11-02): main is branch-protected and requires
-// the family-ci checks, and a PR opened with the default GITHUB_TOKEN fires no
-// pull_request workflow, so a bump PR carried no checks and its merge was
-// refused. workflow_dispatch is the one event that token may still fire; the
-// run it starts puts the required checks on the PR's head commit. A slip here
+// the family-ci checks, and a PR opened with the default GITHUB_TOKEN gets no
+// pull_request CI, so a bot PR carried no checks and its merge was refused.
+// workflow_dispatch is the one event that token may still fire; the run it
+// starts puts the required checks on the PR's head commit. A slip here
 // either strands every family repo's monthly bump (dispatch the wrong file,
-// never see the run) or — worse — merges a tree CI never passed, so each
+// never see the run) or, worse, merges a tree CI never passed, so each
 // branch of the decision is pinned below.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -21,7 +23,8 @@ import { parse } from 'yaml';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const WF = parse(readFileSync(join(ROOT, '.github', 'workflows', 'kit-pin-bump.yml'), 'utf8'));
-const STEPS = WF.jobs.bump.steps;
+const ACTION = parse(readFileSync(join(ROOT, '.github', 'actions', 'land-bot-pr', 'action.yml'), 'utf8'));
+const STEPS = ACTION.runs.steps;
 const CI = STEPS.find((s) => s.id === 'ci');
 const MERGE = STEPS.find((s) => s.id === 'merge');
 const HEAD = 'c'.repeat(40);
@@ -55,7 +58,7 @@ const ago = (s) => new Date(Date.now() - s * 1000).toISOString().replace(/\.\d+Z
 const run = (id, status, conclusion = null, created = now()) => ({ id, status, conclusion, created_at: created, html_url: `https://github.com/jsvolos63/example/actions/runs/${id}` });
 
 function setup({ workflows = { 'ci.yml': FAMILY_CI(), 'kit-pin-bump.yml': 'on: workflow_dispatch\n' }, runs = [[]] } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'kit-pin-bump-ci-'));
+  const dir = mkdtempSync(join(tmpdir(), 'land-bot-pr-'));
   mkdirSync(join(dir, 'repo', '.github', 'workflows'), { recursive: true });
   for (const [f, text] of Object.entries(workflows)) writeFileSync(join(dir, 'repo', '.github', 'workflows', f), text);
   writeFileSync(join(dir, 'gh'), FAKE_GH);
@@ -92,19 +95,25 @@ function runCi(setupOpts, env) {
   try { return exec(CI.run, dir, ciEnv(env)); } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
-test('the CI step sits between the PR and the merge, and the job may dispatch', () => {
-  const ids = STEPS.map((s) => s.id).filter(Boolean);
-  assert.deepEqual(ids.slice(-3), ['cpr', 'ci', 'merge']);
+test('the CI step sits between the PR and the merge, and the bump job may dispatch', () => {
+  assert.equal(ACTION.runs.using, 'composite');
+  assert.deepEqual(STEPS.map((s) => s.id), ['cpr', 'ci', 'merge']);
+  for (const s of STEPS.filter((x) => x.run)) assert.equal(s.shell, 'bash', `${s.id}: a composite run step must name its shell`);
   assert.equal(CI.if, "steps.cpr.outputs.pull-request-number != ''");
-  assert.equal(CI.env.BRANCH, 'auto/kit-pin-bump', 'the branch create-pull-request pushes');
   const cpr = STEPS.find((s) => s.id === 'cpr');
+  assert.equal(CI.env.BRANCH, '${{ inputs.branch }}', 'CI runs on the branch create-pull-request pushes');
   assert.equal(cpr.with.branch, CI.env.BRANCH);
-  assert.equal(WF.permissions.actions, 'write', 'the workflow must ask for actions: write');
-  assert.equal(WF.jobs.bump.permissions.actions, 'write', 'the bump job dispatches, so it needs actions: write');
-  assert.equal(WF.jobs.prepare.permissions.actions, undefined, 'the untrusted job never gets it');
   assert.equal(MERGE.env.CI_GREEN, '${{ steps.ci.outputs.green }}');
   assert.equal(MERGE.env.HEAD_SHA, '${{ steps.ci.outputs.head-sha }}');
   assert.match(MERGE.run, /gh pr merge --squash --delete-branch --match-head-commit "\$HEAD_SHA" "\$PR_URL"/);
+  // The bump: the action is its last step, on its own branch, in the one job
+  // that holds the write token and actions: write.
+  const land = WF.jobs.bump.steps.at(-1);
+  assert.equal(land.uses, 'jsvolos63/vendor-cli/.github/actions/land-bot-pr@main');
+  assert.equal(land.with.branch, 'auto/kit-pin-bump');
+  assert.equal(WF.permissions.actions, 'write', 'the workflow must ask for actions: write');
+  assert.equal(WF.jobs.bump.permissions.actions, 'write', 'the bump job dispatches, so it needs actions: write');
+  assert.equal(WF.jobs.prepare.permissions.actions, undefined, 'the untrusted job never gets it');
   assert.ok(WF.jobs.bump['timeout-minutes'] > WF.on.workflow_call.inputs['ci-wait-minutes'].default, 'the job outlives its own CI wait');
 });
 
@@ -208,6 +217,7 @@ test('the merge happens only on green CI, bound to the commit CI validated', () 
   assert.equal(green.status, 0, green.out);
   assert.match(green.log, new RegExp(`^merge pr merge --squash --delete-branch --match-head-commit ${HEAD} ${PR_URL.replace(/[/.]/g, '\\$&')}$`, 'm'));
   assert.equal(green.outputs['merge-sha'], 'd'.repeat(40));
+  assert.equal(green.outputs.merged, 'true', 'a caller reads merged, not the step outcome');
   const notGreen = runMerge({ CI_GREEN: 'false', HEAD_SHA: HEAD });
   assert.equal(notGreen.status, 0, notGreen.out);
   assert.doesNotMatch(notGreen.log, /^merge /m, 'no merge without green CI');
@@ -215,5 +225,9 @@ test('the merge happens only on green CI, bound to the commit CI validated', () 
   const unset = runMerge({ CI_GREEN: '', HEAD_SHA: '' });
   assert.doesNotMatch(unset.log, /^merge /m, 'no CI result at all is not green');
   const refused = runMerge({ CI_GREEN: 'true', HEAD_SHA: HEAD, FAKE_MERGE_EXIT: '1' });
-  assert.equal(refused.status, 1, 'a refused merge of a green bump still reds the run');
+  assert.equal(refused.status, 1, 'a refused merge of a green PR still reds the run');
+  assert.equal(refused.outputs.merged, undefined, 'and does not say it merged');
+  assert.match(refused.out, /stuck at .*pull\/9, green/);
+  const noted = runMerge({ CI_GREEN: 'true', HEAD_SHA: HEAD, FAKE_MERGE_EXIT: '1', STUCK_NOTE: 'The depth chart stops tracking the team.' });
+  assert.match(noted.out, /merge it by hand or fix the blocker\. The depth chart stops tracking the team\.$/m, 'the caller says what goes stale');
 });
