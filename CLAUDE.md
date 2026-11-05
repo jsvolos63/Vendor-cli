@@ -455,6 +455,26 @@ maintainer email. It is `continue-on-error`, and a marker naming the version
 set keeps a rebase from posting twice. The same suite runs it against a fake
 `gh` and `npm`.
 
+**The merge is made as the family App where the repo holds its two secrets**
+(since 0.22.5). Branch protection has refused every merge the default token
+makes since 2026-11-02, Dependabot's included. So a caller passes
+`FAMILY_BOT_APP_ID` and `FAMILY_BOT_PRIVATE_KEY` by name, the workflow
+declares both optional, and the job mints the token `land-bot-pr` mints.
+That token covers this one repository, with `contents` and `pull-requests`
+write and no `workflows`. The two mint steps are held equal by
+`test/dependabot-merge.test.mjs`. A step `if:` cannot read `secrets`, so the
+job env carries only whether each secret is set (`'true'` / `'false'`). The
+two conditions read that: neither set keeps the default token, and its merge
+is refused. One set fails the job. Both set mints the token. The key is safe
+in this job because the job runs nothing from the repository, only `gh` and
+`npm view`, and the tests hold that too. The digest comment keeps the default
+token. The callers' `workflow_run` trigger runs in the base repository's
+context, so the secrets are read from the repo's Actions secrets, not its
+Dependabot secrets. The step log names the identity it merged as, so a run
+that should have used the App and didn't says so. Every family repo with a
+Dependabot caller, this one included (`dependabot-merge-self.yml`), passes
+the two secrets.
+
 Every npm repo pairs it with a `.github/dependabot.yml` — npm monthly (the
 owner's decision of 2026-11-01), minor and patch grouped with production apart
 from development, monthly `github-actions`, a 7-day cooldown — and the

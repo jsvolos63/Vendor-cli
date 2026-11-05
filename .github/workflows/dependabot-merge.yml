@@ -55,10 +55,24 @@
 #   jobs:
 #     merge:
 #       uses: jsvolos63/vendor-cli/.github/workflows/dependabot-merge.yml@main
+#       # The family App's two secrets, by name (never `secrets: inherit`).
+#       secrets:
+#         FAMILY_BOT_APP_ID: ${{ secrets.FAMILY_BOT_APP_ID }}
+#         FAMILY_BOT_PRIVATE_KEY: ${{ secrets.FAMILY_BOT_PRIVATE_KEY }}
 #
-# The merge is made with GITHUB_TOKEN, so — exactly like the kit-pin bump —
-# it fires no push workflows on main: the PR's own CI run is the only
-# validation the change gets, which is why this gates on it.
+# WHO MERGES (2026-11-05). Under the family branch protection GitHub refuses
+# every merge the default token makes (vendor-cli's MAINTENANCE.md, FAM-1
+# (b)), so where the repo holds the family GitHub App's two secrets the merge
+# is made as the App: a token minted here for THIS repository alone, with
+# contents and pull-requests write and nothing more, exactly the token
+# land-bot-pr mints (test/dependabot-merge.test.mjs holds the two equal).
+# Without the secrets the default token merges, and the merge is refused;
+# with only one the job fails first. The digest comment keeps the default
+# token. The key is safe in this job because the job runs nothing from the
+# repository: no checkout, only `gh` and `npm view` (registry metadata, no
+# package code). A merge made as the App fires push workflows on main; one
+# made with GITHUB_TOKEN fires none, so there the PR's own CI run is the only
+# validation the change gets, which is why this gates on it either way.
 name: Dependabot merge (reusable)
 
 on:
@@ -78,6 +92,14 @@ on:
           false restores merging every minor/patch bump on green.
         type: boolean
         default: true
+    # Both optional: a caller that passes neither keeps the default token.
+    secrets:
+      FAMILY_BOT_APP_ID:
+        description: The family GitHub App's ID. With the key, the merge is made as the App.
+        required: false
+      FAMILY_BOT_PRIVATE_KEY:
+        description: The family GitHub App's private key.
+        required: false
 
 permissions:
   contents: write
@@ -93,11 +115,41 @@ jobs:
       && github.event.workflow_run.conclusion == 'success'
       && github.event.workflow_run.actor.login == 'dependabot[bot]'
       && github.event.workflow_run.head_repository.full_name == github.repository
+    # Whether each of the family App's secrets reached this workflow: 'true'
+    # or 'false', never the value. A step `if:` cannot read `secrets`, so the
+    # two conditions below read these instead.
+    env:
+      FAMILY_APP_ID_SET: ${{ secrets.FAMILY_BOT_APP_ID != '' }}
+      FAMILY_APP_KEY_SET: ${{ secrets.FAMILY_BOT_PRIVATE_KEY != '' }}
     steps:
+      # One secret without the other is a misconfiguration: falling back to
+      # the default token there ends in the refused merge, saying nothing.
+      - name: Refuse a half-configured family App
+        if: env.FAMILY_APP_ID_SET != env.FAMILY_APP_KEY_SET
+        run: |
+          echo "::error::Only one of FAMILY_BOT_APP_ID and FAMILY_BOT_PRIVATE_KEY reached the Dependabot merge. Set both as repository secrets (and pass both from the caller), or neither to keep the default token."
+          exit 1
+
+      # The same token land-bot-pr mints, and the test holds them equal: this
+      # repository only (no owner or repositories input), contents and
+      # pull-requests write, no workflows permission. First-party, so a major
+      # tag (the family pinning policy). Revoked when the job ends.
+      - name: Mint the family App's token for this repository
+        id: app
+        if: env.FAMILY_APP_ID_SET == 'true' && env.FAMILY_APP_KEY_SET == 'true'
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.FAMILY_BOT_APP_ID }}
+          private-key: ${{ secrets.FAMILY_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
       - name: Merge the green Dependabot PR
         id: merge
         env:
-          GH_TOKEN: ${{ github.token }}
+          # The App's token when one was minted, else the default token.
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          IDENTITY: ${{ steps.app.outcome == 'success' && 'app' || 'default' }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           ALLOW_MAJOR: ${{ inputs.allow-major }}
@@ -182,9 +234,21 @@ jobs:
           # The head check above is a snapshot; bind the merge itself to the
           # SHA the green run validated so a push landing in between is
           # refused by GitHub rather than merged unvalidated.
-          gh pr merge --squash --delete-branch --match-head-commit "$HEAD_SHA" \
-            --repo "$GITHUB_REPOSITORY" "$number"
+          if ! gh pr merge --squash --delete-branch --match-head-commit "$HEAD_SHA" \
+                 --repo "$GITHUB_REPOSITORY" "$number"; then
+            if [ "${IDENTITY:-default}" = "app" ]; then
+              echo "::error::The family App's merge of Dependabot PR #$number was refused: the branch protection or ruleset on the default branch must let the App merge a PR with green checks, or a conflict or permissions gap is in the way. The PR is left open, green."
+            else
+              echo "::error::The merge of Dependabot PR #$number was refused. It used the default token because no family App secrets reached this workflow, and the family branch protection refuses the default token's merges: give this repository FAMILY_BOT_APP_ID and FAMILY_BOT_PRIVATE_KEY (vendor-cli's MAINTENANCE.md, FAM-1 (b)). The PR is left open, green."
+            fi
+            exit 1
+          fi
           echo "Merged Dependabot PR #$number"
+          if [ "${IDENTITY:-default}" = "app" ]; then
+            echo "Merged as the family App."
+          else
+            echo "Merged with the default token: no family App secrets reached this workflow."
+          fi
 
       # A held PR is a session's job (FAM-4, or a major), and "read each
       # package's release notes and what changed" used to mean opening the

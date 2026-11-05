@@ -34,7 +34,7 @@ const FAKE_GH = `#!/usr/bin/env bash
 case "$1 $2" in
   "pr list") printf '%s\\n' "$FAKE_PR" ;;
   "pr view") printf '%s\\n' "$FAKE_COMMIT_BODIES" ;;
-  "pr merge") echo "merge $*" >> "$FAKE_LOG" ;;
+  "pr merge") echo "merge $*" >> "$FAKE_LOG"; exit "\${FAKE_MERGE_EXIT:-0}" ;;
   *) echo "fake gh: unexpected: $*" >&2; exit 64 ;;
 esac
 `;
@@ -69,6 +69,7 @@ function runStep({
   commits = meta(['jsdom', 'direct:development']),
   allowMajor = false,
   holdProduction = true,
+  env: extra = {},
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'dependabot-merge-'));
   try {
@@ -94,6 +95,7 @@ function runStep({
         FAKE_PR: JSON.stringify({ number: 77, author: { login: author }, headRefOid: SHA, title, body }),
         FAKE_COMMIT_BODIES: commits,
         FAKE_LOG: log,
+        ...extra,
       },
     });
     return {
@@ -401,4 +403,94 @@ test('no digest for a non-npm update or a missing PR number', () => {
   const none = runDigest({ number: '' });
   assert.equal(none.status, 0, none.out);
   assert.equal(none.comment, '');
+});
+
+// ------------------------------------------------------------ the family App
+//
+// Since 2026-11-02 GitHub refuses every merge the default token makes under
+// the family branch protection. Where the repo holds the family GitHub App's
+// two secrets the merge is made as the App, with the same token land-bot-pr
+// mints. The private key can mint a token for every repo the App is
+// installed on, so where it may appear and what the token may do are pinned.
+
+const JOB = WF.jobs.merge;
+const APP_CHECK = JOB.steps.find((s) => /half-configured family App/.test(s.name || ''));
+const MINT = JOB.steps.find((s) => s.id === 'app');
+const LAND = parse(readFileSync(join(ROOT, '.github', 'actions', 'land-bot-pr', 'action.yml'), 'utf8'));
+const LAND_MINT = LAND.runs.steps.find((s) => s.id === 'app');
+
+// The step conditions, evaluated as GitHub does for these shapes: the job env
+// holds 'true' / 'false' strings, compared as strings.
+const evalIf = (expr, env) => Function('env', `"use strict"; return (${expr.replace(/==/g, '===').replace(/!===/g, '!==').replace(/'([^']*)'/g, (_, v) => JSON.stringify(v))});`)(env);
+
+test("the family App's secrets are optional, and only their presence reaches a condition", () => {
+  const secrets = WF.on.workflow_call.secrets;
+  assert.deepEqual(Object.keys(secrets).sort(), ['FAMILY_BOT_APP_ID', 'FAMILY_BOT_PRIVATE_KEY']);
+  for (const [name, sec] of Object.entries(secrets)) assert.equal(sec.required, false, `${name} must be optional`);
+  assert.deepEqual(JOB.env, {
+    FAMILY_APP_ID_SET: "${{ secrets.FAMILY_BOT_APP_ID != '' }}",
+    FAMILY_APP_KEY_SET: "${{ secrets.FAMILY_BOT_PRIVATE_KEY != '' }}",
+  }, 'the job env carries whether each secret is set, never its value');
+  const cases = [
+    { id: 'false', key: 'false', check: false, mint: false },
+    { id: 'true', key: 'true', check: false, mint: true },
+    { id: 'true', key: 'false', check: true, mint: false },
+    { id: 'false', key: 'true', check: true, mint: false },
+  ];
+  for (const c of cases) {
+    const env = { FAMILY_APP_ID_SET: c.id, FAMILY_APP_KEY_SET: c.key };
+    assert.equal(evalIf(APP_CHECK.if, env), c.check, `half-config guard for ${JSON.stringify(env)}`);
+    assert.equal(evalIf(MINT.if, env), c.mint, `mint for ${JSON.stringify(env)}`);
+  }
+  const r = spawnSync('bash', ['-c', APP_CHECK.run], { encoding: 'utf8' });
+  assert.equal(r.status, 1, 'half a configuration fails the job');
+  assert.match(r.stdout, /^::error::.*FAMILY_BOT_APP_ID.*FAMILY_BOT_PRIVATE_KEY/m);
+  const order = JOB.steps.map((s) => s.id || s.name);
+  assert.ok(order.indexOf(APP_CHECK.id || APP_CHECK.name) < order.indexOf('app') && order.indexOf('app') < order.indexOf('merge'), 'guard, then mint, then merge');
+});
+
+test("the merge's token is land-bot-pr's token: this repo only, contents and pull-requests write, nothing more", () => {
+  assert.equal(MINT.uses, LAND_MINT.uses);
+  assert.equal(MINT.uses, 'actions/create-github-app-token@v3');
+  const normalise = (w) => JSON.stringify(w)
+    .replace('${{ secrets.FAMILY_BOT_APP_ID }}', 'ID').replace('${{ inputs.app-id }}', 'ID')
+    .replace('${{ secrets.FAMILY_BOT_PRIVATE_KEY }}', 'KEY').replace('${{ inputs.app-private-key }}', 'KEY');
+  assert.equal(normalise(MINT.with), normalise(LAND_MINT.with), 'the two mints must ask for the same token');
+  assert.deepEqual(Object.keys(MINT.with).sort(), ['client-id', 'permission-contents', 'permission-pull-requests', 'private-key']);
+});
+
+test('the key reaches the mint step and nothing else, in a job that runs nothing from the repository', () => {
+  const naming = JOB.steps.filter((s) => /secrets\.FAMILY_BOT_PRIVATE_KEY/.test(JSON.stringify(s))).map((s) => s.id);
+  assert.deepEqual(naming, ['app']);
+  for (const s of JOB.steps) {
+    assert.doesNotMatch(JSON.stringify(s.env ?? {}), /secrets\./, `"${s.name}" puts a secret in a shell's environment`);
+    assert.ok(!s.uses || s.uses === 'actions/create-github-app-token@v3', `"${s.name}" uses ${s.uses}: this job runs no other action`);
+    assert.doesNotMatch(String(s.run ?? ''), /\bnpm (ci|install|i|run|exec|test)\b|\bnpx\b|actions\/checkout/, `"${s.name}" runs code from the repository`);
+  }
+  assert.equal(STEP.env.GH_TOKEN, '${{ steps.app.outputs.token || github.token }}', 'the merge uses the App when it was minted');
+  assert.equal(STEP.env.IDENTITY, "${{ steps.app.outcome == 'success' && 'app' || 'default' }}");
+  assert.equal(DIGEST.env.GH_TOKEN, '${{ github.token }}', 'the digest comment keeps the default token');
+});
+
+test('the merge says which identity made it, and a refusal says why', () => {
+  const asApp = runStep({ commits: meta(['jsdom', 'direct:development']), env: { IDENTITY: 'app' } });
+  assert.equal(asApp.status, 0, asApp.out);
+  assert.match(asApp.out, /^Merged Dependabot PR #77\nMerged as the family App\.$/m);
+  const asDefault = runStep({ commits: meta(['jsdom', 'direct:development']), env: { IDENTITY: 'default' } });
+  assert.match(asDefault.out, /Merged with the default token: no family App secrets reached this workflow\./);
+  const refusedApp = runStep({ commits: meta(['jsdom', 'direct:development']), env: { IDENTITY: 'app', FAKE_MERGE_EXIT: '1' } });
+  assert.equal(refusedApp.status, 1);
+  assert.match(refusedApp.out, /::error::The family App's merge of Dependabot PR #77 was refused/);
+  assert.doesNotMatch(refusedApp.out, /^Merged/m);
+  const refusedDefault = runStep({ commits: meta(['jsdom', 'direct:development']), env: { IDENTITY: 'default', FAKE_MERGE_EXIT: '1' } });
+  assert.equal(refusedDefault.status, 1);
+  assert.match(refusedDefault.out, /::error::.*no family App secrets reached this workflow.*FAMILY_BOT_APP_ID and FAMILY_BOT_PRIVATE_KEY/);
+});
+
+test("this repo's own caller passes the two secrets by name", () => {
+  const self = parse(readFileSync(join(ROOT, '.github', 'workflows', 'dependabot-merge-self.yml'), 'utf8'));
+  assert.deepEqual(self.jobs.merge.secrets, {
+    FAMILY_BOT_APP_ID: '${{ secrets.FAMILY_BOT_APP_ID }}',
+    FAMILY_BOT_PRIVATE_KEY: '${{ secrets.FAMILY_BOT_PRIVATE_KEY }}',
+  });
 });
