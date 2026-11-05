@@ -14,3 +14,8 @@ permissions:
 jobs:
   merge:
     uses: ./.github/workflows/dependabot-merge.yml
+    # The family App's two secrets, by name: with both, the merge is made as
+    # the App, the one identity the branch protection lets merge.
+    secrets:
+      FAMILY_BOT_APP_ID: ${{ secrets.FAMILY_BOT_APP_ID }}
+      FAMILY_BOT_PRIVATE_KEY: ${{ secrets.FAMILY_BOT_PRIVATE_KEY }}
