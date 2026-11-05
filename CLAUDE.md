@@ -112,18 +112,20 @@ exists, so a kit caller — which bumps no version — simply no-ops. With
 `auto-merge: false` nothing is skipped that matters: a human's merge fires CI
 and the ordinary gated path tags it.
 
-**The bump commit is signed, because branch protection requires it**
-(since 2026-11-05). Every family `main` also requires signed commits for
-anyone but an admin. A commit made with git on the runner is unsigned, so
-Netlify-kit #58, the first bump after protection went on, read `blocked` with
-both required checks green, and `gh pr merge` was refused with "the base
-branch policy prohibits the merge". A signed session commit with no review
-read `clean` beside it (market-monitor #479), which is what ruled out a
-required approval. The PR step passes `sign-commits: true`, so
-create-pull-request makes the commit through the GitHub API with the default
-token and GitHub signs it as `github-actions[bot]`. It needs the default
-token (a PAT makes unsigned commits), ignores `author` / `committer`, and
-refuses a file over 40 MiB. `test/workflows.test.mjs` holds it.
+**Under the current branch protection the bump cannot merge its own PR.**
+Protection went on every family `main` on 2026-11-02, requiring the two
+`family-ci` checks with admins exempt, and every bot merge since has been
+refused with "the base branch policy prohibits the merge". That includes
+Netlify-kit #59 on 2026-11-05: a signed commit and both required checks
+green on its head from the dispatched run. A PR opened by a session as the
+owner, with no review, reads `clean` in the same repos. Each bot PR also
+carries a `pull_request` CI run started by `github-actions[bot]` that waits
+for approval and runs no jobs. The rule that refuses the merge is not
+readable from a session. It is FAM-1 (b)'s open half, a bot identity whose
+PRs fire CI and may merge, and it is the owner's (MAINTENANCE.md). Until
+then a session or the owner merges a green bump PR, as on 2026-11-05. The
+PR step still passes `sign-commits: true`, so a signature rule is never
+the blocker, and `test/workflows.test.mjs` holds it.
 
 **The bump PR is merged only on a green CI run of its own head commit**
 (since 2026-11-02). Every family `main` is branch-protected and requires the

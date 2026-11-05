@@ -428,14 +428,16 @@ jobs:
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           token: ${{ github.token }}
-          # Every family main requires signed commits for anyone but an
-          # admin. A commit made with git on the runner is unsigned, so its
-          # PR read `blocked` with both required checks green, and the merge
-          # was refused: "the base branch policy prohibits the merge"
-          # (Netlify-kit #58, 2026-11-02, the first bump after protection
-          # went on). sign-commits makes the commit through the GitHub API
-          # with the default token, which GitHub signs as github-actions[bot].
-          # It ignores author/committer, and refuses a file over 40 MiB.
+          # Signed, so a commit-signature rule can never be what refuses the
+          # merge: create-pull-request makes the commit through the GitHub
+          # API with the default token, which GitHub signs as
+          # github-actions[bot] (it ignores author/committer, refuses a file
+          # over 40 MiB). It is NOT enough on its own. Netlify-kit #59
+          # (2026-11-05) was signed with both required checks green on its
+          # head and was still refused: "the base branch policy prohibits the
+          # merge". Under the current protection a bot PR is merged by a
+          # session or the owner until FAM-1 (b)'s bot identity exists (this
+          # repo's MAINTENANCE.md).
           sign-commits: true
           branch: auto/kit-pin-bump
           commit-message: "Bump @jfs kit pins to current HEADs; re-vendor"
