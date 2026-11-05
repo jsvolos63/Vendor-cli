@@ -476,8 +476,8 @@ jobs:
             and merges only once that run is green on the head commit — the
             run whose checks branch protection reads. (A PR opened with the
             default GITHUB_TOKEN triggers no pull_request CI; one opened by
-            the family App does, and the merge still waits for the
-            dispatched run.)
+            the family App does, and the merge waits for that run to
+            finish as well, because branch protection reads its checks too.)
 
             ${{ inputs.pr-body-extra }}
           ci-workflow: ${{ inputs.ci-workflow }}

@@ -132,8 +132,15 @@ mints an installation token for that one repository with `contents` and
 token. A repo without the secrets keeps the default token, and a session or
 the owner merges its green bump PR. A repo with only one of the two fails the
 run before anything is opened. The CI dispatch always uses the default token.
-An App-opened PR also fires `pull_request` CI and its merge fires CI on main,
-and neither changes what the merge waits for. **The private key goes only to a
+An App-opened PR's merge fires CI on main, and its push also fires
+`pull_request` CI on the same head commit. That run's check runs carry the same
+names as the dispatched run's, so branch protection reads the required checks
+as pending until it finishes too. So under the App the merge waits for every
+run of the CI workflow on the head, while the dispatched run's result still
+decides whether to merge at all. Weather #178 is why: its merge came seconds
+after the dispatched run went green and seconds before the `pull_request` run
+did, and it was refused with the same "base branch policy" message.
+**The private key goes only to a
 job that has run nothing from the repository**: it can mint a token for every
 repo the App is installed on, and a step earlier in the same job can rewrite
 the action on the runner's disk. `test/workflows.test.mjs` holds that for the

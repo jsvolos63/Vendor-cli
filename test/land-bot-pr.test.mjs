@@ -103,6 +103,7 @@ test('the CI step sits between the PR and the merge, and the bump job may dispat
   const cpr = STEPS.find((s) => s.id === 'cpr');
   assert.equal(CI.env.BRANCH, '${{ inputs.branch }}', 'CI runs on the branch create-pull-request pushes');
   assert.equal(cpr.with.branch, CI.env.BRANCH);
+  assert.equal(CI.env.IDENTITY, '${{ steps.identity.outputs.identity }}', 'the wait for pull_request CI depends on who opened the PR');
   assert.equal(MERGE.env.CI_GREEN, '${{ steps.ci.outputs.green }}');
   assert.equal(MERGE.env.HEAD_SHA, '${{ steps.ci.outputs.head-sha }}');
   assert.match(MERGE.run, /gh pr merge --squash --delete-branch --match-head-commit "\$HEAD_SHA" "\$PR_URL"/);
@@ -159,6 +160,54 @@ test('an older run on the same commit is not mistaken for this dispatch', { skip
   const r = runCi({ runs: [[old], [old, run(6, 'in_progress')], [old, run(6, 'completed', 'success')]] });
   assert.equal(r.status, 0, r.out);
   assert.equal(r.outputs.green, 'true');
+});
+
+// An App-opened PR fires pull_request CI on the same head as the dispatched
+// run, with check runs of the same names, so branch protection reads the
+// required checks as pending until both finish. Weather #178: the dispatched
+// run went green, the merge came 3 seconds later, the pull_request run was
+// still running and the merge was refused. A re-run with one run on the head
+// merged, under the same branch protection.
+const DISPATCHED = () => run(7, 'completed', 'success');
+const count = (r) => (r.log.match(/^api /gm) || []).length;
+
+test('an App-opened PR is not called green until every CI run on its head has finished', { skip: !hasJq && 'jq not installed' }, () => {
+  const r = runCi({ runs: [[DISPATCHED()], [DISPATCHED(), run(8, 'in_progress')], [DISPATCHED(), run(8, 'in_progress')], [DISPATCHED(), run(8, 'completed', 'success')]] }, { IDENTITY: 'app' });
+  assert.equal(r.status, 0, r.out);
+  assert.equal(count(r), 4, 'it read the head until nothing was unfinished');
+  assert.match(r.log, new RegExp(`runs\\?head_sha=${HEAD}&per_page=20$`, 'm'), 'the second read has no event filter, or it could not see the pull_request run');
+  assert.deepEqual(r.outputs, { 'head-sha': HEAD, green: 'true' });
+});
+
+test('a pull_request run that never finishes is a red step under the App, and a warning under soft-fail', { skip: !hasJq && 'jq not installed' }, () => {
+  const stuck = { runs: [[DISPATCHED()], [DISPATCHED(), run(8, 'in_progress')]] };
+  const r = runCi(stuck, { IDENTITY: 'app', WAIT_MINUTES: '0' });
+  assert.equal(r.status, 1, r.out);
+  assert.match(r.out, /::error::Another CI run \(ci\.yml\).*did not finish within 0 minutes \(last seen: in_progress, .*runs\/8\).*left open/);
+  assert.equal(r.outputs.green, undefined, 'never green while a run on the head is unfinished');
+  const soft = runCi(stuck, { IDENTITY: 'app', WAIT_MINUTES: '0', SOFT_FAIL: 'true' });
+  assert.equal(soft.status, 0, soft.out);
+  assert.match(soft.out, /::warning::Another CI run/);
+  assert.equal(soft.outputs.green, 'false');
+});
+
+test('the default token does not wait for a pull_request run, which only an approval would start', { skip: !hasJq && 'jq not installed' }, () => {
+  // The dispatched run sorts last, as it would be the only one the real
+  // event-filtered read returns.
+  const parked = [run(8, 'queued', null, ago(10)), DISPATCHED()];
+  for (const IDENTITY of ['default', '']) {
+    const r = runCi({ runs: [parked] }, { IDENTITY });
+    assert.equal(r.status, 0, r.out);
+    assert.equal(count(r), 1, 'one read of the dispatched run and no more');
+    assert.equal(r.outputs.green, 'true');
+  }
+});
+
+test('a red dispatched run ends it under the App too, with no wait for anything else', { skip: !hasJq && 'jq not installed' }, () => {
+  const r = runCi({ runs: [[run(7, 'completed', 'failure')], [run(8, 'in_progress')]] }, { IDENTITY: 'app' });
+  assert.equal(r.status, 1, r.out);
+  assert.equal(count(r), 1);
+  assert.equal(r.outputs.green, undefined);
 });
 
 test('with auto-merge off it dispatches (so a human finds the checks) and does not wait', () => {

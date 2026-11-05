@@ -201,8 +201,9 @@ runs:
         # token's bot (github-actions[bot], or the App's bot; it ignores author
         # / committer, and refuses a file over 40 MiB). A push made with the
         # App's token also fires the repo's pull_request CI, which the default
-        # token's never did; the dispatch below still runs and is what the
-        # merge waits for.
+        # token's never did. The dispatch below still runs and its result is
+        # what decides the merge, but the merge also waits for this run to
+        # finish, because branch protection reads its checks too.
         sign-commits: true
         branch: ${{ inputs.branch }}
         add-paths: ${{ inputs.add-paths }}
@@ -234,6 +235,7 @@ runs:
         WAIT_MINUTES: ${{ inputs.ci-wait-minutes }}
         AUTO_MERGE: ${{ inputs.auto-merge }}
         SOFT_FAIL: ${{ inputs.soft-fail }}
+        IDENTITY: ${{ steps.identity.outputs.identity }}
         POLL_SECONDS: '20'
       run: |
         set -euo pipefail
@@ -288,6 +290,33 @@ runs:
         conclusion=$(cut -f3 <<<"$run")
         url=$(cut -f4 <<<"$run")
         if [ "$conclusion" = "success" ]; then
+          # An App-opened PR's push also fired pull_request CI on this commit.
+          # Its check runs carry the same names as this run's, so branch
+          # protection reads the required checks as pending until it finishes
+          # too, and gh refuses the merge however green this run is. Weather
+          # #178 lost that race by seconds with both runs on their way to
+          # green; Netlify-kit #63 won it on the luck of a 20-second poll. No
+          # event filter and no `since`, because any unfinished run on this
+          # head holds the checks. Not for the default token: its PR has no
+          # such run, only one parked on an approval nobody gives.
+          if [ "${IDENTITY:-}" = "app" ]; then
+            while :; do
+              busy=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$wf/runs?head_sha=$head&per_page=20" \
+                       --jq "[.workflow_runs[] | select(.status != \"completed\")] | sort_by(.created_at) | last | select(. != null) | [.status, .html_url] | @tsv")
+              if [ -z "$busy" ]; then break; fi
+              echo "Waiting for another CI run on $head: $(cut -f2 <<<"$busy")"
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                msg="Another CI run ($wf) on $BRANCH's head commit did not finish within $WAIT_MINUTES minutes (last seen: $(cut -f1 <<<"$busy"), $(cut -f2 <<<"$busy")). Branch protection reads its checks too, so $PR_URL is left open."
+                if [ "$SOFT_FAIL" = "true" ]; then echo "::warning::$msg"; echo "green=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+                echo "::error::$msg"
+                exit 1
+              fi
+              sleep "$POLL_SECONDS"
+            done
+            # One more poll's worth of time for GitHub to recompute the PR's
+            # merge state from the checks that just finished.
+            sleep "$POLL_SECONDS"
+          fi
           echo "green=true" >> "$GITHUB_OUTPUT"
           echo "CI passed on $head: $url"
           exit 0
