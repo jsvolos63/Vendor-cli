@@ -568,10 +568,19 @@ labels ride on the pulls list payload, so there is no new endpoint. A family
 whose only open business is recorded holds exits 0. The label is how a session
 SAYS a PR is held; the record is what the monitor checks.
 
-`.github/workflows/family-liveness.yml` runs it Mondays 08:10 UTC and on the
-2nd of each month at 08:10 — ~90 minutes after the monthly 06:41 bump, so it
-observes THIS month's run the same morning —
-and opens ONE rolling issue here when something needs a session. One issue in
+`.github/workflows/family-liveness.yml` runs it daily at 08:10 UTC (since
+2026-11-05; it was Mondays and the 2nd, and weekly left the Bears refreshes
+stuck from a Tuesday with nothing due to say so until the next Monday). 08:10
+is ~90 minutes after the monthly 06:41 bump, so the 2nd's run observes that
+month's bump the same morning. Daily is not a daily comment: the report ends
+in a fingerprint of its findings, built from stable keys rather than the
+wording (which carries ages), and the issue step comments only when it
+differs from the last report's or that report is a week old. Question 4 also
+asks whether any open PR, bot or person, has been green and mergeable on its
+head for over 24 hours and is still open (`readyPulls`): finished work nobody
+landed, which is what market-monitor #479 was for three days. A recorded
+hold mutes it, on the same two conditions as below. The workflow opens ONE
+rolling issue here when something needs a session. One issue in
 the hub rather than a notification in thirteen repos: per-repo notifications
 would need an `issues: write` grant in each, and the notifier's own failure
 would be silent. The run itself also goes red, because a green run with an

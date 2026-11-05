@@ -18,6 +18,7 @@ const SCRIPT = join(ROOT, 'tools', 'family-liveness.mjs');
 const {
   newestScheduledPerWorkflow, parseKitPins, renderMarkdown, redOnDefaultBranch, pullHealth, isRed, autoBranchNames,
   workflowInventory, judgedWorkflows, isHeldLabel, recordsPull, triageBotPulls, heldAcross, HOLD_LABEL,
+  readyPulls, findingsFingerprint, READY_PR_HOURS,
   pinVerdict, pinLag, BUMP_WORKFLOW,
 } =
   await import(pathToFileURL(SCRIPT));
@@ -279,18 +280,90 @@ test('an open PR is red when its newest run of any workflow failed, and conflict
     headRun('dependabot-merge.yml', 'Dependabot merge', '2026-09-22T10:05:00Z', 'skipped'),
     headRun('other.yml', 'Still running', '2026-09-22T10:06:00Z', null, 'in_progress'),
   ];
-  assert.deepEqual(pullHealth({ mergeable_state: 'clean' }, runs), { red: ['CI'], conflicted: false });
+  const rc = (h) => ({ red: h.red, conflicted: h.conflicted });
+  assert.deepEqual(rc(pullHealth({ mergeable_state: 'clean' }, runs)), { red: ['CI'], conflicted: false });
   // A later green run of the SAME workflow (a re-run, a dispatch) clears it.
   assert.deepEqual(
-    pullHealth({ mergeable_state: 'clean' }, [...runs, headRun('ci.yml', 'CI', '2026-09-22T11:00:00Z', 'success')]),
+    rc(pullHealth({ mergeable_state: 'clean' }, [...runs, headRun('ci.yml', 'CI', '2026-09-22T11:00:00Z', 'success')])),
     { red: [], conflicted: false }
   );
-  assert.deepEqual(pullHealth({ mergeable_state: 'dirty' }, []), { red: [], conflicted: true });
+  assert.deepEqual(rc(pullHealth({ mergeable_state: 'dirty' }, [])), { red: [], conflicted: true });
   // GitHub computes mergeability lazily; `unknown` is not a conflict.
-  assert.deepEqual(pullHealth({ mergeable_state: 'unknown' }, [headRun('ci.yml', 'CI', '2026-09-22T10:00:00Z', 'success')]), {
+  assert.deepEqual(rc(pullHealth({ mergeable_state: 'unknown' }, [headRun('ci.yml', 'CI', '2026-09-22T10:00:00Z', 'success')])), {
     red: [],
     conflicted: false,
   });
+});
+
+test('a PR is green only when every workflow\'s newest run on its head finished clean and one succeeded', () => {
+  const r = (path, started, conclusion, { status = 'completed', updated = started } = {}) => ({
+    path: `.github/workflows/${path}`, name: path, run_started_at: started, updated_at: updated, status, conclusion,
+  });
+  // The shape of every bot PR under the 2026-11 protection: its own
+  // pull_request run waits for approval (action_required), and the dispatched
+  // run beside it, newer, succeeded. Green, since the last run finished.
+  const bot = [
+    r('ci.yml', '2026-11-05T04:00:00Z', 'action_required'),
+    r('ci.yml', '2026-11-05T04:01:00Z', 'success', { updated: '2026-11-05T04:03:00Z' }),
+    r('dependabot-merge.yml', '2026-11-05T04:03:30Z', 'skipped', { updated: '2026-11-05T04:03:40Z' }),
+  ];
+  assert.deepEqual(pullHealth({ mergeable_state: 'blocked' }, bot), {
+    red: [], conflicted: false, green: true, greenSince: '2026-11-05T04:03:40Z',
+  });
+  // The waiting run alone is not green: nothing passed.
+  assert.equal(pullHealth({}, [bot[0]]).green, false);
+  // Anything still running holds it back, whatever finished before.
+  assert.equal(pullHealth({}, [...bot, r('ci.yml', '2026-11-05T05:00:00Z', null, { status: 'in_progress' })]).green, false);
+  // Red or conflicted is never green.
+  assert.equal(pullHealth({}, [...bot, r('lint.yml', '2026-11-05T04:02:00Z', 'failure')]).green, false);
+  assert.equal(pullHealth({ mergeable_state: 'dirty' }, bot).green, false);
+  assert.equal(pullHealth({}, []).green, false, 'no runs at all is not green');
+  assert.equal(pullHealth({}, [bot[0]]).greenSince, null);
+});
+
+test('a PR is ready-and-left-open once green for a day, bot or person, unless held on the record', () => {
+  const now = Date.parse('2026-11-06T12:00:00Z');
+  const since = (h) => new Date(now - h * 3_600_000).toISOString();
+  const health = new Map([
+    [1, { red: [], conflicted: false, green: true, greenSince: since(READY_PR_HOURS + 1) }],
+    [2, { red: [], conflicted: false, green: true, greenSince: since(READY_PR_HOURS - 1) }],
+    [3, { red: [], conflicted: false, green: true, greenSince: since(72) }],
+    [4, { red: [], conflicted: false, green: true, greenSince: since(72) }],
+    [5, { red: [], conflicted: false, green: true, greenSince: since(72) }],
+    [6, { red: ['CI'], conflicted: false, green: false, greenSince: null }],
+    [7, { red: [], conflicted: false, green: true, greenSince: since(72) }],
+  ]);
+  const pulls = [
+    { ...pr(1, { bot: false }) },
+    { ...pr(2, { bot: false }) },
+    { ...pr(3, { bot: true }) },
+    { ...pr(4, { bot: false, labels: ['hold'] }) },
+    { ...pr(5, { bot: false, labels: ['hold'] }) },
+    { ...pr(6, { bot: true }) },
+    { ...pr(7, { bot: false }), draft: true },
+    { ...pr(8, { bot: false }) }, // its verdict could not be read
+  ];
+  const doc = 'The owner is reviewing #4 by hand.';
+  const out = readyPulls(pulls, health, doc, now);
+  assert.deepEqual(out.map((p) => p.number), [1, 3, 5]);
+  assert.equal(Math.round(out[0].hours), READY_PR_HOURS + 1);
+  assert.equal(out[1].bot, true);
+  // #5's label has no record behind it, and an unread record mutes nothing.
+  assert.deepEqual(readyPulls(pulls, health, null, now).map((p) => p.number), [1, 3, 4, 5]);
+});
+
+test('the fingerprint is the set of finding keys, not their wording, order or repeats', () => {
+  const a = findingsFingerprint(['Weather|ready-pr|9', 'BearsMockDraft|scheduled|refresh-schedule.yml|failure']);
+  assert.match(a, /^[0-9a-f]{16}$/);
+  assert.equal(findingsFingerprint(['BearsMockDraft|scheduled|refresh-schedule.yml|failure', 'Weather|ready-pr|9', 'Weather|ready-pr|9']), a);
+  assert.notEqual(findingsFingerprint(['Weather|ready-pr|9']), a, 'a finding gone is news');
+  assert.notEqual(findingsFingerprint(['Weather|ready-pr|9', 'BearsMockDraft|scheduled|refresh-schedule.yml|success']), a);
+  // Could-not-check counts by repo, not by its error text, which varies.
+  assert.equal(
+    findingsFingerprint([], ['pwa-kit: HTTP 502 on /repos/x']),
+    findingsFingerprint([], ['pwa-kit: fetch failed after 30000 ms'])
+  );
+  assert.notEqual(findingsFingerprint([], ['pwa-kit: x']), findingsFingerprint([]));
 });
 
 test('the report carries the default-branch and bot-PR columns, and tolerates rows without them', () => {
@@ -929,4 +1002,68 @@ test('the report marks a scheduled workflow whose newest run was a dispatch', ()
     },
   ]);
   assert.match(md, /\| JFS-Sports \| kit-pin-bump ✓ \(dispatch\) \|/);
+});
+
+// End to end: a finished PR nobody merged. market-monitor #479 sat green and
+// mergeable for three days (2026-11-02 to 11-05) before anything said so.
+const WEATHER = '/repos/jsvolos63/Weather';
+function readyPr({ user = { login: 'jsvolos63', type: 'User' }, labels = [], greenHoursAgo = 30, ageDays = 3, doc = null } = {}) {
+  const done = new Date(Date.now() - greenHoursAgo * 3_600_000).toISOString();
+  return {
+    [`${WEATHER}/pulls?`]: {
+      body: [{
+        number: 479, title: 'Remove the AI ANALYSIS button', head: { ref: 'remove-ai', sha: 'c'.repeat(40) }, user,
+        created_at: new Date(Date.now() - ageDays * 86_400_000).toISOString(), html_url: 'https://example.invalid/479',
+        labels: labels.map((name) => ({ name })),
+      }],
+    },
+    [`${WEATHER}/pulls/479`]: { body: { mergeable_state: 'clean' } },
+    [`${WEATHER}/actions/runs?head_sha=`]: {
+      body: { workflow_runs: [{ ...branchRun('ci.yml', 'pull_request', done, 'success'), name: 'CI', updated_at: done }] },
+    },
+    ...(doc ? { [`${WEATHER}/contents/MAINTENANCE.md`]: doc } : {}),
+  };
+}
+
+test('end to end: a person\'s PR green and mergeable for a day is reported, and a fresh one is not', () => {
+  const res = runStubbed(readyPr());
+  assert.equal(res.status, 1, res.stdout + res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.deepEqual(out.findingKeys, ['Weather|ready-pr|479']);
+  assert.match(out.findings[0], /^Weather: PR #479 "Remove the AI ANALYSIS button" has been green and mergeable for 30h and is still open/);
+  assert.doesNotMatch(out.findings[0], /a bot PR/);
+  const fresh = runStubbed(readyPr({ greenHoursAgo: 2 }));
+  assert.equal(fresh.status, 0, fresh.stdout + fresh.stderr);
+  // A person's PR that is not ready costs no MAINTENANCE.md read, label or not.
+  const labelledFresh = runStubbed(readyPr({ greenHoursAgo: 2, labels: ['hold'] }));
+  assert.equal(labelledFresh.requests.filter((r) => r.includes('/contents/MAINTENANCE.md')).length, 0);
+});
+
+test('end to end: a ready PR held on the record is quiet, and the record is read once', () => {
+  const res = runStubbed(readyPr({ labels: ['hold'], doc: maintenanceDocBody('Holding #479 for the owner.') }));
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  assert.equal(res.requests.filter((r) => r.includes('/contents/MAINTENANCE.md')).length, 1);
+  const unrecorded = runStubbed(readyPr({ labels: ['hold'], doc: maintenanceDocBody('Nothing held here.') }));
+  assert.equal(unrecorded.status, 1, 'a label with no record behind it mutes nothing');
+});
+
+test('end to end: a green bot PR a week old is reported as ready, not again as stale', () => {
+  const res = runStubbed(readyPr({ user: { login: 'github-actions[bot]', type: 'Bot' }, ageDays: 8 }));
+  assert.equal(res.status, 1, res.stdout + res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.deepEqual(out.findingKeys, ['Weather|ready-pr|479']);
+  assert.match(out.findings[0], /a bot PR: when its own merge is refused, a session or the owner merges it/);
+});
+
+test('end to end: the issue body carries a fingerprint that the ages in the findings do not move', () => {
+  const a = runStubbed(readyPr({ greenHoursAgo: 30 }), ['--markdown']);
+  const b = runStubbed(readyPr({ greenHoursAgo: 50 }), ['--markdown']);
+  const fp = (out) => (/<!-- liveness-fingerprint: ([0-9a-f]{16}) -->/.exec(out) || [])[1];
+  assert.ok(fp(a.stdout), a.stdout);
+  assert.notEqual(a.stdout, b.stdout, 'the wording moved (30h, 50h)');
+  assert.equal(fp(a.stdout), fp(b.stdout), 'the fingerprint did not');
+  assert.match(a.stdout, /\| green, left open \|/);
+  assert.match(a.stdout, /\| Weather \|.*\| #479 \|/);
+  const quiet = runStubbed({}, ['--markdown']);
+  assert.notEqual(fp(quiet.stdout), fp(a.stdout));
 });
