@@ -124,9 +124,16 @@ rule that refuses the merge is not readable from a session. So since 0.22.4
 the bump opens and merges its PR as the owner's GitHub App,
 `jsvolos63-family-bot`, installed on every family repo. FAM-1 (b)'s bot
 identity is that App. It was proven end to end the same day: Netlify-kit #63
-was opened and merged by `jsvolos63-family-bot[bot]` on green dispatched CI. A caller passes the repo secrets `FAMILY_BOT_APP_ID` and
-`FAMILY_BOT_PRIVATE_KEY` by name (never `secrets: inherit`), the workflow
-declares both optional, and only the `bump` job reads them. `land-bot-pr`
+was opened and merged by `jsvolos63-family-bot[bot]` on green dispatched CI. The two secrets, `FAMILY_BOT_APP_ID` and
+`FAMILY_BOT_PRIVATE_KEY`, live in each repo's `family-bot` ENVIRONMENT, whose
+deployment branch rule admits only the default branch (since 2026-11-05).
+As repository secrets they were readable by a workflow pushed to any branch,
+and the key mints write tokens for every family repo. A caller passes both
+by name (never `secrets: inherit`), the workflow declares both optional,
+and only the `bump` job reads them; it names the environment, so the
+environment's values win over any repository secret of the same name.
+`test/workflows.test.mjs` holds that exactly the two key-holding jobs here
+name it, and `prepare` never does. `land-bot-pr`
 mints an installation token for that one repository with `contents` and
 `pull-requests` write and nothing else. With no `workflows` permission, a
 `.github/workflows/` change stays unpushable, as it is under the default
@@ -477,8 +484,9 @@ is refused. One set fails the job. Both set mints the token. The key is safe
 in this job because the job runs nothing from the repository, only `gh` and
 `npm view`, and the tests hold that too. The digest comment keeps the default
 token. The callers' `workflow_run` trigger runs in the base repository's
-context, so the secrets are read from the repo's Actions secrets, not its
-Dependabot secrets. The step log names the identity it merged as, so a run
+context on the default branch, so the job reads the `family-bot`
+environment's secrets (which only the default branch may use), not the
+repo's Dependabot secrets. The step log names the identity it merged as, so a run
 that should have used the App and didn't says so. Every family repo with a
 Dependabot caller, this one included (`dependabot-merge-self.yml`), passes
 the two secrets.

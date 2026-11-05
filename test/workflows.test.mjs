@@ -676,3 +676,26 @@ esac
   // A report with no fingerprint (an old script) is always posted.
   assert.equal(go({ fp: 'nope', comments: [comment(FP, 1)] }).log, 'issue comment 60');
 });
+
+// The family App's key lives in each repo's `family-bot` environment, whose
+// deployment branch rule admits only the default branch: a REPOSITORY secret
+// is readable by a workflow pushed to any branch, and this key mints write
+// tokens for every family repo. A job reads environment secrets only when it
+// names the environment, so exactly the two jobs that hold the key name it,
+// and nothing that runs untrusted code does: an `environment:` on `prepare`
+// would hand the key to the code the read/write split keeps it away from.
+test('only the two jobs that hold the App key name the family-bot environment', () => {
+  const named = [];
+  for (const f of FILES) {
+    for (const [name, job] of Object.entries(wf(f).jobs || {})) {
+      if (job.environment !== undefined) named.push(`${f}:${name}=${JSON.stringify(job.environment)}`);
+    }
+  }
+  assert.deepEqual(named.sort(), ['dependabot-merge.yml:merge="family-bot"', 'kit-pin-bump.yml:bump="family-bot"']);
+  // Each of those jobs is the one that reads the two secrets.
+  for (const [f, job] of [['kit-pin-bump.yml', 'bump'], ['dependabot-merge.yml', 'merge']]) {
+    const jobs = wf(f).jobs;
+    const readers = Object.entries(jobs).filter(([, j]) => /secrets\.FAMILY_BOT_PRIVATE_KEY/.test(JSON.stringify(j))).map(([n]) => n);
+    assert.deepEqual(readers, [job], `${f}: the key is read by ${readers}, not by the job that names the environment`);
+  }
+});

@@ -411,6 +411,18 @@ jobs:
   # workflow, under that workflow's own (read-only) token.
   bump:
     needs: prepare
+    # The family App's key is read from the `family-bot` environment, not
+    # from repository secrets (2026-11-05). A repository secret is readable
+    # by any workflow on any branch of the repo: one pushed branch carrying
+    # a workflow that names FAMILY_BOT_PRIVATE_KEY would leak a key that
+    # mints write tokens for every family repo. The environment's deployment
+    # branch rule admits only the default branch, so its secrets reach only
+    # runs on it: the monthly schedule and a dispatch from main.
+    # An environment secret takes precedence over a repository secret of
+    # the same name, and the caller still passes both by name, so no caller
+    # changes. A repo whose environment does not exist yet gets an empty one
+    # on its first run and keeps its repository secrets until they move.
+    environment: family-bot
     if: needs.prepare.outputs.changed == 'true'
     runs-on: ubuntu-latest
     # The CI wait is bounded by ci-wait-minutes (default 40); this is the

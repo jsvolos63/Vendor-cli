@@ -150,7 +150,7 @@ runs:
       if: (inputs.app-id == '') != (inputs.app-private-key == '')
       shell: bash
       run: |
-        echo "::error::Only one of FAMILY_BOT_APP_ID and FAMILY_BOT_PRIVATE_KEY reached land-bot-pr. Set both as repository secrets (and pass both from the caller), or neither to keep the default token."
+        echo "::error::Only one of FAMILY_BOT_APP_ID and FAMILY_BOT_PRIVATE_KEY reached land-bot-pr. Set both in the repo's family-bot environment (and pass both from the caller), or neither to keep the default token."
         exit 1
 
     # First-party, so referenced by major tag (the family pinning policy).
