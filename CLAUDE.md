@@ -122,7 +122,8 @@ session as the owner, with no review, reads `clean` in the same repos. The
 rule that refuses the merge is not readable from a session. So since 0.22.4
 the bump opens and merges its PR as the owner's GitHub App,
 `jsvolos63-family-bot`, installed on every family repo. FAM-1 (b)'s bot
-identity is that App. A caller passes the repo secrets `FAMILY_BOT_APP_ID` and
+identity is that App. It was proven end to end the same day: Netlify-kit #63
+was opened and merged by `jsvolos63-family-bot[bot]` on green dispatched CI. A caller passes the repo secrets `FAMILY_BOT_APP_ID` and
 `FAMILY_BOT_PRIVATE_KEY` by name (never `secrets: inherit`), the workflow
 declares both optional, and only the `bump` job reads them. `land-bot-pr`
 mints an installation token for that one repository with `contents` and
