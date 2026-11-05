@@ -12,12 +12,19 @@
 # in thirteen repos: a notification per repo would need an `issues: write` grant
 # in each of them, and the failure of the notifier would itself be silent.
 #
-# Runs Mondays 08:10 UTC, and also on the 2nd of each month at 08:10 —
-# deliberately ~90 minutes after the monthly 06:41 kit-pin bump, so it
-# observes THIS month's bump the morning it runs rather than up to a week
-# later. The weekly run stays: the data crons, Dependabot PRs and the
-# red-branch checks do not wait for the bump. (The bump moved from Mondays to
-# the 2nd on 2026-11-01, the owner's monthly-cadence decision.)
+# Runs DAILY at 08:10 UTC (since 2026-11-05; it was Mondays and the 2nd).
+# Weekly left a mid-week break unreported for days: BearsMockDraft's data
+# refreshes stopped landing on Tuesday 2026-11-03 and the next run would have
+# said so the following Monday, and a green PR a session forgot to merge
+# (market-monitor #479) sat three days. 08:10 is still ~90 minutes after the
+# monthly 06:41 kit-pin bump on the 2nd, so that morning's run sees the bump.
+# It costs Actions minutes only, and ~200 API calls against a PAT's 5,000/hour.
+#
+# Daily does NOT mean a daily comment. The report carries a fingerprint of its
+# findings (stable keys, not the wording, which has ages in it), and the issue
+# step comments only when it differs from the last report's, or when that
+# report is a week old. The run is red every day something needs attention;
+# the issue says something new only when there is something new.
 #
 # NO `npm ci`. The script is dependency-free for exactly this reason: a broken
 # lockfile or a failed install must never be able to blind the monitor. Same
@@ -27,8 +34,7 @@ name: Family liveness
 
 on:
   schedule:
-    - cron: '10 8 * * 1'
-    - cron: '10 8 2 * *'
+    - cron: '10 8 * * *'
   workflow_dispatch:
 
 permissions:
@@ -75,6 +81,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           STATUS: ${{ steps.check.outputs.status }}
+          # A week, less a margin so the same weekday's run still posts: a
+          # report left standing is re-posted every seventh day.
+          REMIND_SECONDS: '561600'
         run: |
           set -euo pipefail
           title="Family automation liveness: attention needed"
@@ -90,12 +99,29 @@ jobs:
             fi
             cat report.md
           } > body.md
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --body-file body.md
-          else
+          if [ -z "$existing" ]; then
             gh issue create --title "$title" --body-file body.md
+            exit 0
           fi
-
+          # The fingerprint of this report, and of the newest report this job
+          # posted: its last comment carrying one, else the issue body.
+          marker='<!-- liveness-fingerprint: ([0-9a-f]{16}) -->'
+          fp=$(sed -nE "s/^${marker}\$/\\1/p" report.md | tail -1)
+          pick='[(.body | capture("<!-- liveness-fingerprint: (?<f>[0-9a-f]{16}) -->").f), .created_at] | @tsv'
+          last=$(gh api "repos/$GITHUB_REPOSITORY/issues/$existing/comments?per_page=100" --paginate \
+                   --jq ".[] | select(.user.login == \"github-actions[bot]\") | select((.body // \"\") | test(\"<!-- liveness-fingerprint: [0-9a-f]{16} -->\")) | $pick" | tail -1)
+          if [ -z "$last" ]; then
+            last=$(gh api "repos/$GITHUB_REPOSITORY/issues/$existing" \
+                     --jq "select((.body // \"\") | test(\"<!-- liveness-fingerprint: [0-9a-f]{16} -->\")) | $pick")
+          fi
+          last_fp=$(cut -f1 <<<"$last")
+          last_at=$(cut -f2 <<<"$last")
+          age=$(( $(date +%s) - $(date -d "${last_at:-1970-01-01T00:00:00Z}" +%s) ))
+          if [ -n "$fp" ] && [ "$fp" = "$last_fp" ] && [ "$age" -lt "$REMIND_SECONDS" ]; then
+            echo "Same findings as the report of $last_at (fingerprint $fp): no new comment until they change or a week passes. The run is still red."
+          else
+            gh issue comment "$existing" --body-file body.md
+          fi
       # A healthy run closes the rolling issue, so an OPEN issue always means
       # "a session is needed now". Nothing closed it before: once the family
       # was fixed, the last red report stood open as if it were current until

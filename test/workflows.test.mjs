@@ -25,10 +25,12 @@
 // and README's job list against the bins the package ships.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseDocument } from 'yaml';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const WF_DIR = join(ROOT, '.github', 'workflows');
@@ -523,4 +525,67 @@ test('kit-pin-bump carries BOTH canonical blocks, the MAINTENANCE.md one only wh
   const maint = steps.indexOf('Sync the MAINTENANCE.md family-maintenance block');
   const check = steps.indexOf("Run the repo's CI checks against the bumped tree");
   assert.ok(md >= 0 && maint > md && check > maint, 'both syncs must run, CLAUDE.md first (it installs the bumped CLI), before the checks');
+});
+
+// ------------------------------------------------------------------ the liveness issue
+
+test('family-liveness runs daily, and comments only when its findings change or a week has passed', { skip: spawnSync('jq', ['--version']).status !== 0 && 'jq not installed' }, () => {
+  // Daily since 2026-11-05: weekly left the Bears refreshes stuck from a
+  // Tuesday with the next report due the Monday after. Daily must not mean a
+  // daily comment, or the rolling issue becomes noise nobody reads.
+  const w = wf('family-liveness.yml');
+  assert.deepEqual(w.on.schedule, [{ cron: '10 8 * * *' }]);
+  const step = w.jobs.liveness.steps.find((s) => s.name === 'Open or update the liveness issue');
+  const FP = 'aaaaaaaaaaaaaaaa';
+  const fake = `#!/usr/bin/env bash
+case "$1 $2" in
+  "issue list") printf '%s\\n' "$FAKE_EXISTING" ;;
+  "issue create"|"issue comment") echo "$1 $2 $3" >> "$FAKE_LOG" ;;
+  api*)
+    q=''; url=''; while [ $# -gt 0 ]; do case "$1" in --jq) q="$2"; shift;; --paginate) ;; api) ;; *) url="$1";; esac; shift; done
+    case "$url" in *"/comments"*) f="$FAKE_COMMENTS";; *) f="$FAKE_ISSUE";; esac
+    jq -r "$q" "$f" ;;
+  *) echo "fake gh: unexpected: $*" >&2; exit 64 ;;
+esac
+`;
+  const iso = (daysAgo) => new Date(Date.now() - daysAgo * 86_400_000).toISOString().replace(/\.\d+Z$/, 'Z');
+  const report = (fp) => `## Family automation liveness — needs-attention\n\n- x\n\n<!-- liveness-fingerprint: ${fp} -->\n`;
+  const comment = (fp, daysAgo, login = 'github-actions[bot]') => ({ user: { login }, created_at: iso(daysAgo), body: report(fp) });
+  const go = ({ existing = '60', fp = FP, comments = [], issue = { body: 'old body', created_at: iso(40) } } = {}) => {
+    const dir = mkdtempSync(join(tmpdir(), 'liveness-issue-'));
+    try {
+      writeFileSync(join(dir, 'gh'), fake, { mode: 0o755 });
+      writeFileSync(join(dir, 'report.md'), report(fp));
+      writeFileSync(join(dir, 'comments.json'), JSON.stringify(comments));
+      writeFileSync(join(dir, 'issue.json'), JSON.stringify(issue));
+      const r = spawnSync('bash', ['-c', step.run], {
+        cwd: dir, encoding: 'utf8',
+        env: {
+          ...process.env, PATH: `${dir}:${process.env.PATH}`, STATUS: '1', REMIND_SECONDS: step.env.REMIND_SECONDS,
+          GITHUB_REPOSITORY: 'jsvolos63/vendor-cli', FAKE_EXISTING: existing, FAKE_LOG: join(dir, 'log'),
+          FAKE_COMMENTS: join(dir, 'comments.json'), FAKE_ISSUE: join(dir, 'issue.json'),
+        },
+      });
+      const log = existsSync(join(dir, 'log')) ? readFileSync(join(dir, 'log'), 'utf8').trim() : '';
+      return { status: r.status, out: r.stdout + r.stderr, log };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  assert.equal(go({ existing: '' }).log, 'issue create --title', 'no open issue: open one');
+  // Same findings as yesterday's report: quiet, and still a clean exit (the
+  // run is reddened by the step after this one).
+  const same = go({ comments: [comment('bbbbbbbbbbbbbbbb', 3), comment(FP, 1)] });
+  assert.equal(same.status, 0, same.out);
+  assert.equal(same.log, '');
+  assert.match(same.out, /no new comment until they change or a week passes/);
+  assert.equal(go({ comments: [comment(FP, 7)] }).log, 'issue comment 60', 'a week on, the same report is posted again');
+  assert.equal(go({ comments: [comment('bbbbbbbbbbbbbbbb', 0.1)] }).log, 'issue comment 60', 'new findings are news at once');
+  assert.equal(go({ comments: [comment(FP, 1), comment('bbbbbbbbbbbbbbbb', 0.5)] }).log, 'issue comment 60', 'the NEWEST report decides');
+  assert.equal(go({ comments: [comment(FP, 1, 'someone')] }).log, 'issue comment 60', 'only this job\'s own reports count');
+  assert.equal(go().log, 'issue comment 60', 'an issue with no fingerprinted report yet gets one');
+  // An issue this job opened yesterday carries the fingerprint in its body.
+  assert.equal(go({ issue: { body: report(FP), created_at: iso(1) } }).log, '');
+  // A report with no fingerprint (an old script) is always posted.
+  assert.equal(go({ fp: 'nope', comments: [comment(FP, 1)] }).log, 'issue comment 60');
 });

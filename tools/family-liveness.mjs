@@ -51,7 +51,16 @@
 //   4. Is any bot pull request stale, red, or conflicted? (Red is the other
 //      place a canonical-text edit shows first: every open Dependabot PR's
 //      CI fails its conventions check, and a red PR is one
-//      dependabot-merge.yml will never land.)
+//      dependabot-merge.yml will never land.) And is ANY open PR, bot or
+//      person, green and mergeable on its head for over READY_PR_HOURS and
+//      still open (readyPulls)? That is finished work nobody landed: a
+//      session that ended before its merge (market-monitor #479, three days,
+//      2026-11-02 to 11-05), or a bot PR whose own merge was refused.
+//
+// It runs daily, and the report ends in a fingerprint of its findings
+// (findingsFingerprint: stable keys, not the wording, which carries ages), so
+// family-liveness.yml comments on the issue only when the findings change or
+// a week has passed.
 //
 // A BOT PR HELD ON PURPOSE is not a finding for question 4 — but only on two
 // conditions at once, and never on a label alone. Some bot PRs are left open
@@ -103,6 +112,7 @@
 // only `node:` modules, and test/family-liveness.test.mjs holds this script's
 // whole import graph to that, so the no-install property below survives the
 // reuse.
+import { createHash } from 'node:crypto';
 import { splitDoc, invokedAsScript } from './maintenance-doc-check.mjs';
 
 const OWNER = 'jsvolos63';
@@ -139,6 +149,11 @@ const KIT_REPO_BY_PACKAGE = {
 };
 
 const STALE_PR_DAYS = 7;
+
+// A PR green on its head and mergeable for this long, and still open, is work
+// someone finished and nobody landed (market-monitor #479 sat three days that
+// way, 2026-11-02 to 11-05, with the owner's decision already made).
+export const READY_PR_HOURS = 24;
 
 // The label a session puts on a bot PR it is holding on purpose. It mutes
 // nothing by itself: see isHeldLabel / recordsPull / triageBotPulls.
@@ -370,14 +385,58 @@ export function redOnDefaultBranch(workflowRuns, now = NOW, existing = null) {
  *  could-not-check. */
 export function pullHealth(pull, headRuns) {
   const newest = new Map();
+  let pending = false;
   for (const run of headRuns || []) {
-    if (run.status !== 'completed') continue;
+    if (run.status !== 'completed') { pending = true; continue; }
     const key = run.path || run.name;
     const prev = newest.get(key);
     if (!prev || Date.parse(run.run_started_at) > Date.parse(prev.run_started_at)) newest.set(key, run);
   }
-  const red = [...newest.values()].filter((r) => isRed(r.conclusion)).map((r) => r.name || r.path);
-  return { red: [...new Set(red)].sort(), conflicted: pull?.mergeable_state === 'dirty' };
+  const finals = [...newest.values()];
+  const red = [...new Set(finals.filter((r) => isRed(r.conclusion)).map((r) => r.name || r.path))].sort();
+  const conflicted = pull?.mergeable_state === 'dirty';
+  // GREEN: every workflow's newest run on the head finished without failing,
+  // at least one of them succeeded, nothing is still running, and GitHub does
+  // not report a conflict. A bot PR's own pull_request run that waits for an
+  // approval nobody gives concludes `action_required`; it is neither red nor
+  // a success, and the dispatched run beside it decides. greenSince is when
+  // the last of those runs finished.
+  const green = !pending && !conflicted && !red.length && finals.some((r) => r.conclusion === 'success');
+  const greenSince = green
+    ? finals.map((r) => r.updated_at || r.run_started_at).filter(Boolean).sort().at(-1) || null
+    : null;
+  return { red, conflicted, green, greenSince };
+}
+
+/** The open PRs that are done and not landed: not drafts, green and mergeable
+ *  on their head (pullHealth) for more than READY_PR_HOURS, and not held on
+ *  purpose. Bot or person alike: a finished PR a session forgot to merge is
+ *  the same loose end as a bot PR whose own merge was refused. A hold mutes
+ *  it only on the same two conditions as everywhere else here: the label AND
+ *  a `#<number>` in the repo-specific half of MAINTENANCE.md (`doc`; null when
+ *  it was not read, which mutes nothing). */
+export function readyPulls(pulls, health = new Map(), doc = null, now = NOW) {
+  const out = [];
+  for (const p of pulls || []) {
+    if (p.draft) continue;
+    const h = health.get(p.number);
+    if (!h || !h.green || !h.greenSince) continue;
+    if (isHeldLabel(p.labels) && doc !== null && recordsPull(doc, p.number)) continue;
+    const hours = (now - Date.parse(h.greenSince)) / 3_600_000;
+    if (hours > READY_PR_HOURS) {
+      out.push({ number: p.number, title: p.title, url: p.url, bot: p.bot, labels: p.labels, hours });
+    }
+  }
+  return out;
+}
+
+/** A short, stable digest of what needs attention: the same findings on two
+ *  days give the same value, whatever the ages in their wording. The workflow
+ *  compares it with the last comment's and comments only when it changes, or
+ *  when a week has passed, so a daily run does not repeat itself daily. */
+export function findingsFingerprint(keys, unchecked = []) {
+  const all = [...keys, ...unchecked.map((u) => `could-not-check|${String(u).split(':')[0]}`)];
+  return createHash('sha256').update([...new Set(all)].sort().join('\n')).digest('hex').slice(0, 16);
 }
 
 async function botPullHealth(repo, p) {
@@ -559,8 +618,12 @@ async function main() {
   }
 
   const findings = [];
+  const findingKeys = [];
   const unchecked = [];
   const rows = [];
+  // Every finding carries a stable key (repo, kind, subject) beside its text,
+  // which has ages in it: findingsFingerprint() digests the keys.
+  const add = (key, text) => { findingKeys.push(key); findings.push(text); };
 
   let heads;
   try {
@@ -574,7 +637,7 @@ async function main() {
   for (const { repo, kind } of REPOS) {
     const row = {
       repo, kind, scheduled: [], disabled: [], redOnMain: [], stranded: [], stalePulls: [], badPulls: [], held: [],
-      unrecordedHolds: [], stalePins: [], unchecked: [],
+      unrecordedHolds: [], readyPulls: [], stalePins: [], unchecked: [],
     };
     try {
       const [branches, pulls, repoPins, meta, wfs] = await Promise.all([
@@ -594,7 +657,7 @@ async function main() {
       for (const r of runs) {
         if (r.conclusion !== 'success') {
           const how = r.event === 'workflow_dispatch' ? ' (its newest run, a dispatch)' : '';
-          findings.push(
+          add(`${repo}|scheduled|${r.workflow}|${r.conclusion}`,
             `${repo}: scheduled \`${r.workflow}\` last ran ${r.ageDays.toFixed(0)}d ago${how} and ` +
             `concluded **${r.conclusion}** — ${r.url}`
           );
@@ -603,7 +666,7 @@ async function main() {
 
       row.disabled = disabled;
       for (const w of disabled) {
-        findings.push(
+        add(`${repo}|disabled|${w}`,
           `${repo}: \`${w}\` has been DISABLED by GitHub for inactivity — it no longer runs at all, ` +
           'and its last run reads green for ever. Re-enable it on the Actions page.'
         );
@@ -614,7 +677,7 @@ async function main() {
       const redScheduled = new Set(runs.filter((r) => r.conclusion !== 'success').map((r) => r.workflow));
       row.redOnMain = redOnMain.filter((r) => !redScheduled.has(r.workflow));
       for (const r of row.redOnMain) {
-        findings.push(
+        add(`${repo}|red-on-default|${r.workflow}|${r.conclusion}`,
           `${repo}: \`${r.workflow}\` is red on ${meta.default_branch} — its newest ${r.event} run ` +
           `(${r.ageDays.toFixed(0)}d ago) concluded **${r.conclusion}** — ${r.url}`
         );
@@ -627,7 +690,7 @@ async function main() {
       const headsWithPr = new Set(pulls.map((p) => p.head));
       row.stranded = branches.filter((b) => !headsWithPr.has(b));
       for (const b of row.stranded) {
-        findings.push(
+        add(`${repo}|stranded|${b}`,
           `${repo}: branch \`${b}\` has been pushed with no open pull request — the automation ` +
           'committed work it could not deliver (check "Allow GitHub Actions to create and approve ' +
           'pull requests" in Settings > Actions > General).'
@@ -639,8 +702,11 @@ async function main() {
       // sign of a canonical-text edit here reddening the family. Held PRs
       // included — their state is shown beside them in the Held list.
       const bots = pulls.filter((q) => q.bot);
+      // Every bot PR, and every PR a person or session opened that is not a
+      // draft: the ready check below covers both.
+      const judged = pulls.filter((q) => q.bot || !q.draft);
       const health = new Map();
-      for (const p of bots) {
+      for (const p of judged) {
         // A verdict that cannot be read is recorded against that PR, and the
         // repo is still judged: every other question here needs only the list
         // payload, and a read failure must not take a stale PR's finding, a
@@ -651,7 +717,7 @@ async function main() {
           health.set(p.number, await botPullHealth(repo, p));
         } catch (e) {
           if (!(e instanceof CouldNotCheck)) throw e;
-          row.unchecked.push(`bot PR #${p.number}: ${e.message}`);
+          row.unchecked.push(`${p.bot ? 'bot ' : ''}PR #${p.number}: ${e.message}`);
         }
       }
 
@@ -659,7 +725,12 @@ async function main() {
       // once per repo. Its failure is recorded against this repo and the rest
       // of the repo is still checked; the labelled PRs are then judged as if
       // unlabelled, since nothing has confirmed the hold.
-      const labelled = bots.filter((p) => isHeldLabel(p.labels));
+      // A person's PR needs the record only when it is ready: a hold is the
+      // one thing that keeps a ready PR out of the report.
+      const labelled = [
+        ...bots.filter((p) => isHeldLabel(p.labels)),
+        ...readyPulls(pulls.filter((q) => !q.bot), health).filter((p) => isHeldLabel(p.labels)),
+      ];
       let doc = null;
       if (labelled.length) {
         try {
@@ -671,9 +742,20 @@ async function main() {
       }
       const triage = triageBotPulls(pulls, health, doc);
 
-      row.stalePulls = triage.stalePulls;
+      // Ready first: a green, mergeable PR left open is reported as that, and
+      // not again as merely stale.
+      row.readyPulls = readyPulls(pulls, health, doc);
+      for (const p of row.readyPulls) {
+        add(`${repo}|ready-pr|${p.number}`,
+          `${repo}: PR #${p.number} "${p.title}" has been green and mergeable for ${Math.floor(p.hours)}h and is ` +
+          `still open — merge it, or label it \`${HOLD_LABEL}\` and record why in MAINTENANCE.md` +
+          `${p.bot ? ' (a bot PR: when its own merge is refused, a session or the owner merges it)' : ''} — ${p.url}`
+        );
+      }
+      const ready = new Set(row.readyPulls.map((p) => p.number));
+      row.stalePulls = triage.stalePulls.filter((p) => !ready.has(p.number));
       for (const p of row.stalePulls) {
-        findings.push(`${repo}: bot PR #${p.number} "${p.title}" is ${p.ageDays.toFixed(0)}d old — ${p.url}`);
+        add(`${repo}|stale-pr|${p.number}`, `${repo}: bot PR #${p.number} "${p.title}" is ${p.ageDays.toFixed(0)}d old — ${p.url}`);
       }
 
       row.badPulls = triage.badPulls;
@@ -682,13 +764,13 @@ async function main() {
           p.red.length ? `red (${p.red.join(', ')})` : '',
           p.conflicted ? 'conflicted' : '',
         ].filter(Boolean).join(' and ');
-        findings.push(`${repo}: bot PR #${p.number} "${p.title}" is ${why} — ${p.url}`);
+        add(`${repo}|bad-pr|${p.number}|${why}`, `${repo}: bot PR #${p.number} "${p.title}" is ${why} — ${p.url}`);
       }
 
       row.held = triage.held;
       row.unrecordedHolds = triage.unrecorded.map((p) => p.number);
       for (const p of triage.unrecorded) {
-        findings.push(
+        add(`${repo}|unrecorded-hold|${p.number}`,
           `${repo}: bot PR #${p.number} "${p.title}" carries the \`${HOLD_LABEL}\` label but MAINTENANCE.md ` +
           `does not mention #${p.number} — held without a recorded reason. Record the hold (why, and what ` +
           `would lift it) in MAINTENANCE.md, or take the label off — ${p.url}`
@@ -717,7 +799,7 @@ async function main() {
               ? `, missing a commit from ${lag.oldestMissing.slice(0, 10)} that its kit-pin bump of ` +
                 `${bump.startedAt.slice(0, 10)} should have landed`
               : '';
-            findings.push(
+            add(`${repo}|stale-pin|${kit}`,
               `${repo}: \`@jfs/${kit}\` pin ${sha.slice(0, 7)} is ${lag.behind} commits behind ${kit}'s default branch${why}`
             );
           }
@@ -739,11 +821,12 @@ async function main() {
   // holds reads healthy and exits 0.
   const status = unchecked.length ? 'could-not-check' : findings.length ? 'needs-attention' : 'healthy';
   const held = heldAcross(rows);
+  const fingerprint = findingsFingerprint(findingKeys, unchecked);
 
   if (JSON_OUT) {
-    console.log(JSON.stringify({ status, findings, unchecked, held, repos: rows }, null, 2));
+    console.log(JSON.stringify({ status, fingerprint, findings, findingKeys, unchecked, held, repos: rows }, null, 2));
   } else if (MD_OUT) {
-    console.log(renderMarkdown(status, findings, unchecked, rows));
+    console.log(renderMarkdown(status, findings, unchecked, rows, fingerprint));
   } else {
     console.log(`jfs family liveness — ${REPOS.length} repos, ${status}\n`);
     for (const f of findings) console.log(`  ! ${f.replace(/[`*]/g, '')}`);
@@ -751,7 +834,7 @@ async function main() {
     for (const h of held) console.log(`  ~ held (recorded in MAINTENANCE.md) — ${heldLine(h)}`);
     if (!findings.length && !unchecked.length) {
       console.log(
-        '  every scheduled run green, no default branch red, no bot PR stale/red/conflicted' +
+        '  every scheduled run green, no default branch red, no bot PR stale/red/conflicted, no green PR left open' +
         (held.length ? ` but the ${held.length} held on purpose` : '') +
         ', nothing stranded, every pin current.'
       );
@@ -776,7 +859,7 @@ function heldLine(h) {
   return `${h.repo} #${h.number} "${h.title}" — ${h.ageDays.toFixed(0)}d old${state ? `, ${state}` : ''} — ${h.url}`;
 }
 
-export function renderMarkdown(status, findings, unchecked, rows) {
+export function renderMarkdown(status, findings, unchecked, rows, fingerprint = null) {
   const held = heldAcross(rows);
   const out = [];
   out.push(`## Family automation liveness — ${status}`, '');
@@ -794,6 +877,7 @@ export function renderMarkdown(status, findings, unchecked, rows) {
     out.push(
       'Every repo\'s last scheduled run succeeded, no default branch is red, no `auto/*` branch is stranded, ' +
       `no bot PR is stale, red or conflicted${held.length ? ' but the ones held on purpose below' : ''}, ` +
+      'no green PR has been left open a day, ' +
       'and every `@jfs/*` pin is current.',
       ''
     );
@@ -811,8 +895,8 @@ export function renderMarkdown(status, findings, unchecked, rows) {
   }
   out.push(
     '### Per repo', '',
-    '| repo | scheduled runs | red on default branch | stranded | stale bot PRs | red / conflicted bot PRs | held bot PRs | pins behind |',
-    '| --- | --- | --- | --- | --- | --- | --- | --- |'
+    '| repo | scheduled runs | red on default branch | stranded | stale bot PRs | red / conflicted bot PRs | held bot PRs | green, left open | pins behind |',
+    '| --- | --- | --- | --- | --- | --- | --- | --- | --- |'
   );
   for (const r of rows) {
     const runs = r.scheduled.length
@@ -836,10 +920,13 @@ export function renderMarkdown(status, findings, unchecked, rows) {
     out.push(
       `| ${r.repo} | ${runs} | ${redOnMain || '—'} | ${r.stranded.join(', ') || '—'} | ` +
       `${r.stalePulls.map((p) => '#' + p.number).join(', ') || '—'} | ${badPulls || '—'} | ${heldCell || '—'} | ` +
+      `${(r.readyPulls || []).map((p) => '#' + p.number).join(', ') || '—'} | ` +
       `${r.stalePins.map((p) => `${p.kit} −${p.behind}`).join(', ') || '—'} |`
     );
   }
   out.push('', '_Generated by `tools/family-liveness.mjs`. See the family maintenance protocol, "Who watches the watchers"._');
+  // Read back by family-liveness.yml to decide whether this report is news.
+  if (fingerprint) out.push('', `<!-- liveness-fingerprint: ${fingerprint} -->`);
   return out.join('\n');
 }
 
