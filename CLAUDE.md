@@ -112,6 +112,19 @@ exists, so a kit caller — which bumps no version — simply no-ops. With
 `auto-merge: false` nothing is skipped that matters: a human's merge fires CI
 and the ordinary gated path tags it.
 
+**The bump commit is signed, because branch protection requires it**
+(since 2026-11-05). Every family `main` also requires signed commits for
+anyone but an admin. A commit made with git on the runner is unsigned, so
+Netlify-kit #58, the first bump after protection went on, read `blocked` with
+both required checks green, and `gh pr merge` was refused with "the base
+branch policy prohibits the merge". A signed session commit with no review
+read `clean` beside it (market-monitor #479), which is what ruled out a
+required approval. The PR step passes `sign-commits: true`, so
+create-pull-request makes the commit through the GitHub API with the default
+token and GitHub signs it as `github-actions[bot]`. It needs the default
+token (a PAT makes unsigned commits), ignores `author` / `committer`, and
+refuses a file over 40 MiB. `test/workflows.test.mjs` holds it.
+
 **The bump PR is merged only on a green CI run of its own head commit**
 (since 2026-11-02). Every family `main` is branch-protected and requires the
 family-ci checks, and a PR opened with the default `GITHUB_TOKEN` fires no
