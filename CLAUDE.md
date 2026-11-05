@@ -112,20 +112,33 @@ exists, so a kit caller — which bumps no version — simply no-ops. With
 `auto-merge: false` nothing is skipped that matters: a human's merge fires CI
 and the ordinary gated path tags it.
 
-**Under the current branch protection the bump cannot merge its own PR.**
-Protection went on every family `main` on 2026-11-02, requiring the two
-`family-ci` checks with admins exempt, and every bot merge since has been
-refused with "the base branch policy prohibits the merge". That includes
-Netlify-kit #59 on 2026-11-05: a signed commit and both required checks
-green on its head from the dispatched run. A PR opened by a session as the
-owner, with no review, reads `clean` in the same repos. Each bot PR also
-carries a `pull_request` CI run started by `github-actions[bot]` that waits
-for approval and runs no jobs. The rule that refuses the merge is not
-readable from a session. It is FAM-1 (b)'s open half, a bot identity whose
-PRs fire CI and may merge, and it is the owner's (MAINTENANCE.md). Until
-then a session or the owner merges a green bump PR, as on 2026-11-05. The
-PR step still passes `sign-commits: true`, so a signature rule is never
-the blocker, and `test/workflows.test.mjs` holds it.
+**A bump merges itself only where the repo holds the family App's two
+secrets.** Protection went on every family `main` on 2026-11-02, requiring the
+two `family-ci` checks with admins exempt, and every merge the default token
+has made since was refused with "the base branch policy prohibits the merge".
+That includes Netlify-kit #59 on 2026-11-05, with a signed commit and both
+required checks green on its head from the dispatched run. A PR opened by a
+session as the owner, with no review, reads `clean` in the same repos. The
+rule that refuses the merge is not readable from a session. So since 0.22.4
+the bump opens and merges its PR as the owner's GitHub App,
+`jsvolos63-family-bot`, installed on every family repo. FAM-1 (b)'s bot
+identity is that App. A caller passes the repo secrets `FAMILY_BOT_APP_ID` and
+`FAMILY_BOT_PRIVATE_KEY` by name (never `secrets: inherit`), the workflow
+declares both optional, and only the `bump` job reads them. `land-bot-pr`
+mints an installation token for that one repository with `contents` and
+`pull-requests` write and nothing else. With no `workflows` permission, a
+`.github/workflows/` change stays unpushable, as it is under the default
+token. A repo without the secrets keeps the default token, and a session or
+the owner merges its green bump PR. A repo with only one of the two fails the
+run before anything is opened. The CI dispatch always uses the default token.
+An App-opened PR also fires `pull_request` CI and its merge fires CI on main,
+and neither changes what the merge waits for. **The private key goes only to a
+job that has run nothing from the repository**: it can mint a token for every
+repo the App is installed on, and a step earlier in the same job can rewrite
+the action on the runner's disk. `test/workflows.test.mjs` holds that for the
+bump, and BearsMockDraft's refresh crons were split into a read job and a land
+job for the same reason. The PR step still passes `sign-commits: true`, so a
+signature rule is never the blocker. GitHub signs as the token's bot.
 
 **The bump PR is merged only on a green CI run of its own head commit**
 (since 2026-11-02). Every family `main` is branch-protected and requires the
@@ -159,9 +172,10 @@ second job would have to hand the tree over as an artifact, as the
 prepare/bump split does. It runs nothing from the calling repo, so it is safe
 in a write-scoped job. Its inputs are the branch, the commit message, title
 and body, `add-paths`, `ci-workflow`, `ci-wait-minutes`, `auto-merge`,
-`soft-fail` and `stuck-note` (what goes stale while a refused PR sits open);
-its outputs include `merged` and `merge-sha`, which a caller reads instead of
-a step outcome. `test/land-bot-pr.test.mjs` runs its CI and merge scripts
+`soft-fail`, `stuck-note` (what goes stale while a refused PR sits open) and
+the App's `app-id` / `app-private-key`; its outputs include `merged`,
+`merge-sha` and `identity` (`app` or `default`), which a caller reads instead
+of a step outcome. `test/land-bot-pr.test.mjs` runs its CI and merge scripts
 against a fake `gh`, and `test/workflows.test.mjs` holds every call to its
 declared inputs and its own third-party pins to the pinning policy.
 
@@ -183,6 +197,9 @@ permissions:
 jobs:
   bump:
     uses: jsvolos63/vendor-cli/.github/workflows/kit-pin-bump.yml@main
+    secrets:                    # the family App's two, by name; empty keeps
+      FAMILY_BOT_APP_ID: ${{ secrets.FAMILY_BOT_APP_ID }}          # the
+      FAMILY_BOT_PRIVATE_KEY: ${{ secrets.FAMILY_BOT_PRIVATE_KEY }} # default token
     with:
       check-command: |
         npm run check
