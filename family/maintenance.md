@@ -68,7 +68,7 @@ evidence that the deploy works.
 
 ### Who watches the watchers
 
-The automation above is what makes fourteen repos maintainable with the owner
+The automation above is what makes fifteen repos maintainable with the owner
 away, which makes a silent failure *in the automation* the highest-severity
 failure mode in the family — and until this protocol existed, nothing watched
 it at all.

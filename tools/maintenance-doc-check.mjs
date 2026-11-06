@@ -64,7 +64,7 @@ const ALLOW_OPEN = '<!-- maintenance-check:allow';
 
 /** Split the doc into the repo-specific half and the canonical block. Claims
  *  are only checked in the repo-specific half: the canonical text is identical
- *  in fourteen repos and cannot name any one repo's scripts, so scanning it
+ *  in fifteen repos and cannot name any one repo's scripts, so scanning it
  *  would report the same phantom finding everywhere. */
 export function splitDoc(src) {
   const from = src.indexOf(MAINT_START);

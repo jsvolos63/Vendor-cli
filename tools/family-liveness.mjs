@@ -497,7 +497,7 @@ export function isHeldLabel(labels) {
 }
 
 /** Does MAINTENANCE.md record PR `number`? A mention as `#<number>` in the
- *  REPO-SPECIFIC half — the canonical family block is identical in fourteen
+ *  REPO-SPECIFIC half — the canonical family block is identical in fifteen
  *  repos and can record no one repo's decision, so a number in it counts for
  *  none of them. `#2560` is not `#256`, and `pwa-kit#256` (another repo's
  *  PR) or `&#256;` (an HTML entity) is not a mention of this repo's #256. */
