@@ -1,6 +1,6 @@
 // Tests for tools/family-liveness.mjs — the family automation liveness check.
 //
-// Only the pure decision logic is exercised here: the script reads fourteen
+// Only the pure decision logic is exercised here: the script reads fifteen
 // repos over the network, so the suite tests what DECIDES, not what fetches.
 // The three properties below are the ones that, had they held, would have
 // caught the five-week silent kit-pin outage of September 2026, so each is a
