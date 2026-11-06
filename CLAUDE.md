@@ -558,7 +558,7 @@ re-sync of every consumer are ONE piece of work, in the same session.
 
 ## Who watches the watchers (`tools/family-liveness.mjs`)
 
-The four reusable workflows keep fourteen repos maintained with the owner away,
+The four reusable workflows keep fifteen repos maintained with the owner away,
 which makes a silent failure IN them the highest-severity failure mode in the
 family — and nothing watched them. A scheduled run that fails produces no
 issue, no comment and no message anyone reads.

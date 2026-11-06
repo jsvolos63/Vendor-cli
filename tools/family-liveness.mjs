@@ -3,7 +3,7 @@
 //
 // WHY THIS EXISTS
 // ---------------
-// Four reusable workflows in this repo carry the upkeep of fourteen repos, and
+// Four reusable workflows in this repo carry the upkeep of fifteen repos, and
 // that is what makes the family maintainable with the owner away. It also makes
 // a silent failure IN that automation the highest-severity failure mode in the
 // whole system — and until this script, nothing watched it.
@@ -131,6 +131,13 @@ const REPOS = [
   { repo: 'FlightCheck', kind: 'app' },
   { repo: 'BearsMockDraft', kind: 'app' },
   { repo: 'Zepbound-', kind: 'app' },
+  // availability joined the family on 2026-10-16 and ran outside this list until
+  // 2026-11-06. In that time its monthly kit-pin bump failed three times on a
+  // missing script and once (2026-11-02) on the per-repo "Actions may not create
+  // pull requests" setting, leaving auto/kit-pin-bump stranded, and nothing here
+  // looked. It carries no MAINTENANCE.md, so a `hold` label there is
+  // could-not-check, which is the intended answer.
+  { repo: 'availability', kind: 'app' },
   { repo: 'news-kit', kind: 'kit' },
   { repo: 'pwa-kit', kind: 'kit' },
   { repo: 'Netlify-kit', kind: 'kit' },
@@ -608,7 +615,7 @@ async function main() {
   if (!TOKEN) {
     const msg =
       'family-liveness: no FAMILY_READ_TOKEN (or GH_TOKEN) in the environment.\n' +
-      '  This job reads fourteen repos, and a repo-scoped GITHUB_TOKEN cannot see its siblings,\n' +
+      '  This job reads fifteen repos, and a repo-scoped GITHUB_TOKEN cannot see its siblings,\n' +
       '  so it needs a PAT with read access to contents, actions and pull-requests on ' + OWNER + '.\n' +
       '  Exiting 2 (COULD NOT CHECK) rather than 0: an unconfigured monitor must never read as a\n' +
       '  healthy family.';
