@@ -6,12 +6,18 @@
 # check pinned to whatever vendor-cli SHA was current when each repo was set
 # up. Consumers now call this workflow instead:
 #
+#   permissions: {}            # nothing by default; the job asks for its own
 #   jobs:
 #     family-ci:
-#       uses: jsvolos63/vendor-cli/.github/workflows/family-ci.yml@main
+#       permissions:
+#         contents: read
+#       # A release's commit, never `@main` (FAM-2); Dependabot's
+#       # github-actions entry rolls the pin to the next tag.
+#       uses: jsvolos63/vendor-cli/.github/workflows/family-ci.yml@<sha> # vX.Y.Z
 #       with:
 #         verify-kit-pins: true
-#         install-command: npm ci
+#         audit: true
+#         audit-signatures: true
 #         run: |
 #           npm run vendor:check
 #           npm test
@@ -32,6 +38,19 @@
 # install to have run). When the caller IS vendor-cli,
 # the local checkout is used instead so a PR here validates against its own
 # canonical text, not main's.
+#
+# THAT CHECKOUT IS AT THE COMMIT THIS WORKFLOW WAS CALLED AT (2026-11-13,
+# FAM-2). It used to take no `ref`, which fetches vendor-cli's default branch
+# — so a caller that pinned `uses: …/family-ci.yml@<sha>` would have run an
+# old workflow against whatever tooling main held that day, a mismatch that
+# breaks without warning when the two move together (JFS-Sports measured it
+# on run 43338472557, which is why the callers could not be pinned first).
+# Nothing in the `github` context names the commit a called workflow was
+# fetched at — in a reusable workflow that context is the CALLER's, and the
+# OIDC claim that does name it (`job_workflow_sha`) would cost every caller
+# an `id-token: write` grant — so the ref is read off the caller's own
+# `uses:` line, in its checkout: the same file GitHub read to start this
+# run. A caller still at `@main` gets main, as before, and a warning.
 name: Family CI
 
 on:
@@ -73,9 +92,17 @@ on:
         type: string
         default: ''
       install-command:
-        description: Dependency install command ('' skips the step)
+        description: >-
+          Dependency install command ('' skips the step). The default is a
+          clean, reproducible install that runs NO package's install scripts
+          (`--ignore-scripts`): a hijacked transitive that adds one runs
+          nothing in CI, where a token is in the environment. It is a flag,
+          not an .npmrc `ignore-scripts=true`, so a repo's own `npm run`
+          pre/post hooks still run. A repo with no lockfile, or one whose
+          dependency genuinely needs its install script (a native build),
+          passes its own command — and says why beside it.
         type: string
-        default: npm install
+        default: npm ci --ignore-scripts
       verify-kit-pins:
         description: Pre-flight that every pinned @jfs kit SHA resolves, before install
         type: boolean
@@ -90,6 +117,30 @@ on:
           the day one is added.
         type: boolean
         default: false
+      audit:
+        description: >-
+          Run `npm audit --audit-level=high` over the WHOLE installed tree
+          after install. `prod-audit` alone covers nothing in a repo whose
+          every dependency is a devDependency — which is most of the family —
+          and the dev tree is what runs in CI with a token and what builds
+          the bundle every reader runs (JFS-Sports' JFS-11: four moderate
+          advisories, one in eslint's own tree, that nothing reported). Opt-in,
+          like maintenance-check: a repo turns it on once its tree is clean,
+          and an edit here never reddens a caller that did not ask.
+        type: boolean
+        default: false
+      audit-signatures:
+        description: >-
+          Run `npm audit signatures` after install: every installed registry
+          tarball must verify against the registry's signatures and, where
+          published with provenance, its attestations. Retried ONCE after 20
+          seconds, and only once: the installed bytes do not change between
+          the two tries, so a real tamper fails both, while a one-off
+          verification hiccup on a runner (JFS-Sports #766: one "invalid
+          attestation" for a package that verified everywhere else) does not
+          block a merge. Needs a lockfile. Opt-in, like `audit`.
+        type: boolean
+        default: false
       claude-md-check:
         description: Check CLAUDE.md carries the current family-conventions block
         type: boolean
@@ -99,11 +150,13 @@ on:
           Check MAINTENANCE.md carries the current family-maintenance block.
 
           OPT-IN, default false, for the same reason node-version-file is: this
-          gate is checked against vendor-cli MAIN rather than the caller's pin,
-          so the moment the canonical text changes here every consumer that
-          opted in goes red until it re-syncs. A repo turns it on in the same
-          PR that adds its MAINTENANCE.md, and a new repo joining the family is
-          never instantly red for a file it has not written yet.
+          gate is checked against the vendor-cli commit the caller's `uses:`
+          names (main, for a caller still at `@main`), so when the canonical
+          text changes every consumer that opted in goes red — at once if
+          unpinned, when its pin rolls if pinned — until it re-syncs. A repo
+          turns it on in the same PR that adds its MAINTENANCE.md, and a new
+          repo joining the family is never instantly red for a file it has
+          not written yet.
 
           jfs-maintenance-sync refuses to CREATE MAINTENANCE.md — the file is
           half canonical and half repo-specific, and one holding only the family
@@ -127,13 +180,17 @@ on:
         type: string
         default: ''
 
-permissions:
-  contents: read
+# Nothing by default: each job asks for exactly what its runs use, so a job
+# added later starts with no token at all (the family's workflow rule,
+# 2026-11-13; JFS-Sports' JFS-13). A caller's grant is the ceiling either way.
+permissions: {}
 
 jobs:
   checks:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read   # the two checkouts and a caller's data-branch fetch; nothing writes
     defaults:
       run:
         # `bash -eo pipefail` for every step, including the caller's `run`
@@ -149,12 +206,71 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/checkout@v7
+      # Which commit of vendor-cli is this run executing? See the header: the
+      # `github` context is the caller's, so the answer is on the caller's
+      # own `uses:` line. The script is bash, grep and sed over one file in
+      # the checkout; the SAME script sits in kit-pin-bump.yml's write job,
+      # and test/workflows.test.mjs holds the two copies identical and runs
+      # them against pinned, unpinned, quoted, doubled and missing callers.
+      - name: Resolve the commit this workflow was called at
+        id: tooling
         if: (inputs.verify-kit-pins || inputs.claude-md-check || inputs.maintenance-check) && github.repository != 'jsvolos63/vendor-cli'
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          CALLED: family-ci.yml
+        run: |
+          set -euo pipefail
+          # WORKFLOW_REF is owner/repo/.github/workflows/<file>@<ref> — the
+          # CALLER's workflow, and the one file GitHub read to start this run.
+          file=${WORKFLOW_REF#*/.github/workflows/}
+          file=${file%%@*}
+          caller=".github/workflows/$file"
+          if [ ! -f "$caller" ]; then
+            echo "::error::Cannot find the calling workflow ($caller, from github.workflow_ref=$WORKFLOW_REF) in the checkout, so the commit $CALLED was called at is unknown."
+            exit 1
+          fi
+          # Every `uses:` of this workflow in that file (owner/repo is
+          # case-insensitive on GitHub, so is this; a commented-out line is
+          # not a `uses:` line), with the ref after the `@` and nothing
+          # else: quotes, a trailing comment and whitespace come off.
+          mapfile -t refs < <(grep -iF -- "jsvolos63/vendor-cli/.github/workflows/$CALLED@" "$caller" \
+            | grep -E '^[[:space:]]*(-[[:space:]]+)?uses:' \
+            | sed -E "s#^.*/$CALLED@##; s#[\"']?[[:space:]]*(\\#.*)?\$##" | sort -u)
+          if [ "${#refs[@]}" -ne 1 ] || [ -z "${refs[0]}" ]; then
+            echo "::error::Expected exactly one 'uses: jsvolos63/vendor-cli/.github/workflows/$CALLED@<ref>' in $caller; found ${#refs[@]}${refs[*]:+: ${refs[*]}}."
+            exit 1
+          fi
+          ref=${refs[0]}
+          if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "$CALLED was called at commit $ref; the family tooling is checked out at that commit."
+          else
+            echo "::warning::$caller calls $CALLED at the mutable ref '$ref' (FAM-2), so the family tooling follows that ref. Pin it: uses: jsvolos63/vendor-cli/.github/workflows/$CALLED@<sha> # vX.Y.Z"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        if: steps.tooling.outcome == 'success'
         with:
           repository: jsvolos63/vendor-cli
+          ref: ${{ steps.tooling.outputs.ref }}
           path: .jfs-family/vendor-cli
           persist-credentials: false
+
+      # The proof, in every run log: the commit the tooling checkout is at,
+      # held to the ref the caller named when that ref is a commit.
+      - name: Check the family tooling is at that commit
+        if: steps.tooling.outcome == 'success'
+        env:
+          REF: ${{ steps.tooling.outputs.ref }}
+        run: |
+          set -euo pipefail
+          head=$(git -C .jfs-family/vendor-cli rev-parse HEAD)
+          version=$(sed -nE 's/^  "version": "([^"]+)",?$/\1/p' .jfs-family/vendor-cli/package.json | head -1)
+          echo "Family tooling: jsvolos63/vendor-cli@$head (version ${version:-?}), called at '$REF'."
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]] && [ "$head" != "$REF" ]; then
+            echo "::error::The family tooling checkout is at $head, not the $REF this workflow was called at."
+            exit 1
+          fi
 
       - uses: actions/setup-node@v7
         with:
@@ -188,6 +304,16 @@ jobs:
       - name: Audit shipped dependencies
         if: inputs.prod-audit
         run: npm audit --omit=dev --audit-level=high
+
+      - name: Audit the whole installed tree
+        if: inputs.audit
+        run: npm audit --audit-level=high
+
+      # One retry, then the second run's failure is the step's failure (the
+      # `||` group ends on it). test/workflows.test.mjs pins the shape.
+      - name: Verify registry signatures and attestations
+        if: inputs.audit-signatures
+        run: npm audit signatures || { echo '::warning::npm audit signatures failed; retrying once in 20 s'; sleep 20; npm audit signatures; }
 
       - name: Check CLAUDE.md family conventions are in sync
         if: inputs.claude-md-check
@@ -265,6 +391,8 @@ jobs:
     if: (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && inputs.version-guard-paths != ''
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read   # the full-history checkout it diffs
     steps:
       - uses: actions/checkout@v7
         with:
@@ -287,6 +415,7 @@ jobs:
           # deliberate — but `set -f` keeps it a word split only, not a glob
           # against the workspace.
           set -f
+          # shellcheck disable=SC2086 # GUARD_PATHS is that word list, split on purpose
           if git diff --quiet "$BASE...HEAD" -- $GUARD_PATHS; then
             echo "guarded paths unchanged - no bump required"
             exit 0

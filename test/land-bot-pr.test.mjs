@@ -113,9 +113,12 @@ test('the CI step sits between the PR and the merge, and the bump job may dispat
   // The bump: the action is its last step, on its own branch, in the one job
   // that holds the write token and actions: write.
   const land = WF.jobs.bump.steps.at(-1);
-  assert.equal(land.uses, 'jsvolos63/vendor-cli/.github/actions/land-bot-pr@main');
+  // The action at THIS workflow's commit, from the checkout the job makes of
+  // this repo there (FAM-2, 2026-11-13) — never `@main`, which handed the
+  // write token and the App key to whatever main held that day.
+  assert.equal(land.uses, './.jfs-family/vendor-cli/.github/actions/land-bot-pr');
   assert.equal(land.with.branch, 'auto/kit-pin-bump');
-  assert.equal(WF.permissions.actions, 'write', 'the workflow must ask for actions: write');
+  assert.deepEqual(WF.permissions, {}, 'the workflow grants nothing at the top level; the bump job asks for its own');
   assert.equal(WF.jobs.bump.permissions.actions, 'write', 'the bump job dispatches, so it needs actions: write');
   assert.equal(WF.jobs.prepare.permissions.actions, undefined, 'the untrusted job never gets it');
   assert.ok(WF.jobs.bump['timeout-minutes'] > WF.on.workflow_call.inputs['ci-wait-minutes'].default, 'the job outlives its own CI wait');

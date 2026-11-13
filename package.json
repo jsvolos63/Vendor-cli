@@ -1,6 +1,6 @@
 {
   "name": "@jfs/vendor-cli",
-  "version": "0.22.7",
+  "version": "0.23.0",
   "description": "Shared dev CLI for the @jfs kit family — vendoring generator (esm/global/cjs, surface derived from the kit's own exports) plus the consolidated kit-pin bumper, kit-pin existence pre-flight, version stamper, the CLAUDE.md family-conventions, MAINTENANCE.md family-maintenance and sanitizer-policy synchronizers, and the buildless-module-graph gate the consumers used to each hand-roll.",
   "type": "module",
   "main": "index.mjs",
@@ -44,5 +44,8 @@
     "eslint": "^10.9.1",
     "globals": "^17.11.0",
     "yaml": "^2.9.1"
+  },
+  "overrides": {
+    "minimatch": "^11.0.5"
   }
 }

@@ -16,11 +16,25 @@ on:
     branches: [main]   # the caller-side half of the doubled guard release.yml asks for
   workflow_dispatch:
 
-permissions:
-  contents: write   # a called workflow cannot elevate its own token
+# Nothing by default: the job asks for exactly what it uses (the family's
+# workflow rule, 2026-11-13; test/workflows.test.mjs).
+permissions: {}
 
 jobs:
   release:
+    # Caller-side gate: the reusable workflow gates on a green run itself, but
+    # this is the caller's decision about when that code is handed a write
+    # token at all — a manual dispatch, or a GREEN run of a push to this
+    # repo's main; never a red run, never a pull request's, never a fork's
+    # (a fork's branch can be named main). The template every consumer
+    # carries.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event != 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository)
+    permissions:
+      contents: write   # the tag and the release; a called workflow cannot elevate
     uses: ./.github/workflows/release.yml
     with:
       title: '@jfs/vendor-cli'

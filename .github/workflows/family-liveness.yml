@@ -37,9 +37,9 @@ on:
     - cron: '10 8 * * *'
   workflow_dispatch:
 
-permissions:
-  contents: read
-  issues: write
+# Nothing by default: the job asks for exactly what it uses (the family's
+# workflow rule, 2026-11-13; test/workflows.test.mjs).
+permissions: {}
 
 concurrency:
   group: family-liveness
@@ -49,6 +49,9 @@ jobs:
   liveness:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read   # the checkout
+      issues: write    # the one rolling issue here
     steps:
       - uses: actions/checkout@v7
         with:

@@ -7,12 +7,24 @@ on:
     workflows: [Test]
     types: [completed]
 
-permissions:
-  contents: write
-  pull-requests: write
+# Nothing by default: the job asks for exactly what it uses, so a job added
+# to this file later starts with no token at all (the family's workflow rule,
+# 2026-11-13; test/workflows.test.mjs).
+permissions: {}
 
 jobs:
   merge:
+    # Caller-side gate: this fires on EVERY Test completion, and the job it
+    # starts is handed the family App's key. The reusable workflow skips a
+    # non-Dependabot run itself; this makes that the caller's decision, so
+    # the key reaches that code only for a run Dependabot started on this
+    # repo's own branch. The template every consumer carries.
+    if: >-
+      github.event.workflow_run.actor.login == 'dependabot[bot]' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    permissions:
+      contents: write        # the merge — a called workflow cannot elevate
+      pull-requests: write   # its token, so the caller grants both
     uses: ./.github/workflows/dependabot-merge.yml
     # The family App's two secrets, by name: with both, the merge is made as
     # the App, the one identity the branch protection lets merge.
