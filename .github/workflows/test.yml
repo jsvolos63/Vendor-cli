@@ -8,11 +8,14 @@ on:
   pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: read
+# Nothing by default: the job asks for exactly what it uses (the family's
+# workflow rule, 2026-11-13; test/workflows.test.mjs).
+permissions: {}
 
 jobs:
   family-ci:
+    permissions:
+      contents: read   # the checkouts; nothing writes
     uses: ./.github/workflows/family-ci.yml
     with:
       # Dogfoods the input this repo ships. It resolves to the same 22 the
@@ -26,8 +29,15 @@ jobs:
       # PR that breaks either fails HERE rather than in the consumers.
       maintenance-check: true
       # esbuild (the narrowing bundler, exact-pinned) must be installed for
-      # the tree-shaking tests; the suite imports index.mjs directly.
-      install-command: npm install
+      # the tree-shaking tests; the suite imports index.mjs directly. A clean
+      # install from the committed lockfile, with no install scripts — the
+      # family default (FAM-11: this repo kept no lockfile until 2026-11-13,
+      # so its dev tree resolved fresh, scripts and all, on every run).
+      install-command: npm ci --ignore-scripts
+      # The whole installed tree is dev here, so prod-audit would cover
+      # nothing: audit all of it, and verify every tarball's signature.
+      audit: true
+      audit-signatures: true
       run: |
         npm run lint
         npm test

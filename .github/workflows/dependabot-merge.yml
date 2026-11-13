@@ -49,12 +49,21 @@
 #     workflow_run:
 #       workflows: [CI]        # MUST match the CI workflow's `name:` exactly
 #       types: [completed]
-#   permissions:
-#     contents: write
-#     pull-requests: write
+#   permissions: {}            # nothing by default; the job asks for its own
 #   jobs:
 #     merge:
-#       uses: jsvolos63/vendor-cli/.github/workflows/dependabot-merge.yml@main
+#       # The CALLER's gate: this fires on every CI completion, and the job
+#       # it starts is handed the App key, so the caller decides that the
+#       # code below runs only for a run Dependabot started on this repo's
+#       # own branch (the workflow skips other runs itself, too).
+#       if: >-
+#         github.event.workflow_run.actor.login == 'dependabot[bot]' &&
+#         github.event.workflow_run.head_repository.full_name == github.repository
+#       permissions:
+#         contents: write
+#         pull-requests: write
+#       # A release's commit, never `@main` (FAM-2); Dependabot rolls the pin.
+#       uses: jsvolos63/vendor-cli/.github/workflows/dependabot-merge.yml@<sha> # vX.Y.Z
 #       # The family App's two secrets, by name (never `secrets: inherit`).
 #       secrets:
 #         FAMILY_BOT_APP_ID: ${{ secrets.FAMILY_BOT_APP_ID }}
@@ -101,14 +110,17 @@ on:
         description: The family GitHub App's private key.
         required: false
 
-permissions:
-  contents: write
-  pull-requests: write
+# Nothing by default; the one job asks for exactly what the merge needs (the
+# family's workflow rule, 2026-11-13). The caller's grant is the ceiling.
+permissions: {}
 
 jobs:
   merge:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write        # the squash-merge and the branch delete
+      pull-requests: write   # reading the PR, the merge, the digest comment
     # The family App's key is read from the `family-bot` environment, not
     # from repository secrets (2026-11-05). A repository secret is readable
     # by any workflow on any branch of the repo: one pushed branch carrying

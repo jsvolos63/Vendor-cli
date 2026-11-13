@@ -28,9 +28,14 @@ hand-rolled — often as drifting copies — across the kits and their consumers
 It also hosts the family's four reusable workflows under `.github/workflows/`
 (`family-ci.yml`, `kit-pin-bump.yml`, `release.yml`, `dependabot-merge.yml`),
 one shared composite action, `.github/actions/land-bot-pr` (open a bot PR,
-run the repo's CI on it, merge it on green; the kit-pin bump and
-BearsMockDraft's refresh crons call it), and the monitor that watches them,
-`tools/family-liveness.mjs`.
+run the repo's CI on it, merge it on green; the kit-pin bump calls it from a
+checkout of this repo at the workflow's own commit, BearsMockDraft's refresh
+crons at a release's SHA), and the monitor that watches them,
+`tools/family-liveness.mjs`. Consumers call the workflows pinned to a
+release's commit — `uses: jsvolos63/vendor-cli/.github/workflows/<file>@<sha>
+# vX.Y.Z`, never `@main` — and Dependabot's `github-actions` entry rolls the
+pins; the workflows check this repo out at that same commit for their tooling
+(CLAUDE.md, "Family CI").
 
 The family's consumers are buildless static sites: `node_modules` is not
 deployed, so each consumer commits a generated copy of every kit it uses and
@@ -358,3 +363,12 @@ kit's `npm install && npm test`, and ship the kits — consumers then pick the
 kits up through the usual `kit-pin-bump` flow. Because the generated output
 is part of the drift contract, a change that alters output requires
 regenerating consumers' vendored copies (their `vendor:check` will say so).
+
+A change to the reusable workflows or the shared action reaches a consumer
+through a different pin: every caller's `uses:` names a release's commit
+(`@<sha> # vX.Y.Z`), so the version must be bumped for the merge to be
+tagged (`release-self.yml` tags each new version on a green `Test`), and
+Dependabot's monthly `github-actions` entry then proposes the new SHA in
+each consumer — behind the family's 7-day cooldown. A fix that cannot wait
+is pinned by hand, one consumer PR each. The bump's own nested
+`release.yml` call is such a pin too, inside this repo.

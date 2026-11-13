@@ -36,13 +36,17 @@
 #     schedule:
 #       - cron: '41 6 2 * *'
 #     workflow_dispatch:
-#   permissions:
-#     contents: write
-#     pull-requests: write
-#     actions: write         # dispatch the repo's CI on the bump branch
+#   permissions: {}            # nothing by default; the job asks for its own
 #   jobs:
 #     bump:
-#       uses: jsvolos63/vendor-cli/.github/workflows/kit-pin-bump.yml@main
+#       permissions:
+#         contents: write
+#         pull-requests: write
+#         actions: write       # dispatch the repo's CI on the bump branch
+#       # Pinned to a release's commit, never `@main` (FAM-2): the write
+#       # token and the App key below go to exactly this code. Dependabot's
+#       # github-actions entry rolls the pin to the next tag.
+#       uses: jsvolos63/vendor-cli/.github/workflows/kit-pin-bump.yml@<sha> # vX.Y.Z
 #       # The family App's two secrets, by name (never `secrets: inherit`,
 #       # which would hand this workflow every secret the repo holds). A repo
 #       # that does not hold them passes empty values and keeps the default
@@ -105,6 +109,16 @@
 # in its environment; the family security audit rated it the family's
 # largest blast radius (FAM-1).
 #
+# THE WRITE JOB RUNS THIS REPO'S ACTION AT THIS WORKFLOW'S OWN COMMIT
+# (2026-11-13, FAM-2). It used to call `land-bot-pr@main` — so even a caller
+# pinned to a release would have handed its write token and the App key to
+# whatever vendor-cli's main held that day. Now the job reads the commit it
+# was fetched from off `job.workflow_sha` (GitHub's record of the call; the
+# `github` context is the caller's — see family-ci.yml's header for the
+# measurement), checks vendor-cli out there, and calls the action from that
+# checkout. The one call that cannot work that way, the nested `release.yml`
+# below, is pinned by SHA instead.
+#
 # One place to fix the flow for every consumer. Treat edits here like kit
 # API changes: they land in every repo's next scheduled bump at once.
 name: Kit pin bump
@@ -150,19 +164,25 @@ on:
         type: string
         default: ''
       install-command:
-        description: Dependency install command (jfs-bump-kit-pins ships in
-          @jfs/vendor-cli, so deps must be installed before it can run)
+        description: >-
+          Dependency install command (jfs-bump-kit-pins ships in
+          @jfs/vendor-cli, so deps must be installed before it can run). The
+          default runs no package's install scripts (`--ignore-scripts`) —
+          this job installs kit commits resolved seconds ago, and a git
+          dependency's `prepare` script is exactly the code nobody reviewed.
+          A repo whose dependency needs its install script (a native build)
+          passes its own command, and says why beside it.
         type: string
-        default: npm ci
+        default: npm ci --ignore-scripts
       vendor-sync-command:
         description: >-
           Commands that regenerate the vendored copies from the bumped pins
           ('' skips — for copy-in consumers with no vendor:sync). The default
           re-installs first so the newly pinned kit commits are what gets
-          vendored.
+          vendored — again with no install scripts.
         type: string
         default: |
-          npm install
+          npm install --ignore-scripts
           npm run vendor:sync
       version-bump-command:
         description: >-
@@ -182,7 +202,7 @@ on:
           block, which is worse than not syncing.
         type: string
         default: |
-          npm install
+          npm install --ignore-scripts
           npx --no-install jfs-claude-md-sync
       maintenance-sync-command:
         description: >-
@@ -245,10 +265,9 @@ on:
         type: number
         default: 40
 
-permissions:
-  contents: write
-  pull-requests: write
-  actions: write
+# Nothing by default: each job asks for exactly what its runs use (the
+# family's workflow rule, 2026-11-13). The caller's grant is the ceiling.
+permissions: {}
 
 # Two runs (a schedule and a dispatch) racing on the same `auto/kit-pin-bump`
 # branch would each open/update the PR and fight over the merge; queue them.
@@ -466,24 +485,86 @@ jobs:
           git apply --index --whitespace=nowarn "$RUNNER_TEMP/kit-pin-bump.patch"
           if refused=$(git diff --cached --name-only | grep -E '^\.(github|claude)/'); then
             echo "::error::The bump patch changes paths a pin bump must never touch; nothing is opened:"
-            sed 's/^/  /' <<<"$refused"
+            while IFS= read -r path; do echo "  $path"; done <<<"$refused"
             exit 1
           fi
           git status --short
 
+      # Which commit of vendor-cli is this run executing? `job.workflow_sha`,
+      # GitHub's record of the commit it fetched this reusable workflow from
+      # (family-ci.yml's header has the measurement). The same script as
+      # family-ci.yml's — test/workflows.test.mjs holds the two copies
+      # identical — and jq over six fields of JSON: nothing from the repo
+      # runs, and the key has not arrived yet.
+      - name: Resolve the commit this workflow was called at
+        id: tooling
+        env:
+          JOB_JSON: ${{ toJSON(job) }}
+        run: |
+          set -euo pipefail
+          # job.workflow_sha is the commit GitHub fetched THIS reusable
+          # workflow from; job.workflow_ref is how the caller named it
+          # (owner/repo/.github/workflows/<file>@<ref>). Both are GitHub's
+          # record of the call, not a reading of the caller's file.
+          sha=$(jq -r '.workflow_sha // ""' <<<"$JOB_JSON")
+          ref=$(jq -r '.workflow_ref // ""' <<<"$JOB_JSON")
+          echo "GitHub's record of this call: $(jq -c '{workflow_repository, workflow_file_path, workflow_ref, workflow_sha}' <<<"$JOB_JSON")"
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::job.workflow_sha does not name the commit this reusable workflow was fetched from (got '$sha'); refusing to guess which vendor-cli to check out."
+            exit 1
+          fi
+          named=${ref##*@}
+          if [ "$named" = "$sha" ]; then
+            echo "Called pinned to commit $sha; the family tooling is checked out at that commit."
+          else
+            echo "::warning::Called at the mutable ref '$named' (FAM-2), which GitHub resolved to $sha for this run; the family tooling is checked out at that commit. Pin it: uses: jsvolos63/vendor-cli/.github/workflows/<file>@<sha> # vX.Y.Z"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # The tooling checkout must never ride the bump PR: it is excluded from
+      # this clone's index before it exists, so `git add -A` and a stash
+      # (which create-pull-request may use) skip it like any ignored path.
+      # Git only, before the key arrives.
+      - name: Keep the tooling checkout out of the pull request
+        run: echo '/.jfs-family/' >> "$(git rev-parse --git-dir)/info/exclude"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: jsvolos63/vendor-cli
+          ref: ${{ steps.tooling.outputs.sha }}
+          path: .jfs-family/vendor-cli
+          persist-credentials: false
+
+      # The proof, in every run log: the commit the tooling checkout is at,
+      # held equal to the commit this workflow was fetched from.
+      - name: Check the family tooling is at that commit
+        env:
+          SHA: ${{ steps.tooling.outputs.sha }}
+        run: |
+          set -euo pipefail
+          head=$(git -C .jfs-family/vendor-cli rev-parse HEAD)
+          version=$(sed -nE 's/^  "version": "([^"]+)",?$/\1/p' .jfs-family/vendor-cli/package.json | head -1)
+          echo "Family tooling: jsvolos63/vendor-cli@$head (version ${version:-?}); this workflow was fetched from $SHA."
+          if [ "$head" != "$SHA" ]; then
+            echo "::error::The family tooling checkout is at $head, not the $SHA this workflow was fetched from."
+            exit 1
+          fi
+
       # Open the PR, run the repo's CI on it, and merge it on green: the
       # family's shared land-bot-pr action, so BearsMockDraft's refresh
-      # crons and this bump run one copy of these steps. It runs nothing
-      # from the repo: create-pull-request (signed commit), gh against the
-      # API, and the CI workflow it dispatches under that workflow's own
-      # token. With the family App's two secrets it opens and merges as the
-      # App; without them it uses the default token, whose merge the
-      # current branch protection refuses (FAM-1 (b) in this repo's
-      # MAINTENANCE.md). This job is the only place the key may go: nothing
-      # from the repo has run on this runner before the action does.
+      # crons and this bump run one copy of these steps — called from the
+      # checkout above, so it is the action at THIS workflow's commit, not
+      # main's. It runs nothing from the repo: create-pull-request (signed
+      # commit), gh against the API, and the CI workflow it dispatches
+      # under that workflow's own token. With the family App's two secrets
+      # it opens and merges as the App; without them it uses the default
+      # token, whose merge the current branch protection refuses (FAM-1 (b)
+      # in this repo's MAINTENANCE.md). This job is the only place the key
+      # may go: nothing from the repo has run on this runner before the
+      # action does.
       - name: Open, test and merge the bump PR
         id: land
-        uses: jsvolos63/vendor-cli/.github/actions/land-bot-pr@main
+        uses: ./.jfs-family/vendor-cli/.github/actions/land-bot-pr
         with:
           app-id: ${{ secrets.FAMILY_BOT_APP_ID }}
           app-private-key: ${{ secrets.FAMILY_BOT_PRIVATE_KEY }}
@@ -538,10 +619,19 @@ jobs:
   # Skipped when the caller names no title, when nothing merged, and when
   # auto-merge is off: there the human's own merge fires CI, and the ordinary
   # CI-gated path tags it.
+  #
+  # A nested reusable-workflow call cannot be a local path (a `./` here would
+  # name the CALLER's repository) and takes no expression, so this is the one
+  # call that cannot follow the checkout above: it is pinned by SHA to a
+  # release of this repo, with the version beside it, and Dependabot's
+  # github-actions entry rolls it like any other pin. A change to release.yml
+  # reaches this job one release later — the pin lags on purpose.
   release:
     needs: bump
     if: inputs.release-title != '' && needs.bump.outputs.merge-sha != ''
-    uses: jsvolos63/vendor-cli/.github/workflows/release.yml@main
+    permissions:
+      contents: write   # the tag and the release; a called workflow cannot elevate
+    uses: jsvolos63/vendor-cli/.github/workflows/release.yml@46d45e887c88d639d533695bc101fb9fbf544b4e # v0.22.7
     with:
       title: ${{ inputs.release-title }}
       ref: ${{ needs.bump.outputs.merge-sha }}

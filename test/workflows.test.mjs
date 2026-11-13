@@ -23,6 +23,16 @@
 // version, the test list against the test files on disk, CLAUDE.md's
 // kit-pin-bump input list against the inputs the workflow actually declares,
 // and README's job list against the bins the package ships.
+//
+// Since 2026-11-13 (FAM-2) it also holds how this repo's own code is reached:
+// family-ci and the bump check vendor-cli out at the commit they were CALLED
+// at — `job.workflow_sha`, GitHub's record of the call; the resolve script is
+// run here against a pinned call, a branch, a tag and a context missing the
+// field — the bump calls land-bot-pr from that checkout, the one nested call
+// that cannot is pinned by release SHA, no `uses:` names `@main`, every
+// workflow grants nothing at the top level and each job exactly its measured
+// grants, the self-callers gate their workflow_run jobs, and the install
+// defaults run no package scripts.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -61,10 +71,21 @@ const ACTIONS = Object.fromEntries(
     return [name, { name, src, ...parse(src) }];
   })
 );
-/** The action a step's `uses:` names when it is one of THIS repo's, in the
- *  `@main` spelling every caller uses (a workflow called from another repo
- *  cannot reach this repo's files through `./`). */
-const localAction = (uses) => (/^jsvolos63\/vendor-cli\/\.github\/actions\/([^@/]+)@main$/i.exec(uses || '') || [])[1] || null;
+/** The action a step's `uses:` names when it is one of THIS repo's: the path
+ *  into the checkout the bump makes of this repo at its own commit
+ *  (`./.jfs-family/vendor-cli/.github/actions/<name>`), or the spelling a
+ *  consumer uses, pinned to a release's commit
+ *  (`jsvolos63/vendor-cli/.github/actions/<name>@<sha>`). `@main` is neither:
+ *  the pinning test names it as this repo's own code at a mutable ref. */
+const localAction = (uses) => (/^(?:\.\/\.jfs-family\/vendor-cli|jsvolos63\/vendor-cli)\/\.github\/actions\/([^@/]+)(?:@[0-9a-f]{40})?$/i.exec(uses || '') || [])[1] || null;
+
+/** The one-line step that keeps the bump's tooling checkout out of its PR. */
+const EXCLUDE_SCRIPT = `echo '/.jfs-family/' >> "$(git rev-parse --git-dir)/info/exclude"`;
+
+/** The signature check, one retry and only one — the second run's failure is
+ *  the step's (the `||` group ends on it). The same literal JFS-Sports' suite
+ *  pins in its own check lists. */
+const RETRY = "npm audit signatures || { echo '::warning::npm audit signatures failed; retrying once in 20 s'; sleep 20; npm audit signatures; }";
 
 /** Every string leaf under `node` — where GitHub expressions live. Comments
  *  are not in the parsed tree, so prose ABOUT an input never counts as a use. */
@@ -79,12 +100,18 @@ const REUSABLE = FILES.filter((f) => callInputs(wf(f)) !== null);
 const allSteps = (w) => Object.values(w.jobs || {}).flatMap((j) => j.steps || []);
 
 /** The workflow file a job's `uses:` points at, when it is one of THIS repo's:
- *  `./.github/workflows/x.yml` (the self-callers) or the `@main` spelling
- *  consumers use (kit-pin-bump.yml's release job calls release.yml that way). */
-function localTarget(uses) {
+ *  `./.github/workflows/x.yml` (the self-callers) or the spelling consumers
+ *  use, pinned to a release's commit (kit-pin-bump.yml's release job calls
+ *  release.yml that way, since a nested call can be neither local nor an
+ *  expression). `@main` is deliberately NOT matched: the pinning test names
+ *  it. `loose` admits any ref, for the docs' examples, which show the shape
+ *  with a placeholder where a real commit would go. */
+function localTarget(uses, { loose = false } = {}) {
   const m =
     /^\.\/\.github\/workflows\/([^@/]+)$/.exec(uses) ||
-    /^jsvolos63\/vendor-cli\/\.github\/workflows\/([^@/]+)@main$/i.exec(uses);
+    (loose
+      ? /^jsvolos63\/vendor-cli\/\.github\/workflows\/([^@/]+)@\S+$/i.exec(uses)
+      : /^jsvolos63\/vendor-cli\/\.github\/workflows\/([^@/]+)@[0-9a-f]{40}$/i.exec(uses));
   return m ? m[1] : null;
 }
 
@@ -179,9 +206,11 @@ test('the example callers in CLAUDE.md and README.md are calls the workflows wou
       const { errors, value } = parse(m[1]);
       assert.deepEqual(errors, [], `${doc}: a yaml example does not parse`);
       for (const [jobName, job] of Object.entries((value && value.jobs) || {})) {
-        const target = job.uses && localTarget(job.uses);
+        const target = job.uses && localTarget(job.uses, { loose: true });
         if (!target) continue;
         checkCall(`${doc} example job ${jobName}`, target, job.with);
+        // An example that still shows `@main` teaches the thing FAM-2 closed.
+        assert.doesNotMatch(job.uses, /@main$/, `${doc} example job ${jobName} calls ${job.uses} at main`);
         examples++;
       }
     }
@@ -281,7 +310,7 @@ test('every checkout leaves no credential behind', () => {
       assert.equal(s.with && s.with['persist-credentials'], false, `${f}: a checkout without persist-credentials: false`);
     }
   }
-  assert.ok(n >= 6, `expected the six checkouts, found ${n}`);
+  assert.ok(n >= 7, `expected the seven checkouts, found ${n}`);
 });
 
 test('a setup-node step naming a version FILE hands node-version in empty whenever the file is set', () => {
@@ -303,14 +332,24 @@ test('a setup-node step naming a version FILE hands node-version in empty whenev
   assert.ok(n >= 3, `expected three setup-node steps, found ${n}`);
 });
 
-test('actions follow the pinning policy: actions/* by major tag, anything else by full SHA', () => {
+test('actions follow the pinning policy: this repo\'s code at its own commit or a release SHA, actions/* by major tag, anything else by full SHA', () => {
   // Read from the RAW text, because the version comment beside a SHA pin is
   // part of the policy and comments are not in the parsed tree. The count is
   // then held against the parsed tree, so a `uses:` the regex failed to see
   // cannot slip through unchecked. The shared actions' own steps count too:
   // a third-party action inside one runs in every job that calls it.
+  //
+  // This repo's own code is the case that mattered (FAM-2, 2026-11-13):
+  // kit-pin-bump.yml called `land-bot-pr@main` and `release.yml@main` from
+  // INSIDE itself, so a consumer pinned to a release still handed its write
+  // token and the App key to whatever main held that day. Own code is now
+  // reached through the checkout the job makes at its own commit (a `./`
+  // path into it), or — for the one nested call that can be neither local
+  // nor an expression — a release's SHA with the version beside it. Never
+  // `@main`.
   let rawCount = 0;
   let parsedCount = 0;
+  let ownPins = 0;
   const sources = [
     ...FILES.map((f) => [f, WF[f].src, allSteps(wf(f)).filter((s) => s.uses).length + Object.values(wf(f).jobs || {}).filter((j) => j.uses).length]),
     ...Object.values(ACTIONS).map((a) => [`actions/${a.name}`, a.src, (a.value.runs.steps || []).filter((s) => s.uses).length]),
@@ -321,10 +360,20 @@ test('actions follow the pinning policy: actions/* by major tag, anything else b
       if (!m) continue;
       rawCount++;
       const [, ref, comment] = m;
-      if (localTarget(ref)) continue;
-      const action = localAction(ref);
-      if (action) {
-        assert.ok(ACTIONS[action], `${f}: uses ${ref}, but .github/actions/${action}/action.yml does not exist`);
+      if (ref.startsWith('./')) {
+        // A local path: one of this repo's workflows (the self-callers), or the
+        // shared action inside the tooling checkout. Nothing else may be
+        // spelled that way.
+        const action = localAction(ref);
+        assert.ok(localTarget(ref) || action, `${f}: local uses ${ref} is neither a workflow here nor an action in the tooling checkout`);
+        if (action) assert.ok(ACTIONS[action], `${f}: uses ${ref}, but .github/actions/${action}/action.yml does not exist`);
+        continue;
+      }
+      if (/^jsvolos63\/vendor-cli\//i.test(ref)) {
+        ownPins++;
+        assert.match(ref, /@[0-9a-f]{40}$/, `${f}: this repo's own code at a mutable ref (FAM-2): ${ref}`);
+        assert.match(comment || '', /^v\d+\.\d+\.\d+$/, `${f}: SHA pin ${ref} has no "# vX.Y.Z" comment naming its release`);
+        assert.ok(localTarget(ref) || localAction(ref), `${f}: ${ref} names nothing in this repo`);
         continue;
       }
       if (ref.startsWith('actions/')) {
@@ -337,6 +386,7 @@ test('actions follow the pinning policy: actions/* by major tag, anything else b
     parsedCount += parsed;
   }
   assert.equal(rawCount, parsedCount, 'the raw scan and the parsed tree disagree on how many `uses:` there are');
+  assert.equal(ownPins, 1, 'exactly one self-reference should be a release pin: the bump\'s nested release.yml call');
 });
 
 test('every shared action parses, reads every input it declares, and is called with declared inputs only', () => {
@@ -373,14 +423,224 @@ test('every shared action parses, reads every input it declares, and is called w
   }
 });
 
-test('every job runs under a timeout, and every workflow caps its token', () => {
+// What each job may hold: exactly the grants its runs were measured using
+// (2026-11-13, from the family's run logs — the `GITHUB_TOKEN Permissions`
+// block of each job: family-ci's `checks` and the bump's `prepare` held
+// contents read; `bump` and BearsMockDraft's `land` actions, contents and
+// pull-requests write; the Dependabot `merge` contents and pull-requests
+// write; `release` contents write; the liveness job contents read and
+// issues write). The top level grants nothing, so a job added to any file
+// starts with no token at all. A called workflow's job still cannot exceed
+// its caller's grant; these are the ceilings this repo declares.
+const GRANTS = {
+  'family-ci.yml': { checks: { contents: 'read' }, 'version-bump': { contents: 'read' } },
+  'kit-pin-bump.yml': {
+    prepare: { contents: 'read' },
+    bump: { contents: 'write', 'pull-requests': 'write', actions: 'write' },
+    release: { contents: 'write' },
+  },
+  'release.yml': { release: { contents: 'write' } },
+  'dependabot-merge.yml': { merge: { contents: 'write', 'pull-requests': 'write' } },
+  'test.yml': { 'family-ci': { contents: 'read' } },
+  'release-self.yml': { release: { contents: 'write' } },
+  'dependabot-merge-self.yml': { merge: { contents: 'write', 'pull-requests': 'write' } },
+  'family-liveness.yml': { liveness: { contents: 'read', issues: 'write' } },
+};
+
+test('every workflow grants nothing at the top level, every job asks for exactly its measured grants, and every job runs under a timeout', () => {
+  assert.deepEqual(Object.keys(GRANTS).sort(), FILES, 'GRANTS names a workflow that is not here, or misses one');
   for (const f of FILES) {
     const w = wf(f);
-    assert.ok(w.permissions && typeof w.permissions === 'object', `${f}: no top-level permissions block`);
-    for (const [jobName, job] of Object.entries(w.jobs || {})) {
-      if (job.uses) continue; // a called workflow's jobs carry their own
+    assert.deepEqual(w.permissions, {}, `${f}: top-level permissions must be {} — a job asks for its own`);
+    assert.deepEqual(Object.keys(w.jobs).sort(), Object.keys(GRANTS[f]).sort(), `${f}: a job GRANTS does not know`);
+    for (const [jobName, job] of Object.entries(w.jobs)) {
+      assert.deepEqual(job.permissions, GRANTS[f][jobName], `${f} job ${jobName}: not its measured grants`);
+      if (job.uses) continue; // a called workflow's jobs carry their own timeouts
       assert.equal(typeof job['timeout-minutes'], 'number', `${f} job ${jobName}: no timeout-minutes`);
     }
+  }
+});
+
+test('the self-callers gate their workflow_run jobs themselves, as every consumer should', () => {
+  // The reusable workflows skip a run that is not theirs, but the CALLER
+  // decides when that code is handed a write token or the App key at all
+  // (JFS-Sports' JFS-13; the template the consumers carry): the Dependabot
+  // merge only for a run Dependabot started on this repo's own branch, the
+  // release for a dispatch or a green run of a push to this repo's main —
+  // never a pull request's, never a fork's (a fork's branch can be named
+  // main).
+  const merge = wf('dependabot-merge-self.yml').jobs.merge;
+  for (const part of [
+    "github.event.workflow_run.actor.login == 'dependabot[bot]'",
+    'github.event.workflow_run.head_repository.full_name == github.repository',
+  ]) assert.ok(String(merge.if).includes(part), `dependabot-merge-self.yml: the gate lacks ${part}`);
+  assert.doesNotMatch(String(merge.if), /\|\|/, 'dependabot-merge-self.yml: the gate must be a conjunction');
+  const release = wf('release-self.yml').jobs.release;
+  for (const part of [
+    "github.event_name == 'workflow_dispatch'",
+    "github.event.workflow_run.conclusion == 'success'",
+    "github.event.workflow_run.event != 'pull_request'",
+    'github.event.workflow_run.head_repository.full_name == github.repository',
+  ]) assert.ok(String(release.if).includes(part), `release-self.yml: the gate lacks ${part}`);
+  assert.deepEqual(wf('release-self.yml').on.workflow_run.branches, ['main']);
+});
+
+test('the reusable defaults install with no package scripts, and the audit steps have their measured shape', () => {
+  // FAM-11 / JFS-11: every install ran every package's install scripts — in
+  // CI with a token, and in the bump against kit commits resolved seconds
+  // ago. `--ignore-scripts` is a FLAG on the install, never an .npmrc rule,
+  // so a repo's own `npm run` pre/post hooks still run.
+  const ci = callInputs(wf('family-ci.yml'));
+  assert.equal(ci['install-command'].default, 'npm ci --ignore-scripts');
+  const bump = callInputs(wf('kit-pin-bump.yml'));
+  assert.equal(bump['install-command'].default, 'npm ci --ignore-scripts');
+  for (const name of ['vendor-sync-command', 'claude-md-sync-command']) {
+    assert.match(bump[name].default, /^npm install --ignore-scripts\n/, `kit-pin-bump ${name} re-installs with scripts`);
+  }
+  // prod-audit covers nothing where every dependency is a devDependency; the
+  // whole-tree audit and the signature check are the two steps JFS-Sports
+  // ran in its own check list, offered to every caller as inputs.
+  const steps = wf('family-ci.yml').jobs.checks.steps;
+  const install = steps.findIndex((s) => s.name === 'Install dependencies');
+  const audit = steps.findIndex((s) => s.if === 'inputs.audit');
+  const sig = steps.findIndex((s) => s.if === 'inputs.audit-signatures');
+  assert.ok(audit > install && sig > install, 'both audits run after the install');
+  assert.equal(steps[audit].run, 'npm audit --audit-level=high');
+  assert.equal(steps[sig].run, RETRY);
+  assert.match(RETRY, /^npm audit signatures \|\| \{ [^{}]*; sleep \d+; npm audit signatures; \}$/, 'one retry, and the group ends on the second run');
+  // This repo opts into all of it: its whole tree is dev, so prod-audit
+  // would cover nothing here.
+  const call = wf('test.yml').jobs['family-ci'].with;
+  assert.equal(call['install-command'], 'npm ci --ignore-scripts');
+  assert.equal(call.audit, true);
+  assert.equal(call['audit-signatures'], true);
+});
+
+// ------------------------------------------------------------------ the tooling checkout (FAM-2)
+
+test('both reusable workflows check the family tooling out at the commit they were called at, with one shared script', () => {
+  // family-ci checked vendor-cli out with no `ref` (main), and the bump
+  // called land-bot-pr@main: a consumer pinned to a release ran an old
+  // workflow against whatever main held that day. Now each resolves the ref
+  // it was called at off the caller's own `uses:` line, checks this repo out
+  // there, and proves it in the log. The two copies of the script are held
+  // identical here, and the script itself is run in the next test.
+  const place = (steps, job) => {
+    const tooling = steps.findIndex((s) => s.id === 'tooling');
+    assert.ok(tooling >= 0, `${job}: no step with id tooling`);
+    // The whole `job` context, as JSON: `job.workflow_sha` is GitHub's record
+    // of the commit it fetched the CALLED workflow from (the `github` context
+    // is the caller's — measured, see the resolve-script test below).
+    assert.deepEqual(steps[tooling].env, { JOB_JSON: '${{ toJSON(job) }}' }, `${job}: the resolve step reads something other than the job context`);
+    const checkout = steps.findIndex((s) => /^actions\/checkout@/.test(s.uses || '') && s.with && s.with.repository === 'jsvolos63/vendor-cli');
+    assert.ok(checkout > tooling, `${job}: the vendor-cli checkout must follow the resolve step`);
+    assert.equal(steps[checkout].with.ref, '${{ steps.tooling.outputs.sha }}', `${job}: the tooling checkout takes no ref, so it fetches main`);
+    assert.equal(steps[checkout].with.path, '.jfs-family/vendor-cli');
+    const verify = steps.findIndex((s) => s.name === 'Check the family tooling is at that commit');
+    assert.ok(verify > checkout, `${job}: the proof step must follow the checkout`);
+    assert.deepEqual(steps[verify].env, { SHA: '${{ steps.tooling.outputs.sha }}' });
+    return { tooling, checkout, verify, resolve: steps[tooling], proof: steps[verify] };
+  };
+  const ciSteps = wf('family-ci.yml').jobs.checks.steps;
+  const bumpSteps = wf('kit-pin-bump.yml').jobs.bump.steps;
+  const ci = place(ciSteps, 'family-ci');
+  const bump = place(bumpSteps, 'kit-pin-bump bump');
+  assert.equal(bump.resolve.run, ci.resolve.run, 'the two resolve scripts drifted');
+  assert.equal(bump.proof.run, ci.proof.run, 'the two proof scripts drifted');
+  // family-ci needs the tooling only for the three gates, and vendor-cli's
+  // own CI uses its local checkout: the resolve step carries that condition
+  // and the two steps after it follow its outcome.
+  assert.match(ci.resolve.if, /inputs\.verify-kit-pins \|\| inputs\.claude-md-check \|\| inputs\.maintenance-check/);
+  assert.match(ci.resolve.if, /github\.repository != 'jsvolos63\/vendor-cli'/);
+  assert.equal(ciSteps[ci.checkout].if, "steps.tooling.outcome == 'success'");
+  assert.equal(ciSteps[ci.verify].if, "steps.tooling.outcome == 'success'");
+  // The bump calls the action FROM that checkout, after the proof, and keeps
+  // the checkout out of the PR it opens — excluded before it exists.
+  const land = bumpSteps.findIndex((s) => s.id === 'land');
+  assert.equal(bumpSteps[land].uses, './.jfs-family/vendor-cli/.github/actions/land-bot-pr');
+  assert.ok(land > bump.verify, 'the action runs after the checkout is proved');
+  const exclude = bumpSteps.findIndex((s) => s.run === EXCLUDE_SCRIPT);
+  assert.ok(exclude > 0 && exclude < bump.checkout, 'the exclude must be written before the tooling checkout exists');
+  // No checkout of this repo, anywhere, takes no ref.
+  for (const f of FILES) {
+    for (const s of allSteps(wf(f))) {
+      if (s.with && s.with.repository === 'jsvolos63/vendor-cli') assert.ok(s.with.ref, `${f}: a vendor-cli checkout with no ref fetches main`);
+    }
+  }
+});
+
+test('the resolve script takes the commit from GitHub\'s record of the call, warns on a mutable ref, and refuses a missing one', () => {
+  // The `job` context of a reusable workflow, as measured on FlightCheck run
+  // 43414050010 (2026-11-13): check_run_id, status, workflow_repository,
+  // workflow_file_path, workflow_ref and workflow_sha — the CALLED workflow's
+  // repository, file, ref and commit, where `github.workflow_ref` /
+  // `github.workflow_sha` are the caller's. The run API's referenced_workflows
+  // (the other record of the same fact) is refused under contents: read.
+  const script = wf('family-ci.yml').jobs.checks.steps.find((s) => s.id === 'tooling').run;
+  const SHA = 'a'.repeat(40);
+  const call = (ref, sha = SHA) => ({
+    check_run_id: 131846679004, status: 'success',
+    workflow_repository: 'jsvolos63/Vendor-cli', workflow_file_path: '.github/workflows/family-ci.yml',
+    workflow_ref: `jsvolos63/Vendor-cli/.github/workflows/family-ci.yml@${ref}`, workflow_sha: sha,
+  });
+  const run = (job) => {
+    const dir = mkdtempSync(join(tmpdir(), 'tooling-ref-'));
+    try {
+      const out = join(dir, 'github-output');
+      const r = spawnSync('bash', ['-c', script], { cwd: dir, encoding: 'utf8', env: { ...process.env, JOB_JSON: JSON.stringify(job), GITHUB_OUTPUT: out } });
+      return { status: r.status, out: r.stdout + r.stderr, sha: existsSync(out) ? readFileSync(out, 'utf8').trim() : '' };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  let r = run(call(SHA));
+  assert.equal(r.status, 0, r.out);
+  assert.equal(r.sha, `sha=${SHA}`, 'a pinned call: the commit GitHub fetched the workflow from');
+  assert.match(r.out, /Called pinned to commit a{40}/);
+  assert.match(r.out, /GitHub's record of this call: \{"workflow_repository":"jsvolos63\/Vendor-cli","workflow_file_path":"\.github\/workflows\/family-ci\.yml","workflow_ref":/, 'the record is in the log, as the proof');
+  assert.doesNotMatch(r.out, /::warning::/);
+
+  r = run(call('refs/heads/main'));
+  assert.equal(r.status, 0, r.out);
+  assert.equal(r.sha, `sha=${SHA}`, 'an unpinned call still gets the commit main resolved to for THIS run');
+  assert.match(r.out, /::warning::Called at the mutable ref 'refs\/heads\/main' \(FAM-2\), which GitHub resolved to a{40} for this run/, 'and is told to pin');
+
+  r = run(call('refs/tags/v0.23.0'));
+  assert.equal(r.status, 0, r.out);
+  assert.match(r.out, /::warning::Called at the mutable ref 'refs\/tags\/v0\.23\.0'/, 'a tag is a mutable ref too — the policy is a SHA with the version beside it');
+
+  r = run({ check_run_id: 1, status: 'success' });
+  assert.equal(r.status, 1, 'no workflow_sha: refuse rather than guess');
+  assert.match(r.out, /::error::job\.workflow_sha does not name the commit this reusable workflow was fetched from \(got ''\)/);
+  assert.equal(r.sha, '', 'nothing is written to GITHUB_OUTPUT on a refusal');
+
+  r = run(call('refs/heads/main', 'main'));
+  assert.equal(r.status, 1, 'a workflow_sha that is not a commit is refused too');
+  assert.match(r.out, /\(got 'main'\)/);
+});
+
+test('the proof script holds the tooling checkout to the commit the workflow was fetched from', () => {
+  const script = wf('family-ci.yml').jobs.checks.steps.find((s) => s.name === 'Check the family tooling is at that commit').run;
+  const git = (cwd, ...a) => execFileSync('git', a, { cwd, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+  const dir = mkdtempSync(join(tmpdir(), 'tooling-proof-'));
+  try {
+    const tooling = join(dir, '.jfs-family', 'vendor-cli');
+    mkdirSync(tooling, { recursive: true });
+    git(tooling, 'init', '-q');
+    writeFileSync(join(tooling, 'package.json'), '{\n  "name": "@jfs/vendor-cli",\n  "version": "0.23.0",\n  "type": "module"\n}\n');
+    git(tooling, 'add', '-A');
+    git(tooling, 'commit', '-q', '-m', 'x');
+    const head = git(tooling, 'rev-parse', 'HEAD').trim();
+    const go = (sha) => spawnSync('bash', ['-c', script], { cwd: dir, encoding: 'utf8', env: { ...process.env, SHA: sha } });
+    let r = go(head);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, new RegExp(`jsvolos63/vendor-cli@${head} \\(version 0\\.23\\.0\\); this workflow was fetched from ${head}`), 'the log names the commit and the version');
+    r = go('b'.repeat(40));
+    assert.equal(r.status, 1, 'a checkout at another commit than the one the workflow was fetched from is refused');
+    assert.match(r.stdout, /::error::The family tooling checkout is at/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -508,7 +768,7 @@ const APPLY_SCRIPT = [
   'git apply --index --whitespace=nowarn "$RUNNER_TEMP/kit-pin-bump.patch"',
   "if refused=$(git diff --cached --name-only | grep -E '^\\.(github|claude)/'); then",
   '  echo "::error::The bump patch changes paths a pin bump must never touch; nothing is opened:"',
-  "  sed 's/^/  /' <<<\"$refused\"",
+  '  while IFS= read -r path; do echo "  $path"; done <<<"$refused"',
   '  exit 1',
   'fi',
   'git status --short',
@@ -538,10 +798,22 @@ test("kit-pin-bump hands the family App's secrets to the write job alone, and on
   // Nothing before the land step runs repo code (the untrusted-command test
   // above holds the whole job; this holds the order too).
   const at = w.jobs.bump.steps.findIndex((s) => s.id === 'land');
+  // Exactly the apply with its path refusal, the resolve of the commit this
+  // workflow was called at, the exclude that keeps the tooling checkout out
+  // of the PR, and the proof of that checkout — git, grep, sed and shell
+  // builtins over files already on the runner, and identical to family-ci's
+  // copies where a copy exists. Any other command here would run before the
+  // key arrives.
+  const familyCi = wf('family-ci.yml').jobs.checks.steps;
+  const preKey = new Set([
+    APPLY_SCRIPT,
+    familyCi.find((s) => s.id === 'tooling').run,
+    EXCLUDE_SCRIPT,
+    familyCi.find((s) => s.name === 'Check the family tooling is at that commit').run,
+  ]);
+  for (const script of preKey) assert.doesNotMatch(script, /\b(npm|npx|node)\b/, 'a pre-key script runs a package manager or node');
   for (const s of w.jobs.bump.steps.slice(0, at)) {
-    // Exactly the apply, the path refusal (git, grep and printf only) and a
-    // status line: any other command here would run before the key arrives.
-    assert.ok(!s.run || s.run === APPLY_SCRIPT, `"${s.name}" runs something before the key arrives`);
+    assert.ok(!s.run || preKey.has(s.run), `"${s.name}" runs something before the key arrives`);
     assert.ok(!s.uses || /^actions\/(checkout|download-artifact)@v\d+$/.test(s.uses), `"${s.name}" uses ${s.uses} before the key arrives`);
   }
   // No workflow in this repo forwards every secret it holds.
@@ -598,7 +870,7 @@ test('kit-pin-bump exposes the merge it made as a workflow output, empty when no
   assert.equal(out.value, '${{ jobs.bump.outputs.merge-sha }}');
   assert.equal(typeof out.description, 'string');
   assert.equal(w.jobs.bump.outputs['merge-sha'], '${{ steps.land.outputs.merge-sha }}');
-  assert.equal(w.jobs.bump.steps.find((st) => st.id === 'land').uses, 'jsvolos63/vendor-cli/.github/actions/land-bot-pr@main');
+  assert.equal(w.jobs.bump.steps.find((st) => st.id === 'land').uses, './.jfs-family/vendor-cli/.github/actions/land-bot-pr');
   assert.equal(ACTIONS['land-bot-pr'].value.outputs['merge-sha'].value, '${{ steps.merge.outputs.merge-sha }}');
 });
 

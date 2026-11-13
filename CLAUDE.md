@@ -14,18 +14,66 @@ change lands in every app's CI at once.
 ## Family CI (`.github/workflows/family-ci.yml`)
 
 This repo also hosts the family's reusable CI workflow. Every repo's CI
-calls it (`uses: jsvolos63/vendor-cli/.github/workflows/family-ci.yml@main`)
-instead of hand-copying the checkout/node/install/check skeleton; it carries
-the kit-pin pre-flight (the same `jfs-check-kit-pins` bin consumers can run
-locally — not a second spelling of it), the CLAUDE.md family-conventions check, the
-shipped-dependency audit gate (`prod-audit` — `npm audit --omit=dev
---audit-level=high`), the kit-style version-bump guard, and
-`node-version-file` (point it at a repo's `.nvmrc` so one file governs CI and
-the deploy, instead of the version being named once here and once for the
-deploy where the two can drift) as opt-in inputs. Edits to it land in every
-repo's next CI run at once — treat them like kit API changes. This repo's
-own `test.yml` references it locally (`uses: ./…`) so a PR editing the
-workflow validates against its own copy.
+calls it (`uses: jsvolos63/vendor-cli/.github/workflows/family-ci.yml@<sha>
+# vX.Y.Z` — a release's commit, never `@main`; see below) instead of
+hand-copying the checkout/node/install/check skeleton; it carries the
+kit-pin pre-flight (the same `jfs-check-kit-pins` bin consumers can run
+locally — not a second spelling of it), the CLAUDE.md family-conventions
+check, the shipped-dependency audit gate (`prod-audit` — `npm audit
+--omit=dev --audit-level=high`), the whole-tree audit and the registry
+signature check (`audit`, `audit-signatures` — the two JFS-Sports ran in its
+own check list, since `prod-audit` covers nothing in a repo whose every
+dependency is a devDependency; both opt-in), the kit-style version-bump
+guard (`version-guard-paths`), `maintenance-check`, `claude-md-check`,
+`python-version`, and `node-version-file` (point it at a repo's `.nvmrc` so
+one file governs CI and the deploy, instead of the version being named once
+here and once for the deploy where the two can drift) as inputs; its
+`install-command` default is `npm ci --ignore-scripts`, so no package's
+install script runs in CI unless a caller asks for it by name. Edits to it
+land in every pinned consumer's CI when that consumer's pin rolls — treat
+them like kit API changes. This repo's own `test.yml` references it locally
+(`uses: ./…`) so a PR editing the workflow validates against its own copy.
+
+**The tooling it checks out is at the commit it was called at (2026-11-13,
+FAM-2).** The kit-pin pre-flight, the CLAUDE.md and the MAINTENANCE.md gates
+run from a checkout of this repo into `.jfs-family/vendor-cli`, and that
+checkout took no `ref` — it fetched main. So pinning a caller's `uses:` to a
+release would have pinned the YAML and not the code: an old workflow running
+whatever tooling main held that day, a mismatch that breaks without warning
+when the two move together (JFS-Sports measured it on run 43338472557, and
+that is why no caller could be pinned before this landed). The commit comes
+from **`job.workflow_sha`** — GitHub's own record of the commit it fetched
+the called workflow from. Measured on FlightCheck run 43414050010 before the
+mechanism was chosen: in a reusable workflow the `job` context carries
+`workflow_repository`, `workflow_file_path`, `workflow_ref` and
+`workflow_sha` for the CALLED workflow (`job.workflow_sha` = the commit the
+caller's `uses:` resolved to), while `github.workflow_ref` /
+`github.workflow_sha` are the CALLER's, `github.job_workflow_sha` does not
+exist, and the run API's `referenced_workflows` — the other record of the
+same fact — is refused under `contents: read`. The `tooling` step hands the
+whole `job` context in as JSON (six fields, no secret), reads the commit
+with jq, logs the record, checks this repo out there and then PROVES it
+(`git rev-parse HEAD` in the log, held equal to the commit); a caller still
+at `@main` gets the commit main resolved to for its run — the same code as
+its YAML, which is the point — and a `::warning::` naming FAM-2. The same
+script, byte for byte, sits in `kit-pin-bump.yml`'s write job, which checks
+this repo out the same way and calls `land-bot-pr` from that checkout
+(`uses: ./.jfs-family/vendor-cli/.github/actions/land-bot-pr`) — it used to
+call the action `@main`, so even a pinned caller handed its write token and
+the App key to main's code. `test/workflows.test.mjs` holds the two copies
+identical, runs the script against a pinned call, a branch, a tag and a
+context with the field missing, and fails any vendor-cli checkout with no
+`ref`. (The first draft read the ref off the caller's own `uses:` line with
+grep and sed; the measurement made that parsing unnecessary.)
+
+Two things follow for the canonical texts. The CLAUDE.md and MAINTENANCE.md
+gates now compare against the PINNED commit, not main, so an edit to a
+canonical text reaches a consumer when its `uses:` pin rolls — Dependabot's
+monthly `github-actions` entry, behind the 7-day cooldown — and the rolling
+PR itself goes red until that consumer's block is re-synced (the kit-pin
+bump re-syncs from the npm pin, on its own date). A session that edits a
+canonical text still re-syncs every consumer in the same session; the pins
+mean the blast is no longer instant, not that it is gone.
 
 ## Kit pin bump (`.github/workflows/kit-pin-bump.yml`)
 
@@ -179,8 +227,10 @@ it is what decides whether a PR is opened at all.
 **Those steps live in one shared action, `.github/actions/land-bot-pr`**
 (since 2026-11-05). Opening the PR with a signed commit, dispatching CI and
 merging pinned to the head is a composite action that the bump's write job
-calls as `jsvolos63/vendor-cli/.github/actions/land-bot-pr@main`, and so do
-BearsMockDraft's two refresh crons. Each used to carry its own copy, and the
+calls from its checkout of this repo at the workflow's own commit
+(`uses: ./.jfs-family/vendor-cli/.github/actions/land-bot-pr`, since
+2026-11-13; it was `@main`), and BearsMockDraft's two refresh crons call
+pinned to a release (`…/land-bot-pr@<sha> # vX.Y.Z`). Each used to carry its own copy, and the
 copies drifted: the CI gate landed in the bump on 2026-11-02 and not in the
 crons, so the crons stopped landing data the next morning. A composite and
 not a reusable workflow, because the steps need the job's working tree: a
@@ -206,13 +256,15 @@ on:
   schedule:
     - cron: '41 6 2 * *'
   workflow_dispatch:
-permissions:
-  contents: write        # the caller must grant all three — a called
-  pull-requests: write   # workflow can't elevate its token
-  actions: write         # dispatch the repo's CI on the bump branch
+permissions: {}            # nothing by default; the job asks for its own
 jobs:
   bump:
-    uses: jsvolos63/vendor-cli/.github/workflows/kit-pin-bump.yml@main
+    permissions:
+      contents: write        # the caller must grant all three — a called
+      pull-requests: write   # workflow can't elevate its token
+      actions: write         # dispatch the repo's CI on the bump branch
+    # A release's commit, never @main (FAM-2); Dependabot rolls the pin.
+    uses: jsvolos63/vendor-cli/.github/workflows/kit-pin-bump.yml@<sha> # vX.Y.Z
     secrets:                    # the family App's two, by name; empty keeps
       FAMILY_BOT_APP_ID: ${{ secrets.FAMILY_BOT_APP_ID }}          # the
       FAMILY_BOT_PRIVATE_KEY: ${{ secrets.FAMILY_BOT_PRIVATE_KEY }} # default token
@@ -223,16 +275,34 @@ jobs:
 ```
 
 A **kit** caller (no `vendor:sync`, no `version:stamp` — its semver tracks
-`index.js` + `bin`) must also pass `vendor-sync-command: npm install` (so
-`package-lock.json` follows the bumped pin) and `version-bump-command: ''`.
+`index.js` + `bin`) must also pass `vendor-sync-command: npm install
+--ignore-scripts` (so `package-lock.json` follows the bumped pin) and
+`version-bump-command: ''`.
 Left at the defaults the run dies on `Missing script: "vendor:sync"`, which
 pwa-kit, netlify-kit and fetch-kit did on every scheduled run for two weeks
 while nothing watched: their vendor-cli pins sat at 0.18.1 against 0.21.3,
 and because each kit's vendor shim resolves the CLI from INSIDE the kit,
 every consumer vendored those three kits through the stale generator.
 
-Same rules as family-ci: edits land in every consumer's next scheduled bump
-at once — treat them like kit API changes.
+**The bump's `release` job is the one self-reference that is a SHA pin.** A
+nested reusable-workflow call can be neither a local path (`./` there names
+the CALLER's repository) nor an expression, so it cannot follow the tooling
+checkout the way `land-bot-pr` does; it is `uses:
+jsvolos63/vendor-cli/.github/workflows/release.yml@<sha> # vX.Y.Z`, a release
+of this repo, and Dependabot's `github-actions` entry rolls it like any other
+pin. A change to `release.yml` therefore reaches the bump's tagging one
+release later — the pin lags on purpose, and `test/workflows.test.mjs` holds
+it as the only `jsvolos63/vendor-cli/…@` reference in this repo's workflows.
+
+Since 2026-11-13 every install the bump runs is `--ignore-scripts` by default
+(`install-command`, and the re-installs inside `vendor-sync-command` and
+`claude-md-sync-command`): this job installs kit commits resolved seconds
+ago, and a git dependency's `prepare` script is exactly the code nobody
+reviewed. A consumer whose dependency genuinely needs its install script
+passes its own command, and says why beside it.
+
+Same rules as family-ci: edits land in every pinned consumer's bump when its
+pin rolls — treat them like kit API changes.
 
 ## Tree-shaking in the vendoring generator (esbuild since 0.16.0)
 
@@ -708,21 +778,25 @@ bump the version, and consumers pick it up via `jfs-claude-md-sync` — family
 CI fails any repo whose block has drifted. The block is deliberately short:
 only conventions that are truly family-wide belong in it.
 
-**Family CI checks the block against vendor-cli MAIN, not against the
-consumer's pin.** `family-ci.yml` clones this repo's main into
-`.jfs-family/vendor-cli` and runs `claude-md-sync --check` from there, so
-the moment an edit to the canonical text merges here, every consumer's
-next CI run — a Dependabot PR's, a session's dispatch, anything — fails
-its conventions check, and it stays red until that consumer's CLAUDE.md
-is re-synced. The monthly pin bump does carry the re-sync, but a repo
-cannot wait up to a month with CI red: the Dependabot merge workflow, for
-one, merges nothing while it is. This has now happened twice (the Look &
-feel section, then the Service-worker-updates and Dependencies sections:
+**Family CI checks the block against the vendor-cli commit the consumer's
+`uses:` names — which was MAIN until 2026-11-13.** `family-ci.yml` clones
+this repo into `.jfs-family/vendor-cli` at the commit it was called at (see
+"Family CI" above) and runs `claude-md-sync --check` from there. While every
+caller said `@main`, the moment an edit to the canonical text merged here
+every consumer's next CI run — a Dependabot PR's, a session's dispatch,
+anything — failed its conventions check, and stayed red until that
+consumer's CLAUDE.md was re-synced. That happened twice (the Look & feel
+section, then the Service-worker-updates and Dependencies sections:
 thirteen repos red at once; a third edit, on 2026-10-01, rewrote the
-Service-worker-updates and Dependencies sections and the protocol's
-hold rule). So the change to the canonical text and the re-sync of every
-consumer are ONE piece of work, in the same session: merge the vendor-cli
-change, then in each consumer run
+Service-worker-updates and Dependencies sections and the protocol's hold
+rule). With the callers pinned, the edit reaches a consumer when
+Dependabot rolls its `uses:` pin (monthly, behind the 7-day cooldown), and
+it is that rolling PR that goes red until the block is re-synced — a
+quieter failure, and one that holds the pin PR open. The monthly kit-pin
+bump does carry a re-sync, from the npm pin, but on its own date. So the
+change to the canonical text and the re-sync of every consumer are still
+ONE piece of work, in the same session: merge the vendor-cli change, then
+in each consumer run
 `node <vendor-cli checkout>/bin/claude-md-sync.mjs` and
 `node <vendor-cli checkout>/bin/maintenance-sync.mjs` from the repo root
 (each syncs the CWD's file), open the PR, dispatch CI, merge. Docs only, so

@@ -16,12 +16,22 @@
 #     workflow_run:
 #       workflows: [Test]        # must match the CI workflow's `name:`
 #       types: [completed]
+#       branches: [main]         # the caller half of the doubled guard below
 #     workflow_dispatch:
-#   permissions:
-#     contents: write
+#   permissions: {}              # nothing by default; the job asks for its own
 #   jobs:
 #     release:
-#       uses: jsvolos63/vendor-cli/.github/workflows/release.yml@main
+#       # The CALLER's gate: a dispatch, or a GREEN run of a push to this
+#       # repo's main — never a red run, a pull request's or a fork's.
+#       if: >-
+#         github.event_name == 'workflow_dispatch' ||
+#         (github.event.workflow_run.conclusion == 'success' &&
+#         github.event.workflow_run.event != 'pull_request' &&
+#         github.event.workflow_run.head_repository.full_name == github.repository)
+#       permissions:
+#         contents: write
+#       # A release's commit, never `@main` (FAM-2); Dependabot rolls the pin.
+#       uses: jsvolos63/vendor-cli/.github/workflows/release.yml@<sha> # vX.Y.Z
 #       with:
 #         title: '@jfs/fetch-kit'
 #
@@ -74,16 +84,17 @@ concurrency:
   group: jfs-release-${{ github.repository }}
   cancel-in-progress: false
 
-# Cap the token here as well as in the caller: a called workflow inherits the
-# caller's grant, and the other three reusable workflows all declare their own
-# ceiling. `gh release create` needs exactly contents: write.
-permissions:
-  contents: write
+# Nothing by default; the one job asks for exactly what `gh release create`
+# needs (the family's workflow rule, 2026-11-13). The caller's grant is the
+# ceiling either way — a called workflow inherits it and can only narrow it.
+permissions: {}
 
 jobs:
   release:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write   # the tag and the release
     # Only tag a commit CI went green on. A manual dispatch skips the gate on
     # purpose — that is the backfill path for a version that shipped before
     # this workflow existed, or whose push fired no workflows (a bump PR
