@@ -206,6 +206,29 @@ jobs:
         with:
           persist-credentials: false
 
+      # TEMPORARY (scratch-branch measurement only, removed before merge):
+      # which contexts, if any, name the CALLED workflow's commit on the
+      # runner? Prints the candidates the owner asked to try — job.workflow_sha,
+      # github.workflow_ref/sha — plus the `job` and `github` context keys and
+      # whether the run API's referenced_workflows is readable with this job's
+      # contents:read token. Keys and refs only; the token is masked anyway.
+      - name: TEMP measure which contexts name the called commit
+        env:
+          JOB_JSON: ${{ toJSON(job) }}
+          GITHUB_JSON: ${{ toJSON(github) }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "github.workflow_ref=$(jq -r '.workflow_ref // "ABSENT"' <<<"$GITHUB_JSON")"
+          echo "github.workflow_sha=$(jq -r '.workflow_sha // "ABSENT"' <<<"$GITHUB_JSON")"
+          echo "github.job_workflow_sha=$(jq -r '.job_workflow_sha // "ABSENT"' <<<"$GITHUB_JSON")"
+          echo "github.sha=$(jq -r '.sha // "ABSENT"' <<<"$GITHUB_JSON")"
+          echo "job.workflow_sha=$(jq -r '.workflow_sha // "ABSENT"' <<<"$JOB_JSON")"
+          echo "job context keys: $(jq -r 'keys|join(",")' <<<"$JOB_JSON")"
+          echo "github context keys: $(jq -r 'keys|join(",")' <<<"$GITHUB_JSON")"
+          env | grep -iE 'WORKFLOW|JOB_' | sort
+          echo "--- referenced_workflows via the run API, this job's token:"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq '.referenced_workflows' || echo "run API refused with this token (exit $?)"
+
       # Which commit of vendor-cli is this run executing? See the header: the
       # `github` context is the caller's, so the answer is on the caller's
       # own `uses:` line. The script is bash, grep and sed over one file in
