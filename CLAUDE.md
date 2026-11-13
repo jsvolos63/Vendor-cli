@@ -41,21 +41,30 @@ checkout took no `ref` — it fetched main. So pinning a caller's `uses:` to a
 release would have pinned the YAML and not the code: an old workflow running
 whatever tooling main held that day, a mismatch that breaks without warning
 when the two move together (JFS-Sports measured it on run 43338472557, and
-that is why no caller could be pinned before this landed). Nothing in the
-`github` context names the commit a called workflow was fetched at — in a
-reusable workflow that context is the CALLER's — and the OIDC claim that does
-(`job_workflow_sha`) would cost every caller an `id-token: write` grant. So
-the `tooling` step reads the ref off the caller's own `uses:` line, in the
-caller's checkout: the same file GitHub read to start the run. A 40-hex ref
-is checked out and then PROVED (`git rev-parse HEAD` in the log, held equal
-to the ref); `@main` still gets main, with a `::warning::` naming FAM-2. The
-same script, byte for byte, sits in `kit-pin-bump.yml`'s write job, which
-checks this repo out the same way and calls `land-bot-pr` from that checkout
+that is why no caller could be pinned before this landed). The commit comes
+from **`job.workflow_sha`** — GitHub's own record of the commit it fetched
+the called workflow from. Measured on FlightCheck run 43414050010 before the
+mechanism was chosen: in a reusable workflow the `job` context carries
+`workflow_repository`, `workflow_file_path`, `workflow_ref` and
+`workflow_sha` for the CALLED workflow (`job.workflow_sha` = the commit the
+caller's `uses:` resolved to), while `github.workflow_ref` /
+`github.workflow_sha` are the CALLER's, `github.job_workflow_sha` does not
+exist, and the run API's `referenced_workflows` — the other record of the
+same fact — is refused under `contents: read`. The `tooling` step hands the
+whole `job` context in as JSON (six fields, no secret), reads the commit
+with jq, logs the record, checks this repo out there and then PROVES it
+(`git rev-parse HEAD` in the log, held equal to the commit); a caller still
+at `@main` gets the commit main resolved to for its run — the same code as
+its YAML, which is the point — and a `::warning::` naming FAM-2. The same
+script, byte for byte, sits in `kit-pin-bump.yml`'s write job, which checks
+this repo out the same way and calls `land-bot-pr` from that checkout
 (`uses: ./.jfs-family/vendor-cli/.github/actions/land-bot-pr`) — it used to
 call the action `@main`, so even a pinned caller handed its write token and
 the App key to main's code. `test/workflows.test.mjs` holds the two copies
-identical, runs the script against pinned, unpinned, quoted, doubled and
-missing callers, and fails any vendor-cli checkout with no `ref`.
+identical, runs the script against a pinned call, a branch, a tag and a
+context with the field missing, and fails any vendor-cli checkout with no
+`ref`. (The first draft read the ref off the caller's own `uses:` line with
+grep and sed; the measurement made that parsing unnecessary.)
 
 Two things follow for the canonical texts. The CLAUDE.md and MAINTENANCE.md
 gates now compare against the PINNED commit, not main, so an edit to a

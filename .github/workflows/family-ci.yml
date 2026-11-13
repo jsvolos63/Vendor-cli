@@ -45,12 +45,14 @@
 # old workflow against whatever tooling main held that day, a mismatch that
 # breaks without warning when the two move together (JFS-Sports measured it
 # on run 43338472557, which is why the callers could not be pinned first).
-# Nothing in the `github` context names the commit a called workflow was
-# fetched at — in a reusable workflow that context is the CALLER's, and the
-# OIDC claim that does name it (`job_workflow_sha`) would cost every caller
-# an `id-token: write` grant — so the ref is read off the caller's own
-# `uses:` line, in its checkout: the same file GitHub read to start this
-# run. A caller still at `@main` gets main, as before, and a warning.
+# The commit comes from `job.workflow_sha`: GitHub's own record of the commit
+# it fetched THIS reusable workflow from (measured on FlightCheck run
+# 43414050010 — the `job` context carries workflow_sha, workflow_ref,
+# workflow_repository and workflow_file_path for the CALLED workflow, while
+# `github.workflow_sha` / `github.workflow_ref` are the caller's, and the
+# run API's `referenced_workflows` is refused under contents: read). A
+# caller still at `@main` gets the commit main resolved to for its run — the
+# same code as its YAML, which is the point — and a warning.
 name: Family CI
 
 on:
@@ -206,92 +208,60 @@ jobs:
         with:
           persist-credentials: false
 
-      # TEMPORARY (scratch-branch measurement only, removed before merge):
-      # which contexts, if any, name the CALLED workflow's commit on the
-      # runner? Prints the candidates the owner asked to try — job.workflow_sha,
-      # github.workflow_ref/sha — plus the `job` and `github` context keys and
-      # whether the run API's referenced_workflows is readable with this job's
-      # contents:read token. Keys and refs only; the token is masked anyway.
-      - name: TEMP measure which contexts name the called commit
-        env:
-          JOB_JSON: ${{ toJSON(job) }}
-          GITHUB_JSON: ${{ toJSON(github) }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "github.workflow_ref=$(jq -r '.workflow_ref // "ABSENT"' <<<"$GITHUB_JSON")"
-          echo "github.workflow_sha=$(jq -r '.workflow_sha // "ABSENT"' <<<"$GITHUB_JSON")"
-          echo "github.job_workflow_sha=$(jq -r '.job_workflow_sha // "ABSENT"' <<<"$GITHUB_JSON")"
-          echo "github.sha=$(jq -r '.sha // "ABSENT"' <<<"$GITHUB_JSON")"
-          echo "job.workflow_sha=$(jq -r '.workflow_sha // "ABSENT"' <<<"$JOB_JSON")"
-          echo "job context keys: $(jq -r 'keys|join(",")' <<<"$JOB_JSON")"
-          echo "github context keys: $(jq -r 'keys|join(",")' <<<"$GITHUB_JSON")"
-          env | grep -iE 'WORKFLOW|JOB_' | sort
-          echo "--- referenced_workflows via the run API, this job's token:"
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq '.referenced_workflows' || echo "run API refused with this token (exit $?)"
-
-      # Which commit of vendor-cli is this run executing? See the header: the
-      # `github` context is the caller's, so the answer is on the caller's
-      # own `uses:` line. The script is bash, grep and sed over one file in
-      # the checkout; the SAME script sits in kit-pin-bump.yml's write job,
-      # and test/workflows.test.mjs holds the two copies identical and runs
-      # them against pinned, unpinned, quoted, doubled and missing callers.
+      # Which commit of vendor-cli is this run executing? `job.workflow_sha`
+      # — see the header. The whole `job` context goes in as JSON (six
+      # fields, no secret) and jq reads it, so the script is testable with a
+      # fixture and actionlint's context typing is not in the way. The SAME
+      # script sits in kit-pin-bump.yml's write job; test/workflows.test.mjs
+      # holds the two copies identical and runs them against a pinned call,
+      # an unpinned call and a context with the field missing.
       - name: Resolve the commit this workflow was called at
         id: tooling
         if: (inputs.verify-kit-pins || inputs.claude-md-check || inputs.maintenance-check) && github.repository != 'jsvolos63/vendor-cli'
         env:
-          WORKFLOW_REF: ${{ github.workflow_ref }}
-          CALLED: family-ci.yml
+          JOB_JSON: ${{ toJSON(job) }}
         run: |
           set -euo pipefail
-          # WORKFLOW_REF is owner/repo/.github/workflows/<file>@<ref> — the
-          # CALLER's workflow, and the one file GitHub read to start this run.
-          file=${WORKFLOW_REF#*/.github/workflows/}
-          file=${file%%@*}
-          caller=".github/workflows/$file"
-          if [ ! -f "$caller" ]; then
-            echo "::error::Cannot find the calling workflow ($caller, from github.workflow_ref=$WORKFLOW_REF) in the checkout, so the commit $CALLED was called at is unknown."
+          # job.workflow_sha is the commit GitHub fetched THIS reusable
+          # workflow from; job.workflow_ref is how the caller named it
+          # (owner/repo/.github/workflows/<file>@<ref>). Both are GitHub's
+          # record of the call, not a reading of the caller's file.
+          sha=$(jq -r '.workflow_sha // ""' <<<"$JOB_JSON")
+          ref=$(jq -r '.workflow_ref // ""' <<<"$JOB_JSON")
+          echo "GitHub's record of this call: $(jq -c '{workflow_repository, workflow_file_path, workflow_ref, workflow_sha}' <<<"$JOB_JSON")"
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::job.workflow_sha does not name the commit this reusable workflow was fetched from (got '$sha'); refusing to guess which vendor-cli to check out."
             exit 1
           fi
-          # Every `uses:` of this workflow in that file (owner/repo is
-          # case-insensitive on GitHub, so is this; a commented-out line is
-          # not a `uses:` line), with the ref after the `@` and nothing
-          # else: quotes, a trailing comment and whitespace come off.
-          mapfile -t refs < <(grep -iF -- "jsvolos63/vendor-cli/.github/workflows/$CALLED@" "$caller" \
-            | grep -E '^[[:space:]]*(-[[:space:]]+)?uses:' \
-            | sed -E "s#^.*/$CALLED@##; s#[\"']?[[:space:]]*(\\#.*)?\$##" | sort -u)
-          if [ "${#refs[@]}" -ne 1 ] || [ -z "${refs[0]}" ]; then
-            echo "::error::Expected exactly one 'uses: jsvolos63/vendor-cli/.github/workflows/$CALLED@<ref>' in $caller; found ${#refs[@]}${refs[*]:+: ${refs[*]}}."
-            exit 1
-          fi
-          ref=${refs[0]}
-          if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "$CALLED was called at commit $ref; the family tooling is checked out at that commit."
+          named=${ref##*@}
+          if [ "$named" = "$sha" ]; then
+            echo "Called pinned to commit $sha; the family tooling is checked out at that commit."
           else
-            echo "::warning::$caller calls $CALLED at the mutable ref '$ref' (FAM-2), so the family tooling follows that ref. Pin it: uses: jsvolos63/vendor-cli/.github/workflows/$CALLED@<sha> # vX.Y.Z"
+            echo "::warning::Called at the mutable ref '$named' (FAM-2), which GitHub resolved to $sha for this run; the family tooling is checked out at that commit. Pin it: uses: jsvolos63/vendor-cli/.github/workflows/<file>@<sha> # vX.Y.Z"
           fi
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v7
         if: steps.tooling.outcome == 'success'
         with:
           repository: jsvolos63/vendor-cli
-          ref: ${{ steps.tooling.outputs.ref }}
+          ref: ${{ steps.tooling.outputs.sha }}
           path: .jfs-family/vendor-cli
           persist-credentials: false
 
       # The proof, in every run log: the commit the tooling checkout is at,
-      # held to the ref the caller named when that ref is a commit.
+      # held equal to the commit this workflow was fetched from.
       - name: Check the family tooling is at that commit
         if: steps.tooling.outcome == 'success'
         env:
-          REF: ${{ steps.tooling.outputs.ref }}
+          SHA: ${{ steps.tooling.outputs.sha }}
         run: |
           set -euo pipefail
           head=$(git -C .jfs-family/vendor-cli rev-parse HEAD)
           version=$(sed -nE 's/^  "version": "([^"]+)",?$/\1/p' .jfs-family/vendor-cli/package.json | head -1)
-          echo "Family tooling: jsvolos63/vendor-cli@$head (version ${version:-?}), called at '$REF'."
-          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]] && [ "$head" != "$REF" ]; then
-            echo "::error::The family tooling checkout is at $head, not the $REF this workflow was called at."
+          echo "Family tooling: jsvolos63/vendor-cli@$head (version ${version:-?}); this workflow was fetched from $SHA."
+          if [ "$head" != "$SHA" ]; then
+            echo "::error::The family tooling checkout is at $head, not the $SHA this workflow was fetched from."
             exit 1
           fi
 

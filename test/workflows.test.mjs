@@ -26,12 +26,13 @@
 //
 // Since 2026-11-13 (FAM-2) it also holds how this repo's own code is reached:
 // family-ci and the bump check vendor-cli out at the commit they were CALLED
-// at (the resolve script is run here against pinned, unpinned, quoted,
-// doubled and missing callers), the bump calls land-bot-pr from that
-// checkout, the one nested call that cannot is pinned by release SHA, no
-// `uses:` names `@main`, every workflow grants nothing at the top level and
-// each job exactly its measured grants, the self-callers gate their
-// workflow_run jobs, and the install defaults run no package scripts.
+// at — `job.workflow_sha`, GitHub's record of the call; the resolve script is
+// run here against a pinned call, a branch, a tag and a context missing the
+// field — the bump calls land-bot-pr from that checkout, the one nested call
+// that cannot is pinned by release SHA, no `uses:` names `@main`, every
+// workflow grants nothing at the top level and each job exactly its measured
+// grants, the self-callers gate their workflow_run jobs, and the install
+// defaults run no package scripts.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -527,22 +528,23 @@ test('both reusable workflows check the family tooling out at the commit they we
   const place = (steps, job) => {
     const tooling = steps.findIndex((s) => s.id === 'tooling');
     assert.ok(tooling >= 0, `${job}: no step with id tooling`);
-    assert.equal(steps[tooling].env.WORKFLOW_REF, '${{ github.workflow_ref }}', `${job}: the resolve step reads another ref`);
+    // The whole `job` context, as JSON: `job.workflow_sha` is GitHub's record
+    // of the commit it fetched the CALLED workflow from (the `github` context
+    // is the caller's — measured, see the resolve-script test below).
+    assert.deepEqual(steps[tooling].env, { JOB_JSON: '${{ toJSON(job) }}' }, `${job}: the resolve step reads something other than the job context`);
     const checkout = steps.findIndex((s) => /^actions\/checkout@/.test(s.uses || '') && s.with && s.with.repository === 'jsvolos63/vendor-cli');
     assert.ok(checkout > tooling, `${job}: the vendor-cli checkout must follow the resolve step`);
-    assert.equal(steps[checkout].with.ref, '${{ steps.tooling.outputs.ref }}', `${job}: the tooling checkout takes no ref, so it fetches main`);
+    assert.equal(steps[checkout].with.ref, '${{ steps.tooling.outputs.sha }}', `${job}: the tooling checkout takes no ref, so it fetches main`);
     assert.equal(steps[checkout].with.path, '.jfs-family/vendor-cli');
     const verify = steps.findIndex((s) => s.name === 'Check the family tooling is at that commit');
     assert.ok(verify > checkout, `${job}: the proof step must follow the checkout`);
-    assert.equal(steps[verify].env.REF, '${{ steps.tooling.outputs.ref }}');
+    assert.deepEqual(steps[verify].env, { SHA: '${{ steps.tooling.outputs.sha }}' });
     return { tooling, checkout, verify, resolve: steps[tooling], proof: steps[verify] };
   };
   const ciSteps = wf('family-ci.yml').jobs.checks.steps;
   const bumpSteps = wf('kit-pin-bump.yml').jobs.bump.steps;
   const ci = place(ciSteps, 'family-ci');
   const bump = place(bumpSteps, 'kit-pin-bump bump');
-  assert.equal(ci.resolve.env.CALLED, 'family-ci.yml');
-  assert.equal(bump.resolve.env.CALLED, 'kit-pin-bump.yml');
   assert.equal(bump.resolve.run, ci.resolve.run, 'the two resolve scripts drifted');
   assert.equal(bump.proof.run, ci.proof.run, 'the two proof scripts drifted');
   // family-ci needs the tooling only for the three gates, and vendor-cli's
@@ -567,63 +569,58 @@ test('both reusable workflows check the family tooling out at the commit they we
   }
 });
 
-test('the resolve script reads the ref off the caller\'s own uses: line, and refuses anything but exactly one', () => {
+test('the resolve script takes the commit from GitHub\'s record of the call, warns on a mutable ref, and refuses a missing one', () => {
+  // The `job` context of a reusable workflow, as measured on FlightCheck run
+  // 43414050010 (2026-11-13): check_run_id, status, workflow_repository,
+  // workflow_file_path, workflow_ref and workflow_sha — the CALLED workflow's
+  // repository, file, ref and commit, where `github.workflow_ref` /
+  // `github.workflow_sha` are the caller's. The run API's referenced_workflows
+  // (the other record of the same fact) is refused under contents: read.
   const script = wf('family-ci.yml').jobs.checks.steps.find((s) => s.id === 'tooling').run;
   const SHA = 'a'.repeat(40);
-  const run = (files, { called = 'family-ci.yml', ref = 'jsvolos63/Example/.github/workflows/ci.yml@refs/heads/main' } = {}) => {
+  const call = (ref, sha = SHA) => ({
+    check_run_id: 131846679004, status: 'success',
+    workflow_repository: 'jsvolos63/Vendor-cli', workflow_file_path: '.github/workflows/family-ci.yml',
+    workflow_ref: `jsvolos63/Vendor-cli/.github/workflows/family-ci.yml@${ref}`, workflow_sha: sha,
+  });
+  const run = (job) => {
     const dir = mkdtempSync(join(tmpdir(), 'tooling-ref-'));
     try {
-      for (const [f, body] of Object.entries(files)) {
-        mkdirSync(dirname(join(dir, f)), { recursive: true });
-        writeFileSync(join(dir, f), body);
-      }
       const out = join(dir, 'github-output');
-      const r = spawnSync('bash', ['-c', script], { cwd: dir, encoding: 'utf8', env: { ...process.env, WORKFLOW_REF: ref, CALLED: called, GITHUB_OUTPUT: out } });
-      return { status: r.status, out: r.stdout + r.stderr, ref: existsSync(out) ? readFileSync(out, 'utf8').trim() : '' };
+      const r = spawnSync('bash', ['-c', script], { cwd: dir, encoding: 'utf8', env: { ...process.env, JOB_JSON: JSON.stringify(job), GITHUB_OUTPUT: out } });
+      return { status: r.status, out: r.stdout + r.stderr, sha: existsSync(out) ? readFileSync(out, 'utf8').trim() : '' };
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   };
-  const caller = (uses) => `name: CI\non:\n  push:\njobs:\n  family-ci:\n    uses: ${uses}\n    with:\n      run: npm test\n`;
-  const pinned = `jsvolos63/vendor-cli/.github/workflows/family-ci.yml@${SHA}`;
 
-  let r = run({ '.github/workflows/ci.yml': caller(`${pinned} # v0.23.0`) });
+  let r = run(call(SHA));
   assert.equal(r.status, 0, r.out);
-  assert.equal(r.ref, `ref=${SHA}`, 'a pinned caller: its commit, the trailing comment stripped');
+  assert.equal(r.sha, `sha=${SHA}`, 'a pinned call: the commit GitHub fetched the workflow from');
+  assert.match(r.out, /Called pinned to commit a{40}/);
+  assert.match(r.out, /GitHub's record of this call: \{"workflow_repository":"jsvolos63\/Vendor-cli","workflow_file_path":"\.github\/workflows\/family-ci\.yml","workflow_ref":/, 'the record is in the log, as the proof');
   assert.doesNotMatch(r.out, /::warning::/);
 
-  r = run({ '.github/workflows/ci.yml': caller('jsvolos63/vendor-cli/.github/workflows/family-ci.yml@main') });
+  r = run(call('refs/heads/main'));
   assert.equal(r.status, 0, r.out);
-  assert.equal(r.ref, 'ref=main', 'an unpinned caller still gets main');
-  assert.match(r.out, /::warning::.*FAM-2/, 'and is told to pin');
+  assert.equal(r.sha, `sha=${SHA}`, 'an unpinned call still gets the commit main resolved to for THIS run');
+  assert.match(r.out, /::warning::Called at the mutable ref 'refs\/heads\/main' \(FAM-2\), which GitHub resolved to a{40} for this run/, 'and is told to pin');
 
-  r = run({ '.github/workflows/ci.yml': caller(`"jsvolos63/Vendor-cli/.github/workflows/family-ci.yml@${SHA}"`) });
+  r = run(call('refs/tags/v0.23.0'));
   assert.equal(r.status, 0, r.out);
-  assert.equal(r.ref, `ref=${SHA}`, 'quotes and the owner\'s case do not matter — GitHub ignores both');
+  assert.match(r.out, /::warning::Called at the mutable ref 'refs\/tags\/v0\.23\.0'/, 'a tag is a mutable ref too — the policy is a SHA with the version beside it');
 
-  r = run({ '.github/workflows/ci.yml': `# uses: jsvolos63/vendor-cli/.github/workflows/family-ci.yml@main\n${caller(pinned)}  release:\n    uses: jsvolos63/vendor-cli/.github/workflows/release.yml@main\n` });
-  assert.equal(r.status, 0, r.out);
-  assert.equal(r.ref, `ref=${SHA}`, 'a commented-out line and another workflow\'s uses: are not uses of this one');
+  r = run({ check_run_id: 1, status: 'success' });
+  assert.equal(r.status, 1, 'no workflow_sha: refuse rather than guess');
+  assert.match(r.out, /::error::job\.workflow_sha does not name the commit this reusable workflow was fetched from \(got ''\)/);
+  assert.equal(r.sha, '', 'nothing is written to GITHUB_OUTPUT on a refusal');
 
-  r = run({ '.github/workflows/ci.yml': `${caller(pinned)}  again:\n    uses: jsvolos63/vendor-cli/.github/workflows/family-ci.yml@main\n` });
-  assert.equal(r.status, 1, 'two different refs cannot both be the one this run executes');
-  assert.match(r.out, /Expected exactly one .*found 2/);
-
-  r = run({ '.github/workflows/ci.yml': 'on: push\njobs: {}\n' });
-  assert.equal(r.status, 1);
-  assert.match(r.out, /found 0/);
-
-  r = run({});
-  assert.equal(r.status, 1);
-  assert.match(r.out, /Cannot find the calling workflow/);
-
-  r = run({ '.github/workflows/kit-pin-bump.yml': caller(`jsvolos63/vendor-cli/.github/workflows/kit-pin-bump.yml@${SHA}`) },
-    { called: 'kit-pin-bump.yml', ref: 'jsvolos63/Example/.github/workflows/kit-pin-bump.yml@refs/pull/7/merge' });
-  assert.equal(r.status, 0, r.out);
-  assert.equal(r.ref, `ref=${SHA}`, 'the file name comes off workflow_ref, whatever the ref part says');
+  r = run(call('refs/heads/main', 'main'));
+  assert.equal(r.status, 1, 'a workflow_sha that is not a commit is refused too');
+  assert.match(r.out, /\(got 'main'\)/);
 });
 
-test('the proof script holds the tooling checkout to the commit the caller named', () => {
+test('the proof script holds the tooling checkout to the commit the workflow was fetched from', () => {
   const script = wf('family-ci.yml').jobs.checks.steps.find((s) => s.name === 'Check the family tooling is at that commit').run;
   const git = (cwd, ...a) => execFileSync('git', a, { cwd, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
   const dir = mkdtempSync(join(tmpdir(), 'tooling-proof-'));
@@ -635,15 +632,13 @@ test('the proof script holds the tooling checkout to the commit the caller named
     git(tooling, 'add', '-A');
     git(tooling, 'commit', '-q', '-m', 'x');
     const head = git(tooling, 'rev-parse', 'HEAD').trim();
-    const go = (ref) => spawnSync('bash', ['-c', script], { cwd: dir, encoding: 'utf8', env: { ...process.env, REF: ref } });
+    const go = (sha) => spawnSync('bash', ['-c', script], { cwd: dir, encoding: 'utf8', env: { ...process.env, SHA: sha } });
     let r = go(head);
     assert.equal(r.status, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, new RegExp(`jsvolos63/vendor-cli@${head} \\(version 0\\.23\\.0\\), called at '${head}'`), 'the log names the commit and the version');
+    assert.match(r.stdout, new RegExp(`jsvolos63/vendor-cli@${head} \\(version 0\\.23\\.0\\); this workflow was fetched from ${head}`), 'the log names the commit and the version');
     r = go('b'.repeat(40));
-    assert.equal(r.status, 1, 'a checkout at another commit than the one named is refused');
+    assert.equal(r.status, 1, 'a checkout at another commit than the one the workflow was fetched from is refused');
     assert.match(r.stdout, /::error::The family tooling checkout is at/);
-    r = go('main');
-    assert.equal(r.status, 0, 'a mutable ref cannot be held to a commit, only reported');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
