@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -1291,4 +1291,61 @@ test('header carries the fixture package version', () => {
   assert.equal(r.status, 0, r.stderr);
   const out = readFileSync(join(dir, 'h.js'), 'utf8');
   assert.ok(out.startsWith('// VENDORED from @jfs/fixture-kit v9.9.9 (github:jsvolos63/fixture-kit)'));
+});
+
+// ── --format css --asset (0.24.0): a stylesheet a kit ships beside index.js ──
+
+test('css format: the asset verbatim under a CSS provenance header, and --check holds it', () => {
+  const dir = freshDir();
+  const r = run(['--format', 'css', '--asset', 'fixture.css', '--out', 'v/fixture.css'], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const out = readFileSync(join(dir, 'v/fixture.css'), 'utf8');
+  const body = readFileSync(join(KIT_DIR, 'fixture.css'), 'utf8');
+  assert.ok(out.startsWith('/* VENDORED from @jfs/fixture-kit v9.9.9 (github:jsvolos63/fixture-kit), fixture.css, pinned in package.json.\n'));
+  assert.ok(out.endsWith(body), 'the asset is copied byte for byte after the header');
+  assert.equal(out.indexOf('*/'), out.indexOf(' * to fail on drift. */') + ' * to fail on drift. '.length, 'the header closes once, at its end');
+  assert.equal(run(['--format', 'css', '--asset', 'fixture.css', '--out', 'v/fixture.css', '--check'], dir).status, 0);
+  writeFileSync(join(dir, 'v/fixture.css'), out.replace('red', 'blue'));
+  const drift = run(['--format', 'css', '--asset', 'fixture.css', '--out', 'v/fixture.css', '--check'], dir);
+  assert.equal(drift.status, 1);
+  assert.match(drift.stderr, /out of sync/);
+});
+
+test('css format refuses a bad, missing, symlinked or unshipped asset, and mixes with no JS option', () => {
+  const dir = freshDir();
+  const refuse = (args, re) => {
+    const r = run(args, dir);
+    assert.equal(r.status, 1, `${args.join(' ')} should be refused`);
+    assert.match(r.stderr, re);
+  };
+  refuse(['--format', 'css', '--out', 'x.css'], /requires --asset/);
+  for (const bad of ['../index.js', 'sub/x.css', 'X.css', 'index.js', '.hidden.css', 'a.css.js']) {
+    refuse(['--format', 'css', '--asset', bad, '--out', 'x.css'], /plain lowercase file name/);
+  }
+  refuse(['--format', 'css', '--asset', 'absent.css', '--out', 'x.css'], /does not exist/);
+  refuse(['--format', 'css', '--asset', 'fixture.css', '--pick', 'a', '--out', 'x.css'], /takes no --name\/--pick\/--global/);
+  refuse(['--format', 'esm', '--asset', 'fixture.css', '--out', 'x.js'], /only valid with --format css/);
+  assert.ok(!existsSync(join(dir, 'x.css')), 'nothing written on a refusal');
+});
+
+test('css format refuses a symlinked asset and one the kit does not ship', () => {
+  // A throwaway kit with a `files` list, driven through runVendorCli itself.
+  const kit = freshDir();
+  writeFileSync(join(kit, 'index.js'), source);
+  writeFileSync(join(kit, 'package.json'), JSON.stringify({ ...pkg, files: ['index.js', 'shipped.css', 'linked.css'] }));
+  writeFileSync(join(kit, 'shipped.css'), '.a{}\n');
+  writeFileSync(join(kit, 'unshipped.css'), '.b{}\n');
+  symlinkSync(join(KIT_DIR, 'fixture.css'), join(kit, 'linked.css'));
+  const cliUrl = pathToFileURL(join(KIT_DIR, '..', '..', 'index.mjs')).href;
+  const drive = (asset) => spawnSync(process.execPath, ['--input-type=module', '-e',
+    `import(${JSON.stringify(cliUrl)}).then((m) => m.runVendorCli(${JSON.stringify(kit)}, ['--format', 'css', '--asset', ${JSON.stringify(asset)}, '--out', 'o.css']))`],
+  { cwd: kit, encoding: 'utf8' });
+  const ok = drive('shipped.css');
+  assert.equal(ok.status, 0, ok.stderr);
+  const un = drive('unshipped.css');
+  assert.equal(un.status, 1);
+  assert.match(un.stderr, /not in @jfs\/fixture-kit's package\.json "files"/);
+  const ln = drive('linked.css');
+  assert.equal(ln.status, 1);
+  assert.match(ln.stderr, /not a regular file/);
 });

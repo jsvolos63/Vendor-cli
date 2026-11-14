@@ -208,7 +208,21 @@ vendored copy:
                   Mutually exclusive with --name/--pick, the legacy
                   single-global spelling (`--global X:a,b` emits bytes
                   identical to `--name X --pick a,b`).
+--format css      (0.24.0) a stylesheet the kit ships beside index.js, copied
+                  verbatim under a CSS provenance comment. Needs --asset;
+                  takes no --name/--pick/--global
+--asset file.css  css format only: a plain lowercase file name in the kit's
+                  own directory, a regular file (no symlink) that the kit's
+                  package.json `files` lists
 --check           exit 1 if the destination differs from what would be generated
+```
+
+The css format exists so a kit can hand its consumers CSS as a FILE: a page
+whose CSP is `style-src 'self'` can link it, where a `<style>` the kit injects
+at runtime is refused (news-kit's river and source-menu styles, FAM-7):
+
+```
+jfs-news-kit-vendor --format css --asset river.css --out css/vendor/news-kit-river.css
 ```
 
 E.g. a consumer that loads both the reader sanitizer and the news river from
